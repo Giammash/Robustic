@@ -1,0 +1,16 @@
+[project]
+name = "mindmove-framework-main"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "lightning==2.2.2",
+    "numpy==1.26.4",
+    "psutil>=7.0.0",
+    "pyside6==6.7.0",
+    "qdarkstyle>=3.2.3",
+    "rtfilter>=0.1.0",
+    "scipy>=1.16.3",
+    "vispy==0.14.2",
+]
