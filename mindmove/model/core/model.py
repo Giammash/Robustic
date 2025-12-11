@@ -1,6 +1,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Any, List, Dict
 import numpy as np
+import time
 
 from mindmove.config import config
 
@@ -24,25 +25,37 @@ if TYPE_CHECKING:
 # TODO: Implement the Model class
 class Model:
     def __init__(self) -> None:
-        """ """
+        """Initialize the DTW-based hand state classifier model."""
         ######### Begin of Modified Code #########
 
         # Initialization of variables for online protocol
+
+        # sampling configuration
         self.FSAMP = config.FSAMP  # Sampling frequency of Muovi EMG
-        self.buffer_length_s = config.template_duration  # Length of the buffer sliding window in seconds
-        self.buffer_length = self.FSAMP * self.buffer_length_s  # Length of the buffer in samples
-        self.increment_dtw_s = config.increment_dtw  # Overlap of the buffer sliding window in seconds
-        self.increment_dtw = int(self.FSAMP * self.increment_s)  # Overlap of the buffer in samples
-        self.window_length = config.window_length # Length of the window for feature extraction in samples
-        self.increment = config.increment # Overlap for feature extraction in samples
         self.num_channels = config.num_channels # Number of EMG channels
         self.dead_channels = config.dead_channels  # 1-indexed list of dead channels to be removed
         self.active_channels = config.active_channels  # List of active channels after removing dead channels
 
+        # buffer configuration (1 second buffer with sliding window)
+        self.buffer_length_s = config.template_duration  # Length of the buffer sliding window in seconds
+        self.buffer_length = self.FSAMP * self.buffer_length_s  # Length of the buffer in samples
+        
+        # DTW computation timing 
+        self.increment_dtw_s = config.increment_dtw  # Overlap of the buffer sliding window in seconds
+        self.increment_dtw = int(self.FSAMP * self.increment_dtw_s)  # Overlap of the buffer in samples
+        
+        # feature extraction configuration
+        self.window_length = config.window_length # Length of the window for feature extraction in samples
+        self.increment = config.increment # Overlap for feature extraction in samples
+        
+        # initialize real-time buffer
         self.emg_rt_buffer = np.zeros((self.num_channels, self.buffer_length))
         # so every update has to do:
         # self.emg_rt_buffer = np.roll(self.emg_rt_buffer, -new_samples, axis=1)
         # self.emg_rt_buffer[:, -new_samples:] = emg_data
+        
+        # track samples from last DTW computation
+        self.samples_since_last_dtw = 0
 
         # templates and thresholds
         self.templates_open = None
@@ -57,20 +70,48 @@ class Model:
         self.feature_name = "wl"
 
         # control the majority more or 5 consecutive predictions to switch state
-        self.consecutive_required = 5
-        self.window_majority_length = 5
+        self.consecutive_required = config.SMOOTHING_WINDOW
+        self.window_majority_length = config.SMOOTHING_WINDOW
         self.last_predictions = []
 
+        # refractory period variables
+        self.refractory_period_s = 0.75  # seconds
+        # self.time_since_last_switch = 0.0 # seconds
 
-    def _update_buffer(self, new_samples: np.ndarray):
+        # time for debugging
+        self.last_dtw_time = time.time()
+
+
+    def _update_buffer(self, new_samples: np.ndarray) -> bool:
+        """
+        Update the real-time buffer with new incoming samples.
+        Args:
+            new_samples (np.ndarray): New incoming EMG samples of shape (n_channels, new_samples).
+        Returns:
+            bool: True if enough samples are available for DTW computation, False otherwise.
+        """
         # new_samples shape: (n_channels, n_new_samples)
         n_new_samples = new_samples.shape[1]
-        if n_new_samples > self.buffer_length:
-            # keep only the òast buffer_length samples from new_samples
+
+        if n_new_samples >= self.buffer_length:
+            # keep only the last buffer_length samples from new_samples
+            # if get more than the buffer length, just keep the last buffer_length samples
             self.emg_rt_buffer = new_samples[:, -self.buffer_length :].copy()
+            self.samples_since_last_dtw = self.buffer_length
+
         else:
             self.emg_rt_buffer = np.roll(self.emg_rt_buffer, -n_new_samples, axis=1)
             self.emg_rt_buffer[:, -n_new_samples :] = new_samples
+            self.samples_since_last_dtw += n_new_samples
+        
+        # check id should compute DTW
+        should_compute = self.samples_since_last_dtw >= self.increment_dtw
+
+        if should_compute:
+            self.samples_since_last_dtw = 0 # reset counter
+        
+        return should_compute
+    
 
     # TODO: Implement the fit method
     def fit(self, training_data: Dict[str, Any], testing_data: Dict[str, Any]) -> None:
@@ -84,6 +125,9 @@ class Model:
         """
         Save the model to the model_path.
         """
+        if self.templates_open is None or self.templates_closed is None:
+            raise ValueError("Model templates are not trained yet.")
+        
         save_dict = {
             "templates_open": self.templates_open,
             "templates_closed": self.templates_closed,
@@ -93,9 +137,13 @@ class Model:
         }
 
         import pickle
+        import os
+        os.makedirs(os.path.dirname(model_path), exist_ok=True)
+
         with open(model_path, "wb") as f:
             pickle.dump(save_dict, f)
         # pass
+        print(f"Model saved to: {model_path}")
 
     # TODO: Implement the load method
     def load(self, model_path: str) -> None:
@@ -103,6 +151,7 @@ class Model:
         Load the model from the model_path.
         """
         import pickle
+
         with open(model_path, "rb") as f:
             data = pickle.load(f)
 
@@ -112,23 +161,45 @@ class Model:
         self.THRESHOLD_CLOSED = data["THRESHOLD_CLOSED"]
         self.feature_name = data["feature_name"]
         # pass
+        print(f"Model loaded from: {model_path}")
+        print(f"  - OPEN templates: {len(self.templates_open)}")
+        print(f"  - CLOSED templates: {len(self.templates_closed)}")
+        print(f"  - OPEN threshold: {self.THRESHOLD_OPEN:.4f}")
+        print(f"  - CLOSED threshold: {self.THRESHOLD_CLOSED:.4f}")
+        print(f"  - Feature: {self.feature_name}")
 
     # TODO: Implement the predict method
     def predict(self, x: Any) -> List[float]:
         """
-        Predict the output for the input x.
-        """
+        Predict the hand state from new EMG data
 
+        Args:
+            x (Any): New EMG data for prediction.
+        
+        Returns:
+            List[float]: Predicted hand state (0.0 for OPEN, 1.0 for CLOSED).
+        
+        """
+        if self.templates_open is None or self.templates_closed is None:
+            raise ValueError("Model not loaded! Call load() first.")
+        
         # Update real-time buffer
-        self._update_buffer(x)
+        should_compute_dtw = self._update_buffer(x)
+
+        if not should_compute_dtw:
+            # Not enough new samples to compute DTW yet
+            return 1.0 if self.current_state == "CLOSED" else 0.0
+        
+        # --- DTW computation (every increment_dtw samples) ---
+        print("Time since last DTW:", time.time() - self.last_dtw_time)
+        self.last_dtw_time = time.time()
 
         # apply filtering
-        
         emg_buffer = apply_rtfiltering(self.emg_rt_buffer) if config.ENABLE_FILTERING else self.emg_rt_buffer.copy()
         # print("EMG BUFFER SHAPE:", emg_buffer.shape)
 
-        # extract features
-        windowed_emg_buffer = sliding_window(emg_buffer, window_length=self.window_length, overlap=self.overlap)
+        # extract features from the template_nsamp buffer
+        windowed_emg_buffer = sliding_window(emg_buffer, self.window_length, self.increment)
 
         feature_info = FEATURES[self.feature_name]
         feature_fn = feature_info["function"]
@@ -136,6 +207,7 @@ class Model:
 
         # DTW distances 
         if self.current_state == "OPEN":
+            # Check if should switch to CLOSED
             D_closed = compute_distance_from_training_set_online(features_emg_buffer, self.templates_closed, self.feature_name)
             if D_closed < self.THRESHOLD_CLOSED:
                 triggered_state = "CLOSED"
@@ -143,31 +215,31 @@ class Model:
                 triggered_state = "OPEN"
 
         elif self.current_state == "CLOSED":
+            # Check if should switch to OPEN
             D_open = compute_distance_from_training_set_online(features_emg_buffer, self.templates_open, self.feature_name)
             if D_open < self.THRESHOLD_OPEN:
                 triggered_state = "OPEN"
             else:
                 triggered_state = "CLOSED"
         
-
-
         # D_open = compute_distance_from_training_set_online(features_emg_buffer, templates_open, feature_name)
         # D_closed = compute_distance_from_training_set_online(features_emg_buffer, templates_closed, feature_name)
 
         # State machine logic
         if config.POST_PREDICTION_SMOOTHING != "NONE":
             self.last_predictions.append(triggered_state)
+
             if len(self.last_predictions) > self.window_majority_length:
                 self.last_predictions.pop(0)
             
                 if config.POST_PREDICTION_SMOOTHING == "MAJORITY VOTE":
                     if self.last_predictions.count("CLOSED") > self.last_predictions.count("OPEN"):
                         self.current_state = "CLOSED"
-                        self.last_predictions = []
-
                     else:
                         self.current_state = "OPEN"
-                        self.last_predictions = []
+                    
+                    # clear the buffer to start new majority vote
+                    self.last_predictions = []
 
                 elif config.POST_PREDICTION_SMOOTHING == "5 CONSECUTIVE":
                     if len(self.last_predictions) == self.consecutive_required and all(p == triggered_state for p in self.last_predictions):
@@ -176,6 +248,15 @@ class Model:
         else:
             # no smoothing
             self.current_state = triggered_state
+
+        # Debug timing
+        current_time = time.time()
+        time_diff = current_time - self.last_dtw_time
+        self.last_dtw_time = current_time
+
+        if time_diff > 0:
+            print(f"DTW computed: {self.current_state} (Δt={time_diff*1000:.1f}ms)")
+            
                     
         # return self.current_state
         return 1.0 if self.current_state == "CLOSED" else 0.0
