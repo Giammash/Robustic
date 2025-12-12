@@ -79,8 +79,8 @@ def prepare_model_from_recordings(
     closed_folder=config.CLOSED_TEMPLATES_FOLDER,
     feature_name='wl',
     template_type= 'features',
-    # threshold_std_multiplier_open=1,
-    # threshold_std_multiplier_closed=1,
+    threshold_std_multiplier_open=1,
+    threshold_std_multiplier_closed=1,
 ):
     """
     Prepare a complete model from recorded template folders.
@@ -118,13 +118,11 @@ def prepare_model_from_recordings(
     print("Computing thresholds...")
     mean_open, std_open, threshold_base_open = compute_threshold(
         open_templates,
-        closed_templates,
-        feature_name=feature_name,
+        s=threshold_std_multiplier_open,
     )
     mean_closed, std_closed, threshold_base_closed = compute_threshold(
         closed_templates,
-        open_templates,
-        feature_name=feature_name,
+        s=threshold_std_multiplier_closed,
     )
     model_dict = {
         "open_templates": open_templates,
@@ -150,8 +148,11 @@ def save_model_to_file(model_dict, file_path):
     file_path : str
         Path to save the pickle file
     """
+    os.makedirs(os.path.dirname(file_path), exist_ok=True)
+
     with open(file_path, 'wb') as f:
         pickle.dump(model_dict, f)
+    
     print(f"Model saved to {file_path}")
 
 def load_model_from_file(file_path):
@@ -172,6 +173,24 @@ def load_model_from_file(file_path):
         model_dict = pickle.load(f)
     print(f"Model loaded from {file_path}")
     return model_dict
+
+
+# Main script to create a model offline
+
+if __name__ == "__main__":
+    model_dict = prepare_model_from_recordings(
+        open_folder=config.OPEN_TEMPLATES_FOLDER,
+        closed_folder=config.CLOSED_TEMPLATES_FOLDER,
+        feature_name='wl',
+        template_type='features',
+        threshold_std_multiplier_open=1,
+        threshold_std_multiplier_closed=1,
+    )
+
+    output_model_path = "data/models/dtw_model_0.pkl"
+    save_model_to_file(model_dict, output_model_path)
+
+    print("Model ready to be loaded in the GUI for online predictions.")
 
 
     

@@ -96,17 +96,17 @@ class MuoviAvailableChannels(Enum):
     ALL = 38
 
 
-class MuoviAvailableChannels(Enum):
-    """
-    Enum class for the available channels of the Muovi device.
+# class MuoviAvailableChannels(Enum):
+#     """
+#     Enum class for the available channels of the Muovi device.
 
-    6 -> AUXILIARY: 6 auxiliary channels.
-    32 -> BIOSIGNALS: 32 biosignals channels.
-    """
+#     6 -> AUXILIARY: 6 auxiliary channels.
+#     32 -> BIOSIGNALS: 32 biosignals channels.
+#     """
 
-    AUXILIARY = 6
-    BIOSIGNALS = 32
-    ALL = 38
+#     AUXILIARY = 6
+#     BIOSIGNALS = 32
+#     ALL = 38
 
 
 class MuoviPlusAvailableChannels(Enum):

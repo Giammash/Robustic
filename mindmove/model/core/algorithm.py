@@ -17,7 +17,7 @@ def dtw(t1,t2):
         alignment_cost : float. value of the DTW distance between the two 1 second templates
     """
     N, nch = t1.shape
-    M, nch = t2.shape
+    M, _ = t2.shape
 
     cost_mat = np.zeros((N+1,M+1))
     cost_mat[0, 1:] = np.inf
@@ -45,24 +45,6 @@ def dtw(t1,t2):
             cost_mat[i, j] = dist + penalty[i_penalty]
             traceback_mat [i-1, j-1] = i_penalty
 
-    # # traceback from bottom right
-    # i = N - 1
-    # j = M - 1
-    # path = [(i, j)]
-    # while i > 0 or j > 0:
-    #     tb_type = traceback_mat[i, j]
-    #     if tb_type ==0:
-    #         # Match
-    #         i = i - 1
-    #         j = j - 1
-    #     elif tb_type == 1:
-    #         # Insertion
-    #         i = i - 1
-    #     elif tb_type == 2:
-    #         # Deletion
-    #         j = j - 1
-    #     path.append((i, j))
-    # strip infinity edges before returning
     cost_mat = cost_mat[1:, 1:]
     alignment_cost = cost_mat[-1, -1]
     return alignment_cost #, (path[::-1], cost_mat)
@@ -101,6 +83,15 @@ def compute_threshold(templates, s = 1):
     print(f"s = {s}")
     threshold = D/N + s*np.std(distances)
 
+    return D/N, np.std(distances), threshold
+
+def tune_thresholds(mean_distance, std_distance, s=1):
+    """
+    mean_distance : mean distance computed on the training set
+    std_distance : std deviation of the distances computed on the training set
+    s : number of standard deviations away from the mean distance allowed
+    """
+    threshold = mean_distance + s*std_distance
     return threshold
 
 
@@ -155,11 +146,11 @@ def compute_distance_from_training_set_offline(test_recording, templates, featur
 def compute_distance_from_training_set_online(
         features_buffer, 
         templates, 
-        feature_name = 'wl', 
-        window_samples=config.template_nsamp, 
-        incr_samples = config.increment_dtw_samples,
-        feature_window_samples = config.window_length,
-        feature_window_increment = config.increment,
+        # feature_name = 'wl', 
+        # window_samples=config.template_nsamp, 
+        # incr_samples = config.increment_dtw_samples,
+        # feature_window_samples = config.window_length,
+        # feature_window_increment = config.increment,
         ):
     """
     Compute DTW distance between current online features and stored templates.

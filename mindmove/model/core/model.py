@@ -226,6 +226,9 @@ class Model:
         # D_closed = compute_distance_from_training_set_online(features_emg_buffer, templates_closed, feature_name)
 
         # State machine logic
+
+        previous_state = self.current_state
+        
         if config.POST_PREDICTION_SMOOTHING != "NONE":
             self.last_predictions.append(triggered_state)
 
@@ -256,7 +259,13 @@ class Model:
 
         if time_diff > 0:
             print(f"DTW computed: {self.current_state} (Δt={time_diff*1000:.1f}ms)")
-            
+        
+        # Print transition
+        if previous_state != self.current_state:
+            print(f"\n{'='*60}")
+            print(f"🔄 STATE TRANSITION: {previous_state} → {self.current_state}")
+            print(f"{'='*60}\n")
+        
                     
         # return self.current_state
         return 1.0 if self.current_state == "CLOSED" else 0.0

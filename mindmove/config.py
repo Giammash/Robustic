@@ -18,9 +18,9 @@ class config:
 
 
         # data to open
-        self.OPEN_TEMPLATES_FOLDER = "data/19.11.2025/templates/open"
+        self.OPEN_TEMPLATES_FOLDER = "data/templates_open"
         self.OPEN_GT_FOLDER = "data/19.11.2025/ground truths/open"
-        self.CLOSED_TEMPLATES_FOLDER = "data/19.11.2025/templates/closed"
+        self.CLOSED_TEMPLATES_FOLDER = "data/templates_closed"
         self.CLOSED_GT_FOLDER = "data/19.11.2025/ground truths/closed"
         self.TEST_FOLDER = "data/19.11.2025/templates/test"
         self.TEST_GT_FOLDER = "data/19.11.2025/ground truths/test"
