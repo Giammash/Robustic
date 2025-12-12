@@ -97,7 +97,7 @@ class OnlineProtocol(QObject):
         now = datetime.now()
         formatted_now = now.strftime("%Y%m%d_%H%M%S%f")
         file_name = (
-            f"MindMove_Predictions_{formatted_now}_{self.model_label.lower()}.pkl"
+            f"MindMove_Predictions_{formatted_now}_{self.model_label}.pkl"
         )
 
         if not os.path.exists(self.prediction_dir_path):

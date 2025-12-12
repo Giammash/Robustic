@@ -9,6 +9,8 @@ class config:
         self.num_channels = 32
         # self.dead_channels = [1, 6, 16, 26, 27] # 1-indexed
         self.dead_channels = [22] # 1-indexed
+        # self.dead_channels = [9, 22, 25] # 1-indexed
+
         self.active_channels = [i for i in range(self.num_channels) if i not in self.dead_channels]
 
 

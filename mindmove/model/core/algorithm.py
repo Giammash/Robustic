@@ -175,7 +175,7 @@ def compute_distance_from_training_set_online(
         
         distances[i] = dtw(features_buffer, template)
     
-    min_distance = np.min(distances)
+    # min_distance = np.min(distances)
     mean_distance = np.mean(distances)
 
     # best_template_index = np.argmin(distances)
@@ -185,4 +185,5 @@ def compute_distance_from_training_set_online(
 
 
     # return min_distance, mean_distance, distances, best_template_index, best_distance
-    return min_distance
+    # return min_distance
+    return mean_distance

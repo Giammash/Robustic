@@ -64,7 +64,8 @@ class Model:
         self.THRESHOLD_CLOSED = None
 
         # state machine
-        self.current_state = "OPEN" # or "CLOSED"
+        # self.current_state = "OPEN" # or "CLOSED"
+        self.current_state = "CLOSED"
 
         # feature choice
         self.feature_name = "wl"
@@ -155,11 +156,18 @@ class Model:
         with open(model_path, "rb") as f:
             data = pickle.load(f)
 
-        self.templates_open = data["templates_open"]
-        self.templates_closed = data["templates_closed"]
-        self.THRESHOLD_OPEN = data["THRESHOLD_OPEN"]
-        self.THRESHOLD_CLOSED = data["THRESHOLD_CLOSED"]
+        self.templates_open = data["open_templates"]
+        self.templates_closed = data["closed_templates"]
+        self.THRESHOLD_OPEN = data["threshold_base_open"]
+        self.mean_open = data["mean_open"]
+        self.std_open = data["std_open"]
+        self.THRESHOLD_CLOSED = data["threshold_base_closed"]
+        self.mean_closed = data["mean_closed"]
+        self.std_closed = data["std_closed"]
         self.feature_name = data["feature_name"]
+        
+        self.current_state = "OPEN"
+
         # pass
         print(f"Model loaded from: {model_path}")
         print(f"  - OPEN templates: {len(self.templates_open)}")
@@ -191,9 +199,10 @@ class Model:
             return 1.0 if self.current_state == "CLOSED" else 0.0
         
         # --- DTW computation (every increment_dtw samples) ---
-        print("Time since last DTW:", time.time() - self.last_dtw_time)
-        self.last_dtw_time = time.time()
-
+        current_time = time.time()
+        print(f"Time since last DTW: {(current_time - self.last_dtw_time) * 1000} ms")
+        time_since_last =  current_time - self.last_dtw_time
+        
         # apply filtering
         emg_buffer = apply_rtfiltering(self.emg_rt_buffer) if config.ENABLE_FILTERING else self.emg_rt_buffer.copy()
         # print("EMG BUFFER SHAPE:", emg_buffer.shape)
@@ -208,19 +217,24 @@ class Model:
         # DTW distances 
         if self.current_state == "OPEN":
             # Check if should switch to CLOSED
-            D_closed = compute_distance_from_training_set_online(features_emg_buffer, self.templates_closed, self.feature_name)
+            D_closed = compute_distance_from_training_set_online(features_emg_buffer, self.templates_closed)
             if D_closed < self.THRESHOLD_CLOSED:
                 triggered_state = "CLOSED"
             else:
                 triggered_state = "OPEN"
+            print(f"[DTW] State: OPEN | D_closed: {D_closed:.4f} | Threshold: {self.THRESHOLD_CLOSED:.4f} | "
+              f"Trigger: {triggered_state} | Δt: {time_since_last:.1f}ms")
 
         elif self.current_state == "CLOSED":
             # Check if should switch to OPEN
-            D_open = compute_distance_from_training_set_online(features_emg_buffer, self.templates_open, self.feature_name)
+            D_open = compute_distance_from_training_set_online(features_emg_buffer, self.templates_open)
             if D_open < self.THRESHOLD_OPEN:
                 triggered_state = "OPEN"
             else:
                 triggered_state = "CLOSED"
+
+            print(f"[DTW] State: CLOSED | D_open: {D_open:.4f} | Threshold: {self.THRESHOLD_OPEN:.4f} | "
+              f"Trigger: {triggered_state} | Δt: {time_since_last:.1f}ms")
         
         # D_open = compute_distance_from_training_set_online(features_emg_buffer, templates_open, feature_name)
         # D_closed = compute_distance_from_training_set_online(features_emg_buffer, templates_closed, feature_name)
@@ -248,13 +262,13 @@ class Model:
                     if len(self.last_predictions) == self.consecutive_required and all(p == triggered_state for p in self.last_predictions):
                         self.current_state = triggered_state
                         self.last_predictions = []
-        else:
+        else: 
             # no smoothing
             self.current_state = triggered_state
 
         # Debug timing
         current_time = time.time()
-        time_diff = current_time - self.last_dtw_time
+        time_diff = current_time - self.last_dtw_time 
         self.last_dtw_time = current_time
 
         if time_diff > 0:
@@ -266,6 +280,7 @@ class Model:
             print(f"🔄 STATE TRANSITION: {previous_state} → {self.current_state}")
             print(f"{'='*60}\n")
         
+        self.last_dtw_time = current_time
                     
         # return self.current_state
         return 1.0 if self.current_state == "CLOSED" else 0.0
