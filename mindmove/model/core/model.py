@@ -65,7 +65,7 @@ class Model:
 
         # state machine
         # self.current_state = "OPEN" # or "CLOSED"
-        self.current_state = "CLOSED"
+        # self.current_state = "CLOSED"
 
         # feature choice
         self.feature_name = "wl"
@@ -81,6 +81,11 @@ class Model:
 
         # time for debugging
         self.last_dtw_time = time.time()
+        self.dtw_count = 0
+
+        self.dtw_distances = []
+        self.dtw_times = []
+
 
 
     def _update_buffer(self, new_samples: np.ndarray) -> bool:
@@ -93,6 +98,9 @@ class Model:
         """
         # new_samples shape: (n_channels, n_new_samples)
         n_new_samples = new_samples.shape[1]
+        # print(n_new_samples.shape)
+        # print(f"number of new samples: {n_new_samples}")
+        # print(f"buffer length: {self.buffer_length}")
 
         if n_new_samples >= self.buffer_length:
             # keep only the last buffer_length samples from new_samples
@@ -110,6 +118,8 @@ class Model:
 
         if should_compute:
             self.samples_since_last_dtw = 0 # reset counter
+        
+        # print(f"should compute? {should_compute}")
         
         return should_compute
     
@@ -158,15 +168,15 @@ class Model:
 
         self.templates_open = data["open_templates"]
         self.templates_closed = data["closed_templates"]
-        self.THRESHOLD_OPEN = data["threshold_base_open"]
+        self.THRESHOLD_OPEN = data["threshold_base_open"] *2
         self.mean_open = data["mean_open"]
         self.std_open = data["std_open"]
-        self.THRESHOLD_CLOSED = data["threshold_base_closed"]
+        self.THRESHOLD_CLOSED = data["threshold_base_closed"] *2
         self.mean_closed = data["mean_closed"]
         self.std_closed = data["std_closed"]
         self.feature_name = data["feature_name"]
         
-        self.current_state = "OPEN"
+        self.current_state = "CLOSED"
 
         # pass
         print(f"Model loaded from: {model_path}")
@@ -192,6 +202,7 @@ class Model:
             raise ValueError("Model not loaded! Call load() first.")
         
         # Update real-time buffer
+        # print(f"x shape: {x.shape}")
         should_compute_dtw = self._update_buffer(x)
 
         if not should_compute_dtw:
@@ -199,6 +210,7 @@ class Model:
             return 1.0 if self.current_state == "CLOSED" else 0.0
         
         # --- DTW computation (every increment_dtw samples) ---
+        dtw_start_time = time.perf_counter()
         current_time = time.time()
         print(f"Time since last DTW: {(current_time - self.last_dtw_time) * 1000} ms")
         time_since_last =  current_time - self.last_dtw_time
@@ -224,6 +236,9 @@ class Model:
                 triggered_state = "OPEN"
             print(f"[DTW] State: OPEN | D_closed: {D_closed:.4f} | Threshold: {self.THRESHOLD_CLOSED:.4f} | "
               f"Trigger: {triggered_state} | Δt: {time_since_last:.1f}ms")
+            
+            self.dtw_distances.append(("closed", D_closed, self.THRESHOLD_CLOSED))
+
 
         elif self.current_state == "CLOSED":
             # Check if should switch to OPEN
@@ -235,11 +250,16 @@ class Model:
 
             print(f"[DTW] State: CLOSED | D_open: {D_open:.4f} | Threshold: {self.THRESHOLD_OPEN:.4f} | "
               f"Trigger: {triggered_state} | Δt: {time_since_last:.1f}ms")
+
+            self.dtw_distances.append(("open", D_open, self.THRESHOLD_OPEN))
         
         # D_open = compute_distance_from_training_set_online(features_emg_buffer, templates_open, feature_name)
         # D_closed = compute_distance_from_training_set_online(features_emg_buffer, templates_closed, feature_name)
 
         # State machine logic
+
+        if len(self.dtw_distances) < 100:
+            self.dtw_distances.pop(0)
 
         previous_state = self.current_state
         
@@ -262,6 +282,7 @@ class Model:
                     if len(self.last_predictions) == self.consecutive_required and all(p == triggered_state for p in self.last_predictions):
                         self.current_state = triggered_state
                         self.last_predictions = []
+
         else: 
             # no smoothing
             self.current_state = triggered_state
@@ -280,7 +301,23 @@ class Model:
             print(f"🔄 STATE TRANSITION: {previous_state} → {self.current_state}")
             print(f"{'='*60}\n")
         
+        # update timing
+        dtw_end_time = time.perf_counter()
+        dtw_computation_time = (dtw_end_time - dtw_start_time) * 1000
+        self.dtw_times.append(dtw_computation_time)
+        if len(self.dtw_times) < 100:
+            self.dtw_times.pop(0)
+
         self.last_dtw_time = current_time
+        self.dtw_count += 1
+
+        # everz 20 DTW computations print statistic
+
+        if self.dtw_count % 20 == 0:
+            avg_time = np.mean(self.dtw_times)
+            print(f"\n stats (last {len(self.dtw_times)} DTW): "
+            f"AVG computation={avg_time}ms"
+            f"avg dt={np.mean([time_since_last])}ms")
                     
         # return self.current_state
         return 1.0 if self.current_state == "CLOSED" else 0.0

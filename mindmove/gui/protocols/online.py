@@ -72,6 +72,9 @@ class OnlineProtocol(QObject):
             self.timings = []
             self.online_record_toggle_push_button.setText("Stop Recording")
             self.online_load_model_push_button.setEnabled(False)
+            # self.online_threshold_slider.setEnabled(false) # Disable threshold changes while recording
+
+            # connect signals
             self.main_window.device.ready_read_signal.connect(self.online_emg_update)
 
             self.emg_buffer = []
@@ -131,6 +134,11 @@ class OnlineProtocol(QObject):
 
         label = file_name.split("/")[-1].split("_")[-1].split(".")[0]
         self.online_model_label.setText(f"{label} loaded.")
+
+    # def _on_threshold_changed(self, value):
+    #     """Called when thresholdslider is moved"""
+    #     threshold = value / 100.0
+    #     self.online_threshold_value_label.setText(f"")
 
     def _setup_protocol_ui(self) -> None:
         self.online_load_model_group_box = self.main_window.ui.onlineLoadModelGroupBox

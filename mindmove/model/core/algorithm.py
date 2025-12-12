@@ -18,6 +18,8 @@ def dtw(t1,t2):
     """
     N, nch = t1.shape
     M, _ = t2.shape
+    # print(f"t1 shape: {t1.shape}")
+    # print(f"t2 shape: {t2.shape}")
 
     cost_mat = np.zeros((N+1,M+1))
     cost_mat[0, 1:] = np.inf
