@@ -40,7 +40,7 @@ class DiagnosticModel:
         self.emg_rt_buffer = np.zeros((self.num_channels, self.buffer_length))
 
         # track samples
-        self.samples_since_last_computation = 0
+        self.samples_since_last_dtw = 0
 
         # feature choice
         self.feature_name = "rms" 
