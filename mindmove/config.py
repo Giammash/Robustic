@@ -18,6 +18,9 @@ class config:
         self.ENABLE_FILTERING = True
         # self.ENABLE_FILTERING = False
 
+        # Diagnostic mode
+        self.DIAGNOSTIC_MODE = True
+
 
         # data to open
         self.OPEN_TEMPLATES_FOLDER = "data/templates_open"
