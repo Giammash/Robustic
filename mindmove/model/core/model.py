@@ -2,6 +2,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any, List, Dict
 import numpy as np
 import time
+from datetime import datetime
 
 from mindmove.config import config
 
@@ -32,9 +33,10 @@ class Model:
 
         # sampling configuration
         self.FSAMP = config.FSAMP  # Sampling frequency of Muovi EMG
-        self.num_channels = config.num_channels # Number of EMG channels
-        self.dead_channels = config.dead_channels  # 1-indexed list of dead channels to be removed
-        self.active_channels = config.active_channels  # List of active channels after removing dead channels
+        self.num_channels = config.num_channels  # Number of EMG channels
+        # dead_channels stored as 0-indexed (index 0-31 for 32 channels)
+        self.dead_channels = config.dead_channels
+        self.active_channels = config.active_channels  # List of active channel indices (0-indexed)
 
         # buffer configuration (1 second buffer with sliding window)
         self.buffer_length_s = config.template_duration  # Length of the buffer sliding window in seconds
@@ -63,12 +65,19 @@ class Model:
         self.THRESHOLD_OPEN = None
         self.THRESHOLD_CLOSED = None
 
-        # state machine
-        # self.current_state = "OPEN" # or "CLOSED"
-        # self.current_state = "CLOSED"
+        # state machine - initialize to CLOSED (hand starts closed)
+        self.current_state = "CLOSED"
 
         # feature choice
         self.feature_name = "wl"
+
+        # distance aggregation method (can be overridden by model settings)
+        # Options: "average", "minimum", "avg_3_smallest"
+        self.distance_aggregation = "average"
+
+        # smoothing method (can be overridden by model settings)
+        # Options: "MAJORITY VOTE", "5 CONSECUTIVE", "NONE"
+        self.smoothing_method = config.POST_PREDICTION_SMOOTHING
 
         # control the majority more or 5 consecutive predictions to switch state
         self.consecutive_required = config.SMOOTHING_WINDOW
@@ -85,6 +94,23 @@ class Model:
 
         self.dtw_distances = []
         self.dtw_times = []
+
+        # History for post-acquisition plotting
+        # Each entry: (timestamp, D_open or None, D_closed or None, current_state)
+        self.distance_history = []
+        self.state_transitions = []  # (timestamp, from_state, to_state)
+
+        # Threshold tuning parameter (s value)
+        self.threshold_s = 1.0  # Default s=1 (mean + 1*std)
+
+        # History for post-acquisition plotting
+        # Each entry: (timestamp, D_open, D_closed, current_state, triggered_state)
+        self.distance_history = []
+        self.emg_history = []  # Store EMG snapshots for plotting
+        self.state_history = []  # Store (timestamp, state) for transitions
+
+        # Threshold tuning parameter (s value)
+        self.threshold_s = 1.0  # Default s=1 (mean + 1*std)
 
 
 
@@ -168,14 +194,42 @@ class Model:
 
         self.templates_open = data["open_templates"]
         self.templates_closed = data["closed_templates"]
-        self.THRESHOLD_OPEN = data["threshold_base_open"] *2
+        # Thresholds are now correctly computed as mean + s*std (s=1 by default)
+        # Use a configurable multiplier for tuning if needed
+        threshold_multiplier = data.get("threshold_multiplier", 1.0)
+        self.THRESHOLD_OPEN = data["threshold_base_open"] * threshold_multiplier
         self.mean_open = data["mean_open"]
         self.std_open = data["std_open"]
-        self.THRESHOLD_CLOSED = data["threshold_base_closed"] *2
+        self.THRESHOLD_CLOSED = data["threshold_base_closed"] * threshold_multiplier
         self.mean_closed = data["mean_closed"]
         self.std_closed = data["std_closed"]
         self.feature_name = data["feature_name"]
-        
+
+        # Load new model settings (with defaults for backwards compatibility)
+        # dead_channels stored as 0-indexed
+        self.dead_channels = data.get("dead_channels", config.dead_channels)
+        # Compute active channels from dead channels
+        self.active_channels = [i for i in range(self.num_channels) if i not in self.dead_channels]
+
+        # Distance aggregation method: "average", "minimum", "avg_3_smallest"
+        self.distance_aggregation = data.get("distance_aggregation", "average")
+
+        # Smoothing method: "MAJORITY VOTE", "5 CONSECUTIVE", "NONE"
+        smoothing_method = data.get("smoothing_method", config.POST_PREDICTION_SMOOTHING)
+        self.smoothing_method = smoothing_method
+
+        # Load training parameters for feature extraction consistency
+        params = data.get("parameters", {})
+        if params:
+            self.window_length = params.get("window_samples", config.window_length)
+            self.increment = params.get("overlap_samples", config.increment)
+            print(f"  - Window/overlap (from model): {self.window_length}/{self.increment} samples")
+        else:
+            # Fallback to config for backwards compatibility
+            self.window_length = config.window_length
+            self.increment = config.increment
+            print(f"  - Window/overlap (from config): {self.window_length}/{self.increment} samples")
+
         self.current_state = "CLOSED"
 
         # pass
@@ -185,8 +239,77 @@ class Model:
         print(f"  - OPEN threshold: {self.THRESHOLD_OPEN:.4f}")
         print(f"  - CLOSED threshold: {self.THRESHOLD_CLOSED:.4f}")
         print(f"  - Feature: {self.feature_name}")
+        print(f"  - Dead channels (0-indexed): {self.dead_channels}")
+        print(f"  - Active channels: {len(self.active_channels)}")
+        print(f"  - Distance aggregation: {self.distance_aggregation}")
+        print(f"  - Smoothing method: {self.smoothing_method}")
 
-    # TODO: Implement the predict method
+    def update_thresholds(self, s: float) -> None:
+        """
+        Update thresholds based on new s value (standard deviation multiplier).
+
+        Args:
+            s: Number of standard deviations above mean for threshold.
+               Higher s = less sensitive (fewer false activations)
+               Lower s = more sensitive (faster response, more false positives)
+        """
+        if not hasattr(self, 'mean_open') or not hasattr(self, 'std_open'):
+            print("Warning: Model statistics not loaded, cannot update thresholds")
+            return
+
+        self.threshold_s = s
+        self.THRESHOLD_OPEN = self.mean_open + s * self.std_open
+        self.THRESHOLD_CLOSED = self.mean_closed + s * self.std_closed
+
+        print(f"\n[THRESHOLD UPDATE] s = {s:.2f}")
+        print(f"  OPEN threshold:   {self.THRESHOLD_OPEN:.4f} (mean={self.mean_open:.4f}, std={self.std_open:.4f})")
+        print(f"  CLOSED threshold: {self.THRESHOLD_CLOSED:.4f} (mean={self.mean_closed:.4f}, std={self.std_closed:.4f})\n")
+
+    def reset_history(self) -> None:
+        """Reset all history buffers for a new acquisition session."""
+        self.distance_history = []
+        self.state_transitions = []
+        self.dtw_distances = []
+        self.dtw_times = []
+        self.last_predictions = []
+        self.dtw_count = 0
+        self.last_dtw_time = time.time()
+        print("[MODEL] History reset for new session")
+
+    def get_distance_history(self) -> Dict[str, Any]:
+        """
+        Get the distance history for plotting.
+
+        Returns:
+            Dictionary with timestamps, distances (with None for gaps), states, and thresholds.
+        """
+        if not self.distance_history:
+            return None
+
+        timestamps = [h[0] for h in self.distance_history]
+        D_open = [h[1] for h in self.distance_history]  # None when state was OPEN
+        D_closed = [h[2] for h in self.distance_history]  # None when state was CLOSED
+        states = [h[3] for h in self.distance_history]
+
+        # Normalize timestamps to start from 0
+        t0 = timestamps[0] if timestamps else 0
+        timestamps = [t - t0 for t in timestamps]
+
+        return {
+            "timestamps": timestamps,
+            "D_open": D_open,
+            "D_closed": D_closed,
+            "states": states,
+            "threshold_open": self.THRESHOLD_OPEN,
+            "threshold_closed": self.THRESHOLD_CLOSED,
+            "mean_open": getattr(self, 'mean_open', None),
+            "std_open": getattr(self, 'std_open', None),
+            "mean_closed": getattr(self, 'mean_closed', None),
+            "std_closed": getattr(self, 'std_closed', None),
+            "threshold_s": self.threshold_s,
+            "state_transitions": self.state_transitions,
+        }
+
     def predict(self, x: Any) -> List[float]:
         """
         Predict the hand state from new EMG data
@@ -226,23 +349,37 @@ class Model:
         feature_fn = feature_info["function"]
         features_emg_buffer = feature_fn(windowed_emg_buffer)
 
-        # DTW distances 
+        # DTW distances (use model's active_channels and distance_aggregation)
+        # Only compute distance to OPPOSITE state templates (efficient)
+        timestamp = time.time()
+
         if self.current_state == "OPEN":
             # Check if should switch to CLOSED
-            D_closed = compute_distance_from_training_set_online(features_emg_buffer, self.templates_closed)
+            D_closed = compute_distance_from_training_set_online(
+                features_emg_buffer,
+                self.templates_closed,
+                active_channels=self.active_channels,
+                distance_aggregation=self.distance_aggregation
+            )
             if D_closed < self.THRESHOLD_CLOSED:
                 triggered_state = "CLOSED"
             else:
                 triggered_state = "OPEN"
             print(f"[DTW] State: OPEN | D_closed: {D_closed:.4f} | Threshold: {self.THRESHOLD_CLOSED:.4f} | "
               f"Trigger: {triggered_state} | Δt: {time_since_last:.1f}ms")
-            
-            self.dtw_distances.append(("closed", D_closed, self.THRESHOLD_CLOSED))
 
+            self.dtw_distances.append(("closed", D_closed, self.THRESHOLD_CLOSED))
+            # Store in history: (timestamp, D_open=None, D_closed, state)
+            self.distance_history.append((timestamp, None, D_closed, self.current_state))
 
         elif self.current_state == "CLOSED":
             # Check if should switch to OPEN
-            D_open = compute_distance_from_training_set_online(features_emg_buffer, self.templates_open)
+            D_open = compute_distance_from_training_set_online(
+                features_emg_buffer,
+                self.templates_open,
+                active_channels=self.active_channels,
+                distance_aggregation=self.distance_aggregation
+            )
             if D_open < self.THRESHOLD_OPEN:
                 triggered_state = "OPEN"
             else:
@@ -252,40 +389,61 @@ class Model:
               f"Trigger: {triggered_state} | Δt: {time_since_last:.1f}ms")
 
             self.dtw_distances.append(("open", D_open, self.THRESHOLD_OPEN))
+            # Store in history: (timestamp, D_open, D_closed=None, state)
+            self.distance_history.append((timestamp, D_open, None, self.current_state))
         
         # D_open = compute_distance_from_training_set_online(features_emg_buffer, templates_open, feature_name)
         # D_closed = compute_distance_from_training_set_online(features_emg_buffer, templates_closed, feature_name)
 
         # State machine logic
 
-        if len(self.dtw_distances) < 100:
+        # Keep dtw_distances buffer bounded (for debugging/logging)
+        if len(self.dtw_distances) >= 100:
             self.dtw_distances.pop(0)
 
         previous_state = self.current_state
-        
-        if config.POST_PREDICTION_SMOOTHING != "NONE":
+
+        # Use model's smoothing method (defaults to config if not set)
+        smoothing = getattr(self, 'smoothing_method', config.POST_PREDICTION_SMOOTHING)
+
+        if smoothing == "NONE":
+            # No smoothing - directly use triggered state
+            self.current_state = triggered_state
+
+        elif smoothing == "MAJORITY VOTE":
+            # Sliding window majority vote
             self.last_predictions.append(triggered_state)
 
+            # Keep window at fixed size (sliding window)
             if len(self.last_predictions) > self.window_majority_length:
                 self.last_predictions.pop(0)
-            
-                if config.POST_PREDICTION_SMOOTHING == "MAJORITY VOTE":
-                    if self.last_predictions.count("CLOSED") > self.last_predictions.count("OPEN"):
-                        self.current_state = "CLOSED"
-                    else:
-                        self.current_state = "OPEN"
-                    
-                    # clear the buffer to start new majority vote
-                    self.last_predictions = []
 
-                elif config.POST_PREDICTION_SMOOTHING == "5 CONSECUTIVE":
-                    if len(self.last_predictions) == self.consecutive_required and all(p == triggered_state for p in self.last_predictions):
-                        self.current_state = triggered_state
+            # Once we have enough predictions, use majority vote
+            if len(self.last_predictions) >= self.window_majority_length:
+                closed_count = self.last_predictions.count("CLOSED")
+                open_count = self.last_predictions.count("OPEN")
+                if closed_count > open_count:
+                    self.current_state = "CLOSED"
+                elif open_count > closed_count:
+                    self.current_state = "OPEN"
+                # If tied, keep current state (no change)
+
+        elif smoothing == "5 CONSECUTIVE":
+            # Require N consecutive identical predictions to switch state
+            self.last_predictions.append(triggered_state)
+
+            # Keep window at fixed size
+            if len(self.last_predictions) > self.consecutive_required:
+                self.last_predictions.pop(0)
+
+            # Check if all predictions in window are the same AND different from current
+            if len(self.last_predictions) >= self.consecutive_required:
+                if all(p == self.last_predictions[0] for p in self.last_predictions):
+                    new_state = self.last_predictions[0]
+                    if new_state != self.current_state:
+                        self.current_state = new_state
+                        # Clear buffer after state transition to require fresh consecutive predictions
                         self.last_predictions = []
-
-        else: 
-            # no smoothing
-            self.current_state = triggered_state
 
         # Debug timing
         current_time = time.time()
@@ -295,17 +453,35 @@ class Model:
         if time_diff > 0:
             print(f"DTW computed: {self.current_state} (Δt={time_diff*1000:.1f}ms)")
         
-        # Print transition
+        # Print transition with prominent message
         if previous_state != self.current_state:
-            print(f"\n{'='*60}")
-            print(f"🔄 STATE TRANSITION: {previous_state} → {self.current_state}")
-            print(f"{'='*60}\n")
+            transition_time = time.time()
+            # Store state transition for plotting
+            self.state_transitions.append((transition_time, previous_state, self.current_state))
+
+            print("\n")
+            print("=" * 70)
+            print("=" * 70)
+            print("||" + " " * 66 + "||")
+            if self.current_state == "OPEN":
+                print("||" + "           ****   HAND OPENED   ****".center(66) + "||")
+            else:
+                print("||" + "           ****   HAND CLOSED   ****".center(66) + "||")
+            print("||" + " " * 66 + "||")
+            print("||" + f"  {previous_state}  --->  {self.current_state}".center(66) + "||")
+            print("||" + " " * 66 + "||")
+            print("||" + f"  Time: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}".center(66) + "||")
+            print("||" + " " * 66 + "||")
+            print("=" * 70)
+            print("=" * 70)
+            print("\n")
         
         # update timing
         dtw_end_time = time.perf_counter()
         dtw_computation_time = (dtw_end_time - dtw_start_time) * 1000
         self.dtw_times.append(dtw_computation_time)
-        if len(self.dtw_times) < 100:
+        # Keep dtw_times buffer bounded
+        if len(self.dtw_times) >= 100:
             self.dtw_times.pop(0)
 
         self.last_dtw_time = current_time

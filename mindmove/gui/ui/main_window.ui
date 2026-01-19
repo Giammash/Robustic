@@ -510,6 +510,187 @@ color: rgb(0, 0, 0);</string>
           <widget class="QWidget" name="trainingWidget">
            <layout class="QGridLayout" name="gridLayout_12">
             <item row="0" column="0">
+             <widget class="QGroupBox" name="trainingTemplateExtractionGroupBox">
+              <property name="title">
+               <string>Template Extraction</string>
+              </property>
+              <layout class="QGridLayout" name="gridLayout_20">
+               <item row="0" column="0">
+                <widget class="QLabel" name="label_9">
+                 <property name="text">
+                  <string>Class</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="0" column="1">
+                <widget class="QComboBox" name="trainingTemplateClassComboBox">
+                 <item>
+                  <property name="text">
+                   <string>Open</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>Closed</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+               <item row="1" column="0">
+                <widget class="QLabel" name="label_12">
+                 <property name="text">
+                  <string>Data Format</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="1" column="1">
+                <widget class="QComboBox" name="trainingDataFormatComboBox">
+                 <item>
+                  <property name="text">
+                   <string>Auto-detect (single files)</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>Legacy (EMG + GT folders)</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+               <item row="2" column="0">
+                <widget class="QLabel" name="label_10">
+                 <property name="text">
+                  <string>Template Type</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="2" column="1">
+                <widget class="QComboBox" name="trainingTemplateTypeComboBox">
+                 <item>
+                  <property name="text">
+                   <string>Hold Only (skip 0.5s)</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>Onset + Hold (start -0.2s)</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+               <item row="3" column="0">
+                <widget class="QPushButton" name="trainingSelectRecordingsForExtractionPushButton">
+                 <property name="text">
+                  <string>Select Recording(s)</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="3" column="1">
+                <widget class="QLabel" name="trainingSelectedRecordingsForExtractionLabel">
+                 <property name="text">
+                  <string>No recordings selected</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="4" column="0">
+                <widget class="QPushButton" name="trainingExtractActivationsPushButton">
+                 <property name="text">
+                  <string>Extract Activations</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="4" column="1">
+                <widget class="QLabel" name="trainingActivationCountLabel">
+                 <property name="text">
+                  <string>0 activations found</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="5" column="0">
+                <widget class="QLabel" name="label_11">
+                 <property name="text">
+                  <string>Selection Mode</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="5" column="1">
+                <widget class="QComboBox" name="trainingSelectionModeComboBox">
+                 <item>
+                  <property name="text">
+                   <string>Manual Review</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>Auto (longest)</string>
+                  </property>
+                 </item>
+                 <item>
+                  <property name="text">
+                   <string>First 20</string>
+                  </property>
+                 </item>
+                </widget>
+               </item>
+               <item row="6" column="0" colspan="2">
+                <widget class="QListWidget" name="trainingActivationListWidget">
+                 <property name="sizePolicy">
+                  <sizepolicy hsizetype="Preferred" vsizetype="Expanding">
+                   <horstretch>0</horstretch>
+                   <verstretch>0</verstretch>
+                  </sizepolicy>
+                 </property>
+                 <property name="selectionMode">
+                  <enum>QAbstractItemView::SelectionMode::MultiSelection</enum>
+                 </property>
+                </widget>
+               </item>
+               <item row="7" column="0">
+                <widget class="QPushButton" name="trainingPlotSelectedPushButton">
+                 <property name="text">
+                  <string>Plot Selected</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="7" column="1">
+                <widget class="QPushButton" name="trainingSelectTemplatesPushButton">
+                 <property name="text">
+                  <string>Select as Templates</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="8" column="0">
+                <widget class="QLabel" name="trainingTemplateCountLabel">
+                 <property name="text">
+                  <string>0/20 templates</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="9" column="0">
+                <widget class="QPushButton" name="trainingSaveTemplatesPushButton">
+                 <property name="text">
+                  <string>Save Templates</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="9" column="1">
+                <widget class="QPushButton" name="trainingClearExtractionPushButton">
+                 <property name="text">
+                  <string>Clear</string>
+                 </property>
+                </widget>
+               </item>
+               <item row="10" column="0" colspan="2">
+                <widget class="QProgressBar" name="trainingExtractionProgressBar">
+                 <property name="value">
+                  <number>0</number>
+                 </property>
+                </widget>
+               </item>
+              </layout>
+             </widget>
+            </item>
+            <item row="1" column="0">
              <widget class="QGroupBox" name="trainingCreateDatasetGroupBox">
               <property name="title">
                <string>Create Training Dataset</string>
@@ -556,7 +737,7 @@ color: rgb(0, 0, 0);</string>
               </layout>
              </widget>
             </item>
-            <item row="1" column="0">
+            <item row="2" column="0">
              <widget class="QGroupBox" name="trainingTrainModelGroupBox">
               <property name="title">
                <string>Train Model</string>

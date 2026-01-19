@@ -58,3 +58,12 @@ bin/
 
 # Data
 [Dd]ata/
+
+# Claude / temp
+.claude/
+tmpclaude-*/
+CLAUDE.md
+
+# Misc
+nul
+old scripts/

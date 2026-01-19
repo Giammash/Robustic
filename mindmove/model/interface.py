@@ -160,3 +160,33 @@ class MindMoveInterface(QObject):
         """Print timing summary from diagnostic model."""
         if self.use_diagnostic and hasattr(self.model, 'print_summary'):
             self.model.print_summary()
+
+    def update_thresholds(self, s: float) -> None:
+        """Update thresholds with new s value (standard deviation multiplier)."""
+        if self.model and hasattr(self.model, 'update_thresholds'):
+            self.model.update_thresholds(s)
+
+    def reset_history(self) -> None:
+        """Reset history buffers for new acquisition session."""
+        if self.model and hasattr(self.model, 'reset_history'):
+            self.model.reset_history()
+
+    def get_distance_history(self):
+        """Get distance history for plotting."""
+        if self.model and hasattr(self.model, 'get_distance_history'):
+            return self.model.get_distance_history()
+        return None
+
+    def get_current_thresholds(self):
+        """Get current threshold values."""
+        if self.model:
+            return {
+                "threshold_open": getattr(self.model, 'THRESHOLD_OPEN', None),
+                "threshold_closed": getattr(self.model, 'THRESHOLD_CLOSED', None),
+                "threshold_s": getattr(self.model, 'threshold_s', 1.0),
+                "mean_open": getattr(self.model, 'mean_open', None),
+                "std_open": getattr(self.model, 'std_open', None),
+                "mean_closed": getattr(self.model, 'mean_closed', None),
+                "std_closed": getattr(self.model, 'std_closed', None),
+            }
+        return None
