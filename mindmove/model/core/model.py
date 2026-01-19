@@ -100,8 +100,9 @@ class Model:
         self.distance_history = []
         self.state_transitions = []  # (timestamp, from_state, to_state)
 
-        # Threshold tuning parameter (s value)
-        self.threshold_s = 1.0  # Default s=1 (mean + 1*std)
+        # Threshold tuning parameters (separate s values for each class)
+        self.s_open = 1.0  # Default s=1 for OPEN threshold
+        self.s_closed = 1.0  # Default s=1 for CLOSED threshold
 
         # History for post-acquisition plotting
         # Each entry: (timestamp, D_open, D_closed, current_state, triggered_state)
@@ -244,26 +245,50 @@ class Model:
         print(f"  - Distance aggregation: {self.distance_aggregation}")
         print(f"  - Smoothing method: {self.smoothing_method}")
 
-    def update_thresholds(self, s: float) -> None:
+    def update_threshold_open(self, s_open: float) -> None:
         """
-        Update thresholds based on new s value (standard deviation multiplier).
+        Update OPEN threshold based on s_open value.
 
         Args:
-            s: Number of standard deviations above mean for threshold.
-               Higher s = less sensitive (fewer false activations)
-               Lower s = more sensitive (faster response, more false positives)
+            s_open: Standard deviations above mean for OPEN threshold.
         """
         if not hasattr(self, 'mean_open') or not hasattr(self, 'std_open'):
-            print("Warning: Model statistics not loaded, cannot update thresholds")
+            print("Warning: Model statistics not loaded, cannot update threshold")
             return
 
-        self.threshold_s = s
-        self.THRESHOLD_OPEN = self.mean_open + s * self.std_open
-        self.THRESHOLD_CLOSED = self.mean_closed + s * self.std_closed
+        self.s_open = s_open
+        self.THRESHOLD_OPEN = self.mean_open + s_open * self.std_open
 
-        print(f"\n[THRESHOLD UPDATE] s = {s:.2f}")
-        print(f"  OPEN threshold:   {self.THRESHOLD_OPEN:.4f} (mean={self.mean_open:.4f}, std={self.std_open:.4f})")
-        print(f"  CLOSED threshold: {self.THRESHOLD_CLOSED:.4f} (mean={self.mean_closed:.4f}, std={self.std_closed:.4f})\n")
+        print(f"[THRESHOLD] OPEN: s={s_open:.2f} → threshold={self.THRESHOLD_OPEN:.4f}")
+
+    def update_threshold_closed(self, s_closed: float) -> None:
+        """
+        Update CLOSED threshold based on s_closed value.
+
+        Args:
+            s_closed: Standard deviations above mean for CLOSED threshold.
+        """
+        if not hasattr(self, 'mean_closed') or not hasattr(self, 'std_closed'):
+            print("Warning: Model statistics not loaded, cannot update threshold")
+            return
+
+        self.s_closed = s_closed
+        self.THRESHOLD_CLOSED = self.mean_closed + s_closed * self.std_closed
+
+        print(f"[THRESHOLD] CLOSED: s={s_closed:.2f} → threshold={self.THRESHOLD_CLOSED:.4f}")
+
+    def update_thresholds(self, s_open: float = None, s_closed: float = None) -> None:
+        """
+        Update both thresholds. If only one is provided, only that one is updated.
+
+        Args:
+            s_open: Standard deviations for OPEN threshold (None = keep current)
+            s_closed: Standard deviations for CLOSED threshold (None = keep current)
+        """
+        if s_open is not None:
+            self.update_threshold_open(s_open)
+        if s_closed is not None:
+            self.update_threshold_closed(s_closed)
 
     def reset_history(self) -> None:
         """Reset all history buffers for a new acquisition session."""
@@ -306,7 +331,8 @@ class Model:
             "std_open": getattr(self, 'std_open', None),
             "mean_closed": getattr(self, 'mean_closed', None),
             "std_closed": getattr(self, 'std_closed', None),
-            "threshold_s": self.threshold_s,
+            "s_open": self.s_open,
+            "s_closed": self.s_closed,
             "state_transitions": self.state_transitions,
         }
 

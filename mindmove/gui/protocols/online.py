@@ -188,8 +188,10 @@ class OnlineProtocol(QObject):
         ax2.grid(True, alpha=0.3)
 
         # Add info text
-        s_value = history.get("threshold_s", 1.0)
-        fig.suptitle(f"Online Session Distance Analysis (s = {s_value:.2f})", fontsize=14, fontweight='bold')
+        s_open = history.get("s_open", 1.0)
+        s_closed = history.get("s_closed", 1.0)
+        fig.suptitle(f"Online Session Distance Analysis (s_open={s_open:.2f}, s_closed={s_closed:.2f})",
+                     fontsize=14, fontweight='bold')
 
         plt.tight_layout()
         plt.show()
@@ -257,17 +259,27 @@ class OnlineProtocol(QObject):
         self._update_threshold_display()
 
     def _update_threshold_display(self) -> None:
-        """Update the threshold value label after model load or slider change."""
+        """Update the threshold labels after model load."""
         thresholds = self.model_interface.get_current_thresholds()
         if thresholds and thresholds.get("threshold_open") is not None:
-            s = thresholds.get("threshold_s", 1.0)
-            # Update slider position to match model's s value
-            self.threshold_slider.blockSignals(True)
-            self.threshold_slider.setValue(int(s * 100))
-            self.threshold_slider.blockSignals(False)
+            s_open = thresholds.get("s_open", 1.0)
+            s_closed = thresholds.get("s_closed", 1.0)
 
-            self.threshold_value_label.setText(
-                f"s = {s:.2f} | OPEN: {thresholds['threshold_open']:.4f} | CLOSED: {thresholds['threshold_closed']:.4f}"
+            # Update slider positions to match model's s values
+            self.threshold_slider_open.blockSignals(True)
+            self.threshold_slider_open.setValue(int(s_open * 100))
+            self.threshold_slider_open.blockSignals(False)
+
+            self.threshold_slider_closed.blockSignals(True)
+            self.threshold_slider_closed.setValue(int(s_closed * 100))
+            self.threshold_slider_closed.blockSignals(False)
+
+            # Update labels
+            self.threshold_open_label.setText(
+                f"s_open = {s_open:.2f} | Threshold: {thresholds['threshold_open']:.4f}"
+            )
+            self.threshold_closed_label.setText(
+                f"s_closed = {s_closed:.2f} | Threshold: {thresholds['threshold_closed']:.4f}"
             )
 
     def _setup_protocol_ui(self) -> None:
@@ -290,60 +302,93 @@ class OnlineProtocol(QObject):
         self._setup_threshold_slider()
 
     def _setup_threshold_slider(self) -> None:
-        """Setup threshold tuning slider UI."""
+        """Setup threshold tuning sliders UI (separate for OPEN and CLOSED)."""
         # Create a group box for threshold tuning
-        self.threshold_group_box = QGroupBox("Threshold Tuning (s value)")
+        self.threshold_group_box = QGroupBox("Threshold Tuning")
 
-        layout = QVBoxLayout()
+        main_layout = QVBoxLayout()
 
-        # Slider row
-        slider_layout = QHBoxLayout()
+        # --- OPEN threshold slider ---
+        open_label = QLabel("s_open (OPEN threshold):")
+        main_layout.addWidget(open_label)
 
-        # Min label
-        min_label = QLabel("0.5")
-        slider_layout.addWidget(min_label)
+        open_slider_layout = QHBoxLayout()
+        open_slider_layout.addWidget(QLabel("0.5"))
 
-        # Slider (0.5 to 3.0, mapped as 50 to 300 for integer slider)
-        self.threshold_slider = QSlider(Qt.Horizontal)
-        self.threshold_slider.setMinimum(50)
-        self.threshold_slider.setMaximum(300)
-        self.threshold_slider.setValue(100)  # Default s=1.0
-        self.threshold_slider.setTickPosition(QSlider.TicksBelow)
-        self.threshold_slider.setTickInterval(50)
-        self.threshold_slider.valueChanged.connect(self._on_threshold_slider_changed)
-        slider_layout.addWidget(self.threshold_slider)
+        self.threshold_slider_open = QSlider(Qt.Horizontal)
+        self.threshold_slider_open.setMinimum(50)
+        self.threshold_slider_open.setMaximum(300)
+        self.threshold_slider_open.setValue(100)  # Default s=1.0
+        self.threshold_slider_open.setTickPosition(QSlider.TicksBelow)
+        self.threshold_slider_open.setTickInterval(50)
+        self.threshold_slider_open.valueChanged.connect(self._on_threshold_open_changed)
+        open_slider_layout.addWidget(self.threshold_slider_open)
 
-        # Max label
-        max_label = QLabel("3.0")
-        slider_layout.addWidget(max_label)
+        open_slider_layout.addWidget(QLabel("3.0"))
+        main_layout.addLayout(open_slider_layout)
 
-        layout.addLayout(slider_layout)
+        self.threshold_open_label = QLabel("s_open = 1.00 | Threshold: Not loaded")
+        main_layout.addWidget(self.threshold_open_label)
 
-        # Value display
-        self.threshold_value_label = QLabel("s = 1.00 | Thresholds: Not loaded")
-        layout.addWidget(self.threshold_value_label)
+        # --- CLOSED threshold slider ---
+        closed_label = QLabel("s_closed (CLOSED threshold):")
+        main_layout.addWidget(closed_label)
 
-        self.threshold_group_box.setLayout(layout)
+        closed_slider_layout = QHBoxLayout()
+        closed_slider_layout.addWidget(QLabel("0.5"))
+
+        self.threshold_slider_closed = QSlider(Qt.Horizontal)
+        self.threshold_slider_closed.setMinimum(50)
+        self.threshold_slider_closed.setMaximum(300)
+        self.threshold_slider_closed.setValue(100)  # Default s=1.0
+        self.threshold_slider_closed.setTickPosition(QSlider.TicksBelow)
+        self.threshold_slider_closed.setTickInterval(50)
+        self.threshold_slider_closed.valueChanged.connect(self._on_threshold_closed_changed)
+        closed_slider_layout.addWidget(self.threshold_slider_closed)
+
+        closed_slider_layout.addWidget(QLabel("3.0"))
+        main_layout.addLayout(closed_slider_layout)
+
+        self.threshold_closed_label = QLabel("s_closed = 1.00 | Threshold: Not loaded")
+        main_layout.addWidget(self.threshold_closed_label)
+
+        self.threshold_group_box.setLayout(main_layout)
 
         # Add to the online commands group box layout
         if self.online_commands_group_box.layout():
             self.online_commands_group_box.layout().addWidget(self.threshold_group_box)
 
-    def _on_threshold_slider_changed(self, value: int) -> None:
-        """Called when threshold slider is moved."""
-        s = value / 100.0  # Convert back to float (50-300 -> 0.5-3.0)
+    def _on_threshold_open_changed(self, value: int) -> None:
+        """Called when OPEN threshold slider is moved."""
+        s_open = value / 100.0  # Convert back to float (50-300 -> 0.5-3.0)
 
-        # Update model thresholds
-        self.model_interface.update_thresholds(s)
+        # Update model threshold
+        self.model_interface.update_threshold_open(s_open)
 
         # Update label
         thresholds = self.model_interface.get_current_thresholds()
         if thresholds and thresholds.get("threshold_open") is not None:
-            self.threshold_value_label.setText(
-                f"s = {s:.2f} | OPEN: {thresholds['threshold_open']:.4f} | CLOSED: {thresholds['threshold_closed']:.4f}"
+            self.threshold_open_label.setText(
+                f"s_open = {s_open:.2f} | Threshold: {thresholds['threshold_open']:.4f}"
             )
         else:
-            self.threshold_value_label.setText(f"s = {s:.2f} | Thresholds: Not loaded")
+            self.threshold_open_label.setText(f"s_open = {s_open:.2f} | Threshold: Not loaded")
+
+    def _on_threshold_closed_changed(self, value: int) -> None:
+        """Called when CLOSED threshold slider is moved."""
+        s_closed = value / 100.0  # Convert back to float (50-300 -> 0.5-3.0)
+
+        # Update model threshold
+        self.model_interface.update_threshold_closed(s_closed)
+
+        # Update label
+        thresholds = self.model_interface.get_current_thresholds()
+        if thresholds and thresholds.get("threshold_closed") is not None:
+            self.threshold_closed_label.setText(
+                f"s_closed = {s_closed:.2f} | Threshold: {thresholds['threshold_closed']:.4f}"
+            )
+        else:
+            self.threshold_closed_label.setText(f"s_closed = {s_closed:.2f} | Threshold: Not loaded")
 
 
 ######################################

@@ -161,10 +161,20 @@ class MindMoveInterface(QObject):
         if self.use_diagnostic and hasattr(self.model, 'print_summary'):
             self.model.print_summary()
 
-    def update_thresholds(self, s: float) -> None:
-        """Update thresholds with new s value (standard deviation multiplier)."""
+    def update_threshold_open(self, s_open: float) -> None:
+        """Update OPEN threshold with new s_open value."""
+        if self.model and hasattr(self.model, 'update_threshold_open'):
+            self.model.update_threshold_open(s_open)
+
+    def update_threshold_closed(self, s_closed: float) -> None:
+        """Update CLOSED threshold with new s_closed value."""
+        if self.model and hasattr(self.model, 'update_threshold_closed'):
+            self.model.update_threshold_closed(s_closed)
+
+    def update_thresholds(self, s_open: float = None, s_closed: float = None) -> None:
+        """Update thresholds with new s values (standard deviation multipliers)."""
         if self.model and hasattr(self.model, 'update_thresholds'):
-            self.model.update_thresholds(s)
+            self.model.update_thresholds(s_open, s_closed)
 
     def reset_history(self) -> None:
         """Reset history buffers for new acquisition session."""
@@ -183,7 +193,8 @@ class MindMoveInterface(QObject):
             return {
                 "threshold_open": getattr(self.model, 'THRESHOLD_OPEN', None),
                 "threshold_closed": getattr(self.model, 'THRESHOLD_CLOSED', None),
-                "threshold_s": getattr(self.model, 'threshold_s', 1.0),
+                "s_open": getattr(self.model, 's_open', 1.0),
+                "s_closed": getattr(self.model, 's_closed', 1.0),
                 "mean_open": getattr(self.model, 'mean_open', None),
                 "std_open": getattr(self.model, 'std_open', None),
                 "mean_closed": getattr(self.model, 'mean_closed', None),

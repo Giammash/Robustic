@@ -4,10 +4,11 @@ Template Manager for MindMove.
 Handles extraction, selection, and management of EMG templates from recordings.
 Supports both "hold only" and "onset + hold" template types.
 
-Supports three recording formats:
-1. MindMove format: {emg, kinematics, timings_emg, timings_kinematics, label, task}
-2. VHI format: {biosignal, ground_truth, biosignal_timings, ground_truth_timings, ...}
-3. Legacy format: Separate EMG files + GT files with timestamp synchronization
+Supports four recording formats:
+1. MindMove Virtual Hand format: {emg, kinematics, gt_mode: "virtual_hand", ...}
+2. MindMove Keyboard format: {emg, gt, gt_mode: "keyboard", ...}
+3. VHI format: {biosignal, ground_truth, biosignal_timings, ground_truth_timings, ...}
+4. Legacy format: Separate EMG files + GT files with timestamp synchronization
 """
 
 import os
@@ -25,9 +26,12 @@ class TemplateManager:
     """Manages template extraction from recordings."""
 
     # Recording format constants
-    FORMAT_MINDMOVE = "mindmove"  # emg, kinematics keys
+    FORMAT_MINDMOVE_VH = "mindmove_vh"  # emg, kinematics keys (virtual hand)
+    FORMAT_MINDMOVE_KB = "mindmove_kb"  # emg, gt keys (keyboard)
     FORMAT_VHI = "vhi"  # biosignal, ground_truth keys
     FORMAT_LEGACY = "legacy"  # Separate EMG + GT files
+    # Backwards compatibility alias
+    FORMAT_MINDMOVE = "mindmove_vh"
 
     # Template duration options (in seconds)
     DURATION_OPTIONS = [0.5, 1.0, 1.5, 2.0]
@@ -65,14 +69,22 @@ class TemplateManager:
         Auto-detect the format of a recording dictionary.
 
         Returns:
-            One of: FORMAT_MINDMOVE, FORMAT_VHI
+            One of: FORMAT_MINDMOVE_VH, FORMAT_MINDMOVE_KB, FORMAT_VHI
         """
-        if "emg" in recording and "kinematics" in recording:
-            return TemplateManager.FORMAT_MINDMOVE
+        # Check gt_mode field if present
+        gt_mode = recording.get("gt_mode", None)
+
+        if "emg" in recording:
+            if gt_mode == "keyboard" or "gt" in recording:
+                # Keyboard mode: emg + gt (binary)
+                return TemplateManager.FORMAT_MINDMOVE_KB
+            elif "kinematics" in recording:
+                # Virtual hand mode: emg + kinematics
+                return TemplateManager.FORMAT_MINDMOVE_VH
         elif "biosignal" in recording and "ground_truth" in recording:
             return TemplateManager.FORMAT_VHI
-        else:
-            raise ValueError(f"Unknown recording format. Keys: {list(recording.keys())}")
+
+        raise ValueError(f"Unknown recording format. Keys: {list(recording.keys())}")
 
     @staticmethod
     def normalize_recording(recording: dict) -> dict:
@@ -84,12 +96,29 @@ class TemplateManager:
 
         Returns:
             Normalized dict with keys: emg, kinematics, label, task
+            Note: For keyboard format, kinematics will be the binary GT reshaped to (1, n_samples)
         """
         fmt = TemplateManager.detect_recording_format(recording)
 
-        if fmt == TemplateManager.FORMAT_MINDMOVE:
-            # Already in correct format
+        if fmt == TemplateManager.FORMAT_MINDMOVE_VH:
+            # Virtual hand format - already in correct format
             return recording
+
+        elif fmt == TemplateManager.FORMAT_MINDMOVE_KB:
+            # Keyboard format - gt is already binary at EMG sample rate
+            gt = recording["gt"]
+            # Reshape to (1, n_samples) to match expected kinematics shape
+            kinematics = gt.reshape(1, -1) if gt.ndim == 1 else gt
+
+            return {
+                "emg": recording["emg"],
+                "kinematics": kinematics,  # Binary GT as "kinematics"
+                "timings_emg": recording.get("timings_emg"),
+                "timings_kinematics": recording.get("timings_emg"),  # Same as EMG
+                "label": recording.get("label", "default"),
+                "task": recording.get("task", "unknown"),
+                "gt_mode": "keyboard",
+            }
 
         elif fmt == TemplateManager.FORMAT_VHI:
             # Convert VHI format
@@ -270,13 +299,14 @@ class TemplateManager:
 
         emg = normalized["emg"]
         kinematics = normalized["kinematics"]
+        gt_mode = normalized.get("gt_mode", None)
 
-        # Check if kinematics is already binary (legacy format with 1 dimension)
-        if kinematics.shape[0] == 1:
-            # Legacy format - kinematics is already binary
+        # Determine how to process ground truth
+        if gt_mode == "keyboard" or kinematics.shape[0] == 1:
+            # Keyboard format or legacy format - kinematics is already binary at EMG rate
             gt_binary = kinematics.flatten().astype(int)
         else:
-            # Multi-dimensional kinematics - convert to binary
+            # Virtual hand: Multi-dimensional kinematics - convert to binary
             gt_binary = self._convert_kinematics_to_binary(kinematics, emg.shape[1])
 
         # Extract activation segments

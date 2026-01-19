@@ -1,6 +1,8 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, Qt
+from PySide6.QtWidgets import QComboBox, QLabel, QShortcut
+from PySide6.QtGui import QKeySequence
 import time
 import numpy as np
 import pickle
@@ -42,6 +44,38 @@ class RecordProtocol(QObject):
         # File management:
         self.recording_dir_path: str = "data/recordings/"
 
+        # Ground truth mode: "virtual_hand" or "keyboard"
+        self.gt_mode: str = "keyboard"  # Default to keyboard for simplicity
+
+        # Keyboard trigger state
+        self.keyboard_gt_state: int = 0  # 0 = OPEN, 1 = CLOSED
+        self.keyboard_gt_buffer: list = []  # (timestamp, state) pairs
+
+        # Setup keyboard shortcut (spacebar)
+        self._setup_keyboard_shortcut()
+
+    def _setup_keyboard_shortcut(self) -> None:
+        """Setup spacebar shortcut for GT toggle."""
+        self.spacebar_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self.main_window)
+        self.spacebar_shortcut.activated.connect(self._toggle_keyboard_gt)
+        self.spacebar_shortcut.setEnabled(False)  # Only enabled during recording
+
+    def _toggle_keyboard_gt(self) -> None:
+        """Toggle ground truth state when spacebar is pressed."""
+        if self.gt_mode != "keyboard":
+            return
+
+        # Toggle state
+        self.keyboard_gt_state = 1 - self.keyboard_gt_state
+        current_time = time.time()
+
+        # Store the transition
+        self.keyboard_gt_buffer.append((current_time, self.keyboard_gt_state))
+
+        # Visual feedback
+        state_str = "CLOSED" if self.keyboard_gt_state == 1 else "OPEN"
+        print(f"\n[SPACEBAR] GT toggled to: {state_str} at t={current_time - self.start_time:.2f}s\n")
+
     def emg_update(self, data: np.ndarray) -> None:
         self.emg_buffer.append((time.time(), data))
         current_samples = len(self.emg_buffer) * self.emg_buffer[0][1].shape[1]
@@ -71,14 +105,19 @@ class RecordProtocol(QObject):
                 self.record_toggle_push_button.setChecked(False)
                 return
 
-            if not self.main_window.virtual_hand_interface.is_streaming:
-                print("Virtual Hand Interface is not connected!")
-                self.record_toggle_push_button.setChecked(False)
-                return
+            # Get GT mode from combo box
+            self.gt_mode = self.gt_mode_combo_box.currentData()
 
-            self.main_window.virtual_hand_interface.input_message_signal.connect(
-                self.kinematics_update
-            )
+            # Check virtual hand connection only if using virtual hand mode
+            if self.gt_mode == "virtual_hand":
+                if not self.main_window.virtual_hand_interface.is_streaming:
+                    print("Virtual Hand Interface is not connected!")
+                    self.record_toggle_push_button.setChecked(False)
+                    return
+
+                self.main_window.virtual_hand_interface.input_message_signal.connect(
+                    self.kinematics_update
+                )
 
             self.main_window.device.ready_read_signal.connect(self.emg_update)
 
@@ -87,6 +126,8 @@ class RecordProtocol(QObject):
             # Reset buffers
             self.emg_buffer = []
             self.kinematics_buffer = []
+            self.keyboard_gt_buffer = []
+            self.keyboard_gt_state = 0  # Start with OPEN
 
             # Set duration time
             self.recording_time: int = self.record_duration_spin_box.value()
@@ -103,6 +144,15 @@ class RecordProtocol(QObject):
 
             self.has_finished_emg = False
             self.has_finished_kinematics = False
+
+            # Enable spacebar shortcut for keyboard mode
+            if self.gt_mode == "keyboard":
+                self.spacebar_shortcut.setEnabled(True)
+                self.has_finished_kinematics = True  # No kinematics to wait for
+                print("\n" + "=" * 60)
+                print("KEYBOARD MODE: Press SPACEBAR to toggle GT (OPEN/CLOSED)")
+                print("Starting state: OPEN (GT=0)")
+                print("=" * 60 + "\n")
 
     def _set_emg_progress_bar(self, value: int) -> None:
         self.record_emg_progress_bar.setValue(value / self.emg_recording_time * 100)
@@ -121,19 +171,33 @@ class RecordProtocol(QObject):
             print("EMG recording not finished yet!")
             return
 
+        # Disable spacebar shortcut
+        self.spacebar_shortcut.setEnabled(False)
+
         self.review_recording_stacked_widget.setCurrentIndex(1)
         self.record_toggle_push_button.setText("Finished Recording")
         self.review_recording_task_label.setText(self.current_task.capitalize())
 
-        # Plot Kinematics Signal in Preview Window
-        kinematics_signal = np.vstack([data for _, data in self.kinematics_buffer]).T
-        self.review_recording_kinematics_plot_widget.refresh_plot()
-        self.review_recording_kinematics_plot_widget.configure_lines_plot(
-            display_time=self.recording_time,
-            fs=self.kinematics_sampling_frequency,
-            lines=kinematics_signal.shape[0],
-        )
-        self.review_recording_kinematics_plot_widget.set_plot_data(kinematics_signal)
+        # Plot GT/Kinematics Signal in Preview Window
+        if self.gt_mode == "virtual_hand":
+            kinematics_signal = np.vstack([data for _, data in self.kinematics_buffer]).T
+            self.review_recording_kinematics_plot_widget.refresh_plot()
+            self.review_recording_kinematics_plot_widget.configure_lines_plot(
+                display_time=self.recording_time,
+                fs=self.kinematics_sampling_frequency,
+                lines=kinematics_signal.shape[0],
+            )
+            self.review_recording_kinematics_plot_widget.set_plot_data(kinematics_signal)
+        else:
+            # Keyboard mode: build GT signal from toggle events
+            gt_signal = self._build_gt_signal_from_keyboard()
+            self.review_recording_kinematics_plot_widget.refresh_plot()
+            self.review_recording_kinematics_plot_widget.configure_lines_plot(
+                display_time=self.recording_time,
+                fs=self.emg_sampling_frequency,  # Same fs as EMG for GT
+                lines=1,
+            )
+            self.review_recording_kinematics_plot_widget.set_plot_data(gt_signal.reshape(1, -1))
 
         # Plot EMG Signal in Preview Window
         emg_signal = np.hstack([data for _, data in self.emg_buffer])[
@@ -147,6 +211,33 @@ class RecordProtocol(QObject):
             lines=emg_signal.shape[0],
         )
         self.review_recording_emg_plot_widget.set_plot_data(emg_signal / 1000)
+
+    def _build_gt_signal_from_keyboard(self) -> np.ndarray:
+        """Build a GT signal from keyboard toggle events."""
+        n_samples = self.emg_recording_time
+        gt_signal = np.zeros(n_samples)
+
+        if not self.keyboard_gt_buffer:
+            return gt_signal
+
+        # Convert toggle events to continuous signal
+        current_state = 0  # Start with OPEN
+        last_sample = 0
+
+        for toggle_time, new_state in self.keyboard_gt_buffer:
+            # Calculate sample index
+            sample_idx = int((toggle_time - self.start_time) * self.emg_sampling_frequency)
+            sample_idx = min(sample_idx, n_samples - 1)
+
+            # Fill from last sample to this sample with previous state
+            gt_signal[last_sample:sample_idx] = current_state
+            current_state = new_state
+            last_sample = sample_idx
+
+        # Fill remaining samples with final state
+        gt_signal[last_sample:] = current_state
+
+        return gt_signal
 
     def _accept_recording(self) -> None:
         print("Recording accepted")
@@ -164,16 +255,32 @@ class RecordProtocol(QObject):
             np.hstack([data for _, data in self.emg_buffer])
         )[:, : self.emg_recording_time]
 
-        save_pickle_dict = {
-            "emg": emg_signal,
-            "kinematics": np.vstack([data for _, data in self.kinematics_buffer]).T,
-            "timings_emg": np.array([time_stamp for time_stamp, _ in self.emg_buffer]),
-            "timings_kinematics": np.array(
-                [time_stamp for time_stamp, _ in self.kinematics_buffer]
-            ),
-            "label": label,
-            "task": self.current_task,
-        }
+        # Build save dict based on GT mode
+        if self.gt_mode == "virtual_hand":
+            save_pickle_dict = {
+                "emg": emg_signal,
+                "kinematics": np.vstack([data for _, data in self.kinematics_buffer]).T,
+                "timings_emg": np.array([time_stamp for time_stamp, _ in self.emg_buffer]),
+                "timings_kinematics": np.array(
+                    [time_stamp for time_stamp, _ in self.kinematics_buffer]
+                ),
+                "label": label,
+                "task": self.current_task,
+                "gt_mode": "virtual_hand",
+            }
+        else:
+            # Keyboard mode: save GT signal directly
+            gt_signal = self._build_gt_signal_from_keyboard()
+            save_pickle_dict = {
+                "emg": emg_signal,
+                "gt": gt_signal,  # Binary GT signal at EMG sampling rate
+                "keyboard_toggles": self.keyboard_gt_buffer,  # Raw toggle events
+                "timings_emg": np.array([time_stamp for time_stamp, _ in self.emg_buffer]),
+                "label": label,
+                "task": self.current_task,
+                "gt_mode": "keyboard",
+            }
+
         now = datetime.now()
         formatted_now = now.strftime("%Y%m%d_%H%M%S%f")
         file_name = f"MindMove_Recording_{formatted_now}_{self.current_task.lower()}_{label.lower()}.pkl"
@@ -184,6 +291,12 @@ class RecordProtocol(QObject):
         with open(os.path.join(self.recording_dir_path, file_name), "wb") as f:
             pickle.dump(save_pickle_dict, f)
 
+        print(f"Recording saved: {file_name}")
+        print(f"  GT mode: {self.gt_mode}")
+        print(f"  EMG shape: {emg_signal.shape}")
+        if self.gt_mode == "keyboard":
+            print(f"  GT toggles: {len(self.keyboard_gt_buffer)}")
+
         # Reset progress bars
         self.record_emg_progress_bar.setValue(0)
         self.record_kinematics_progress_bar.setValue(0)
@@ -191,6 +304,7 @@ class RecordProtocol(QObject):
         # Reset buffers
         self.emg_buffer = []
         self.kinematics_buffer = []
+        self.keyboard_gt_buffer = []
 
     def _reject_recording(self) -> None:
         self.review_recording_stacked_widget.setCurrentIndex(0)
@@ -216,6 +330,33 @@ class RecordProtocol(QObject):
         )
         self.record_kinematics_progress_bar.setValue(0)
 
+        # Add GT mode selector (programmatically)
+        self._setup_gt_mode_selector()
+
+        # Setup review recording UI
+        self._setup_review_ui()
+
+    def _setup_gt_mode_selector(self) -> None:
+        """Setup GT mode selector combo box."""
+        from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout
+
+        # Create GT mode selector
+        gt_mode_label = QLabel("Ground Truth Mode:")
+        self.gt_mode_combo_box = QComboBox()
+        self.gt_mode_combo_box.addItem("Keyboard (Spacebar toggle)", "keyboard")
+        self.gt_mode_combo_box.addItem("Virtual Hand Interface", "virtual_hand")
+
+        # Add to record group box layout
+        if self.record_group_box.layout():
+            layout = self.record_group_box.layout()
+            # Insert at the beginning
+            gt_layout = QHBoxLayout()
+            gt_layout.addWidget(gt_mode_label)
+            gt_layout.addWidget(self.gt_mode_combo_box)
+            layout.insertLayout(0, gt_layout)
+
+    def _setup_review_ui(self) -> None:
+        """Setup review recording UI."""
         # Review Recording UI
         self.review_recording_stacked_widget = (
             self.main_window.ui.recordReviewRecordingStackedWidget
