@@ -1,8 +1,8 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 from PySide6.QtCore import QObject, Qt
-from PySide6.QtWidgets import QComboBox, QLabel, QShortcut
-from PySide6.QtGui import QKeySequence
+from PySide6.QtWidgets import QComboBox, QLabel
+from PySide6.QtGui import QKeySequence, QShortcut
 import time
 import numpy as np
 import pickle
@@ -338,7 +338,7 @@ class RecordProtocol(QObject):
 
     def _setup_gt_mode_selector(self) -> None:
         """Setup GT mode selector combo box."""
-        from PySide6.QtWidgets import QHBoxLayout, QVBoxLayout
+        from PySide6.QtWidgets import QGridLayout
 
         # Create GT mode selector
         gt_mode_label = QLabel("Ground Truth Mode:")
@@ -347,13 +347,12 @@ class RecordProtocol(QObject):
         self.gt_mode_combo_box.addItem("Virtual Hand Interface", "virtual_hand")
 
         # Add to record group box layout
-        if self.record_group_box.layout():
-            layout = self.record_group_box.layout()
-            # Insert at the beginning
-            gt_layout = QHBoxLayout()
-            gt_layout.addWidget(gt_mode_label)
-            gt_layout.addWidget(self.gt_mode_combo_box)
-            layout.insertLayout(0, gt_layout)
+        layout = self.record_group_box.layout()
+        if layout and isinstance(layout, QGridLayout):
+            # Add GT mode selector to the next available row
+            next_row = layout.rowCount()
+            layout.addWidget(gt_mode_label, next_row, 0)
+            layout.addWidget(self.gt_mode_combo_box, next_row, 1)
 
     def _setup_review_ui(self) -> None:
         """Setup review recording UI."""
