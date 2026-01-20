@@ -8,8 +8,11 @@ from PySide6.QtCore import QObject, Signal, QByteArray, SignalInstance
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QMessageBox, QMainWindow
 
-from myogestic.gui.widgets.templates.meta_qobject import MetaQObjectABC
-from myogestic.utils.constants import RECORDING_DIR_PATH
+from mindmove.gui.widgets.templates.meta_qobject import MetaQObjectABC
+
+# Recording directory path
+from pathlib import Path
+RECORDING_DIR_PATH = Path("data/recordings")
 
 
 class SetupInterfaceTemplate(QObject, metaclass=MetaQObjectABC):
@@ -38,9 +41,9 @@ class SetupInterfaceTemplate(QObject, metaclass=MetaQObjectABC):
     def __init__(self, main_window, name: str = "SetupUI", ui: object = None):
         super().__init__()
 
-        from myogestic.gui.myogestic import MyoGestic
+        from mindmove.gui.mindmove import MindMove
 
-        self._main_window: MyoGestic = main_window
+        self._main_window: MindMove = main_window
         self.name = name
 
         if not ui:
@@ -48,13 +51,20 @@ class SetupInterfaceTemplate(QObject, metaclass=MetaQObjectABC):
         self.ui = ui
         self.ui.setupUi(self._main_window)
 
-        from myogestic.gui.protocols.record import RecordProtocol
-        from myogestic.gui.protocols.training import TrainingProtocol
-        from myogestic.gui.protocols.online import OnlineProtocol
+        # Protocol references - these may not exist in simpler MindMove setup
+        self._record_protocol = None
+        self._training_protocol = None
+        self._online_protocol = None
 
-        self._record_protocol: RecordProtocol = self._main_window.protocols[0]
-        self._training_protocol: TrainingProtocol = self._main_window.protocols[1]
-        self._online_protocol: OnlineProtocol = self._main_window.protocols[2]
+        # Try to get protocols if they exist
+        if hasattr(self._main_window, 'protocol') and hasattr(self._main_window.protocol, 'protocols'):
+            protocols = self._main_window.protocol.protocols
+            if len(protocols) > 0:
+                self._record_protocol = protocols[0]
+            if len(protocols) > 1:
+                self._training_protocol = protocols[1]
+            if len(protocols) > 2:
+                self._online_protocol = protocols[2]
 
     @abstractmethod
     def initialize_ui_logic(self) -> None:
@@ -174,9 +184,9 @@ class RecordingInterfaceTemplate(QObject, metaclass=MetaQObjectABC):
     ):
         super().__init__()
 
-        from myogestic.gui.myogestic import MyoGestic
+        from mindmove.gui.mindmove import MindMove
 
-        self._main_window: MyoGestic = main_window
+        self._main_window: MindMove = main_window
         self.name = name
 
         if not ui:
@@ -184,8 +194,10 @@ class RecordingInterfaceTemplate(QObject, metaclass=MetaQObjectABC):
         self.ui = ui
         self.ui.setupUi(self._main_window)
 
-        self._record_emg_progress__bar = self._main_window.ui.recordEMGProgressBar
-        self._record_emg_progress__bar.setValue(0)
+        # Try to get EMG progress bar if it exists
+        self._record_emg_progress__bar = getattr(self._main_window.ui, 'recordEMGProgressBar', None)
+        if self._record_emg_progress__bar:
+            self._record_emg_progress__bar.setValue(0)
 
         if ground_truth__nr_of_recording_values == -1:
             raise ValueError("The number of recording values must be provided.")
@@ -201,9 +213,8 @@ class RecordingInterfaceTemplate(QObject, metaclass=MetaQObjectABC):
             self.record_ground_truth_progress_bar = self.ui.groundTruthProgressBar
             self.record_ground_truth_progress_bar.setValue(0)
         else:
-            raise ValueError(
-                "A UI element named 'groundTruthProgressBar' must be provided in the ui file!"
-            )
+            self.ground_truth_recording_time = 0
+            self.record_ground_truth_progress_bar = None
 
         if not incoming_message_signal:
             raise ValueError("The incoming message signal must be provided.")
@@ -248,6 +259,19 @@ class RecordingInterfaceTemplate(QObject, metaclass=MetaQObjectABC):
             Additional custom data to save.
         """
 
+        # Get device information if available
+        device_info = {}
+        if hasattr(self._main_window, 'device') and hasattr(self._main_window.device, 'get_device_information'):
+            device_info = self._main_window.device.get_device_information()
+
+        # Get bad channels if available
+        bad_channels = getattr(self._main_window, 'current_bad_channels__list', [])
+
+        # Get visual interface name if available
+        visual_interface_name = "VirtualHandInterface"
+        if hasattr(self._main_window, 'selected_visual_interface'):
+            visual_interface_name = self._main_window.selected_visual_interface.name
+
         save_pickle_dict = {
             "biosignal": biosignal,
             "biosignal_timings": biosignal_timings,
@@ -256,16 +280,19 @@ class RecordingInterfaceTemplate(QObject, metaclass=MetaQObjectABC):
             "recording_label": recording_label,
             "task": task,
             "ground_truth_sampling_frequency": ground_truth_sampling_frequency,
-            "device_information": self._main_window.device__widget.get_device_information(),
-            "bad_channels": self._main_window.current_bad_channels__list,
+            "device_information": device_info,
+            "bad_channels": bad_channels,
             "recording_time": record_duration,
             "use_as_classification": use_as_classification,
-            "visual_interface": self._main_window.selected_visual_interface.name,
+            "visual_interface": visual_interface_name,
         }
 
         save_pickle_dict.update(kwargs)
 
         file_name = f"{save_pickle_dict['visual_interface']}_Recording_{datetime.now().strftime('%Y%m%d_%H%M%S%f')}_{task.lower()}_{recording_label.lower()}.pkl"
+
+        # Ensure directory exists
+        RECORDING_DIR_PATH.mkdir(parents=True, exist_ok=True)
 
         with (RECORDING_DIR_PATH / file_name).open("wb") as f:
             pickle.dump(save_pickle_dict, f)
@@ -315,6 +342,19 @@ class RecordingInterfaceTemplate(QObject, metaclass=MetaQObjectABC):
             Additional custom data to save.
         """
 
+        # Get device information if available
+        device_info = {}
+        if hasattr(self._main_window, 'device') and hasattr(self._main_window.device, 'get_device_information'):
+            device_info = self._main_window.device.get_device_information()
+
+        # Get bad channels if available
+        bad_channels = getattr(self._main_window, 'current_bad_channels__list', [])
+
+        # Get visual interface name if available
+        visual_interface_name = "VirtualCursorInterface"
+        if hasattr(self._main_window, 'selected_visual_interface'):
+            visual_interface_name = self._main_window.selected_visual_interface.name
+
         save_pickle_dict = {
             "biosignal": biosignal,
             "biosignal_timings": biosignal_timings,
@@ -325,16 +365,19 @@ class RecordingInterfaceTemplate(QObject, metaclass=MetaQObjectABC):
             "movement": movement,
             "task_label_map": task_label_map,
             "ground_truth_sampling_frequency": ground_truth_sampling_frequency,
-            "device_information": self._main_window.device__widget.get_device_information(),
-            "bad_channels": self._main_window.current_bad_channels__list,
+            "device_information": device_info,
+            "bad_channels": bad_channels,
             "recording_time": record_duration,
             "use_as_classification": use_as_classification,
-            "visual_interface": self._main_window.selected_visual_interface.name,
+            "visual_interface": visual_interface_name,
         }
 
         save_pickle_dict.update(kwargs)
 
         file_name = f"{save_pickle_dict['visual_interface']}_Recording_{datetime.now().strftime('%Y%m%d_%H%M%S%f')}_{task.lower()}_{recording_label.lower()}.pkl"
+
+        # Ensure directory exists
+        RECORDING_DIR_PATH.mkdir(parents=True, exist_ok=True)
 
         with (RECORDING_DIR_PATH / file_name).open("wb") as f:
             pickle.dump(save_pickle_dict, f)
@@ -367,9 +410,9 @@ class RecordingInterfaceTemplate(QObject, metaclass=MetaQObjectABC):
 
 class VisualInterface(QObject):
     """
-    Base class for visual interfaces in the MyoGestic application.
+    Base class for visual interfaces in the MindMove application.
 
-    This class is the base class for visual interfaces in the MyoGestic application.
+    This class is the base class for visual interfaces in the MindMove application.
 
     Parameters
     ----------

@@ -23,7 +23,7 @@ import numpy as np
 from PySide6.QtCore import QByteArray, QObject, QProcess, QTimer, Signal
 from PySide6.QtGui import QCloseEvent
 from PySide6.QtNetwork import QHostAddress, QUdpSocket
-from PySide6.QtWidgets import QLineEdit, QMessageBox
+from PySide6.QtWidgets import QLineEdit, QMessageBox, QWidget, QSizePolicy
 
 if TYPE_CHECKING:
     from mindmove.gui.mindmove import MindMove
@@ -196,39 +196,56 @@ class VirtualHandInterface(QObject):
                 self._streaming_udp_socket.pendingDatagramSize()
             )
 
-            data = datagram.data().decode("utf-8")
-            if not data:
-                continue
+            raw_data = datagram.data()
 
             try:
+                data = raw_data.decode("utf-8")
+                if not data:
+                    continue
+
                 # Check for status response
                 if data == STATUS_RESPONSE:
                     self._is_connected = True
                     self._update_status_indicator()
                     self._status_timeout_timer.stop()
+                    print(f"VHI connected! (status response received)")
                     continue
 
                 # Parse as array data
+                print(f"Received text data: {data[:100]}...")  # Debug
                 self.input_message_signal.emit(np.array(ast.literal_eval(data)))
-            except (ValueError, SyntaxError):
-                pass
+            except UnicodeDecodeError:
+                # Binary data - print hex for debugging
+                print(f"Received binary data ({len(raw_data)} bytes): {raw_data[:20].hex()}...")
+            except (ValueError, SyntaxError) as e:
+                print(f"Parse error: {e}")
 
     def _read_predicted_hand(self) -> None:
-        """Read predicted hand data from VHI (interpolated hand visualization)."""
+        """Read predicted hand data from VHI (kinematics/ground truth at 60Hz)."""
         while self._predicted_hand_udp_socket and self._predicted_hand_udp_socket.hasPendingDatagrams():
             datagram, _, _ = self._predicted_hand_udp_socket.readDatagram(
                 self._predicted_hand_udp_socket.pendingDatagramSize()
             )
 
-            data = datagram.data().decode("utf-8")
-            if not data:
-                continue
+            raw_data = datagram.data()
 
             try:
+                data = raw_data.decode("utf-8")
+                if not data:
+                    continue
+
                 hand_data = np.array(ast.literal_eval(data))
+                # Only print occasionally to avoid spam
+                if not hasattr(self, '_hand_msg_count'):
+                    self._hand_msg_count = 0
+                self._hand_msg_count += 1
+                if self._hand_msg_count % 60 == 1:  # Print every ~1 second
+                    print(f"Kinematics data (port 1234): {hand_data}")
                 self.predicted_hand_signal.emit(hand_data)
-            except (ValueError, SyntaxError):
-                pass
+            except UnicodeDecodeError:
+                print(f"Binary kinematics ({len(raw_data)} bytes): {raw_data[:20].hex()}...")
+            except (ValueError, SyntaxError) as e:
+                print(f"Kinematics parse error: {e}")
 
     def _write_message(self, message: QByteArray) -> None:
         """Send a prediction message to the Virtual Hand Interface."""
@@ -475,10 +492,21 @@ class VirtualHandInterface(QObject):
             self._toggle_streaming
         )
 
-        # Try to get status widget if it exists
+        # Create status indicator widget
         self._status_widget = getattr(self.main_window.ui, 'virtualHandInterfaceStatusWidget', None)
-        if self._status_widget:
-            self._status_widget.setStyleSheet(NOT_CONNECTED_STYLESHEET)
+        if not self._status_widget:
+            # Create status widget programmatically if not in UI
+            self._status_widget = QWidget()
+            self._status_widget.setObjectName("virtualHandInterfaceStatusWidget")
+            size_policy = QSizePolicy(QSizePolicy.Policy.Fixed, QSizePolicy.Policy.Fixed)
+            self._status_widget.setSizePolicy(size_policy)
+            self._status_widget.setMinimumSize(10, 10)
+            self._status_widget.setMaximumSize(10, 10)
+            # Add to the control buttons group box layout
+            control_group_box = self.main_window.ui.groupBox_2
+            if control_group_box and control_group_box.layout():
+                control_group_box.layout().addWidget(self._status_widget, 0, 2)
+        self._status_widget.setStyleSheet(NOT_CONNECTED_STYLESHEET)
 
     def get_custom_save_data(self) -> dict:
         """Get recorded predicted hand data for saving."""
@@ -518,5 +546,3 @@ class VirtualHandInterface(QObject):
 
         # Stop Unity process
         self.stop_unity_interface()
-
-        return super().closeEvent(event)

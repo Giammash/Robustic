@@ -10,12 +10,13 @@ from PySide6.QtGui import QCloseEvent
 from PySide6.QtNetwork import QHostAddress, QUdpSocket
 from PySide6.QtWidgets import QCheckBox, QPushButton, QWidget
 
-from myogestic.gui.widgets.logger import LoggerLevel
-from myogestic.gui.widgets.templates.visual_interface import SetupInterfaceTemplate
-from myogestic.gui.widgets.visual_interfaces.virtual_hand_interface.ui import (
+from mindmove.gui.widgets.templates.visual_interface import SetupInterfaceTemplate
+from mindmove.gui.widgets.visual_interfaces.virtual_hand_interface.ui import (
     Ui_SetupVirtualHandInterface
 )
-from myogestic.utils.constants import MYOGESTIC_UDP_PORT
+
+# Port constant
+MINDMOVE_UDP_PORT = 1233
 
 # Stylesheets
 NOT_CONNECTED_STYLESHEET = "background-color: red; border-radius: 5px;"
@@ -92,7 +93,7 @@ class VirtualHandInterface_SetupInterface(SetupInterfaceTemplate):
         """Get the path to the Unity executable based on the platform."""
         base_dirs = [
             Path("dist") if not hasattr(sys, "_MEIPASS") else Path(sys._MEIPASS, "dist"),
-            Path("myogestic", "dist") if not hasattr(sys, "_MEIPASS") else Path(sys._MEIPASS, "dist"),
+            Path("mindmove", "dist") if not hasattr(sys, "_MEIPASS") else Path(sys._MEIPASS, "dist"),
         ]
 
         unity_executable_paths = {
@@ -177,9 +178,7 @@ class VirtualHandInterface_SetupInterface(SetupInterfaceTemplate):
                 self._unity_process.kill()
                 self._unity_process.waitForFinished()
         except Exception as e:
-            self._main_window.logger.print(
-                f"Error during cleanup: {e}", level=LoggerLevel.ERROR
-            )
+            print(f"Error during cleanup: {e}")
 
     def _update_status(self) -> None:
         """Update the status of the Virtual Hand Interface."""
@@ -208,7 +207,7 @@ class VirtualHandInterface_SetupInterface(SetupInterfaceTemplate):
             self._streaming__udp_socket.readyRead.connect(self.read_message)
             self.outgoing_message_signal.connect(self.write_message)
             self._streaming__udp_socket.bind(
-                QHostAddress(SOCKET_IP), MYOGESTIC_UDP_PORT
+                QHostAddress(SOCKET_IP), MINDMOVE_UDP_PORT
             )
 
             self._predicted_hand__udp_socket = QUdpSocket(self)
@@ -255,10 +254,7 @@ class VirtualHandInterface_SetupInterface(SetupInterfaceTemplate):
             )
 
             if output_bytes == -1:
-                self._main_window.logger.print(
-                    "Error in sending message to Virtual Hand Interface!",
-                    level=LoggerLevel.ERROR,
-                )
+                print("Error in sending message to Virtual Hand Interface!")
 
     def read_message(self) -> None:
         """Read a message from the Virtual Hand Interface."""
@@ -295,10 +291,7 @@ class VirtualHandInterface_SetupInterface(SetupInterfaceTemplate):
             )
 
             if output_bytes == -1:
-                self._main_window.logger.print(
-                    "Error in sending status message to Virtual Hand Interface!",
-                    level=LoggerLevel.ERROR,
-                )
+                print("Error in sending status message to Virtual Hand Interface!")
                 return
 
             self._status_request_timeout__timer.start()

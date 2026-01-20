@@ -66,4 +66,5 @@ class MindMove(QMainWindow):
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.device.closeEvent(event)
+        self.virtual_hand_interface.closeEvent(event)
         return super().closeEvent(event)

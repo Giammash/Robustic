@@ -1,8 +1,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
-from PySide6.QtCore import QObject, Qt
+from PySide6.QtCore import QObject, Qt, QEvent
 from PySide6.QtWidgets import QComboBox, QLabel
-from PySide6.QtGui import QKeySequence, QShortcut
 import time
 import numpy as np
 import pickle
@@ -47,34 +46,67 @@ class RecordProtocol(QObject):
         # Ground truth mode: "virtual_hand" or "keyboard"
         self.gt_mode: str = "keyboard"  # Default to keyboard for simplicity
 
-        # Keyboard trigger state
-        self.keyboard_gt_state: int = 0  # 0 = OPEN, 1 = CLOSED
+        # Keyboard trigger state (press-and-hold behavior)
+        self.keyboard_gt_state: int = 0  # 0 = NO ACTIVATION, 1 = ACTIVATION
         self.keyboard_gt_buffer: list = []  # (timestamp, state) pairs
+        self._spacebar_enabled: bool = False  # Only enabled during recording
+        self._spacebar_pressed: bool = False  # Track if spacebar is currently held
 
-        # Setup keyboard shortcut (spacebar)
-        self._setup_keyboard_shortcut()
+        # Setup keyboard event filter
+        self._setup_keyboard_events()
 
-    def _setup_keyboard_shortcut(self) -> None:
-        """Setup spacebar shortcut for GT toggle."""
-        self.spacebar_shortcut = QShortcut(QKeySequence(Qt.Key_Space), self.main_window)
-        self.spacebar_shortcut.activated.connect(self._toggle_keyboard_gt)
-        self.spacebar_shortcut.setEnabled(False)  # Only enabled during recording
+    def _setup_keyboard_events(self) -> None:
+        """Setup event filter for spacebar press/release detection."""
+        self.main_window.installEventFilter(self)
 
-    def _toggle_keyboard_gt(self) -> None:
-        """Toggle ground truth state when spacebar is pressed."""
-        if self.gt_mode != "keyboard":
-            return
+    def eventFilter(self, obj, event: QEvent) -> bool:
+        """Filter key events for spacebar press and release."""
+        if not self._spacebar_enabled:
+            return False
 
-        # Toggle state
-        self.keyboard_gt_state = 1 - self.keyboard_gt_state
+        if event.type() == QEvent.KeyPress and not event.isAutoRepeat():
+            if event.key() == Qt.Key_Space:
+                self._on_spacebar_pressed()
+                return True
+
+        elif event.type() == QEvent.KeyRelease and not event.isAutoRepeat():
+            if event.key() == Qt.Key_Space:
+                self._on_spacebar_released()
+                return True
+
+        return False
+
+    def _on_spacebar_pressed(self) -> None:
+        """Handle spacebar press - ACTIVATION BEGINS."""
+        if self._spacebar_pressed:
+            return  # Already pressed, ignore
+
+        self._spacebar_pressed = True
+        self.keyboard_gt_state = 1
         current_time = time.time()
 
         # Store the transition
         self.keyboard_gt_buffer.append((current_time, self.keyboard_gt_state))
 
         # Visual feedback
-        state_str = "CLOSED" if self.keyboard_gt_state == 1 else "OPEN"
-        print(f"\n[SPACEBAR] GT toggled to: {state_str} at t={current_time - self.start_time:.2f}s\n")
+        elapsed = current_time - self.start_time
+        print(f"\n>>> ACTIVATION BEGINS at t={elapsed:.2f}s <<<\n")
+
+    def _on_spacebar_released(self) -> None:
+        """Handle spacebar release - ACTIVATION STOPS."""
+        if not self._spacebar_pressed:
+            return  # Not pressed, ignore
+
+        self._spacebar_pressed = False
+        self.keyboard_gt_state = 0
+        current_time = time.time()
+
+        # Store the transition
+        self.keyboard_gt_buffer.append((current_time, self.keyboard_gt_state))
+
+        # Visual feedback
+        elapsed = current_time - self.start_time
+        print(f"\n<<< ACTIVATION STOPS at t={elapsed:.2f}s <<<\n")
 
     def emg_update(self, data: np.ndarray) -> None:
         self.emg_buffer.append((time.time(), data))
@@ -145,13 +177,16 @@ class RecordProtocol(QObject):
             self.has_finished_emg = False
             self.has_finished_kinematics = False
 
-            # Enable spacebar shortcut for keyboard mode
+            # Enable spacebar for keyboard mode (press-and-hold)
             if self.gt_mode == "keyboard":
-                self.spacebar_shortcut.setEnabled(True)
+                self._spacebar_enabled = True
+                self._spacebar_pressed = False
                 self.has_finished_kinematics = True  # No kinematics to wait for
                 print("\n" + "=" * 60)
-                print("KEYBOARD MODE: Press SPACEBAR to toggle GT (OPEN/CLOSED)")
-                print("Starting state: OPEN (GT=0)")
+                print("KEYBOARD MODE: Hold SPACEBAR for activation")
+                print("  Press spacebar   → ACTIVATION BEGINS")
+                print("  Release spacebar → ACTIVATION STOPS")
+                print("Starting state: NO ACTIVATION (GT=0)")
                 print("=" * 60 + "\n")
 
     def _set_emg_progress_bar(self, value: int) -> None:
@@ -171,8 +206,9 @@ class RecordProtocol(QObject):
             print("EMG recording not finished yet!")
             return
 
-        # Disable spacebar shortcut
-        self.spacebar_shortcut.setEnabled(False)
+        # Disable spacebar
+        self._spacebar_enabled = False
+        self._spacebar_pressed = False
 
         self.review_recording_stacked_widget.setCurrentIndex(1)
         self.record_toggle_push_button.setText("Finished Recording")
@@ -246,6 +282,10 @@ class RecordProtocol(QObject):
         self.record_toggle_push_button.setChecked(False)
         self.record_group_box.setEnabled(True)
 
+        # Ensure spacebar is disabled
+        self._spacebar_enabled = False
+        self._spacebar_pressed = False
+
         # Save Recordings
         label = self.review_recording_label_line_edit.text()
         if not label:
@@ -312,6 +352,10 @@ class RecordProtocol(QObject):
         self.record_toggle_push_button.setChecked(False)
         self.record_group_box.setEnabled(True)
 
+        # Disable spacebar
+        self._spacebar_enabled = False
+        self._spacebar_pressed = False
+
         # Reset progress bars
         self.record_emg_progress_bar.setValue(0)
         self.record_kinematics_progress_bar.setValue(0)
@@ -343,7 +387,7 @@ class RecordProtocol(QObject):
         # Create GT mode selector
         gt_mode_label = QLabel("Ground Truth Mode:")
         self.gt_mode_combo_box = QComboBox()
-        self.gt_mode_combo_box.addItem("Keyboard (Spacebar toggle)", "keyboard")
+        self.gt_mode_combo_box.addItem("Keyboard (Hold spacebar)", "keyboard")
         self.gt_mode_combo_box.addItem("Virtual Hand Interface", "virtual_hand")
 
         # Add to record group box layout

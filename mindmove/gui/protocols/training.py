@@ -102,17 +102,19 @@ class TrainingProtocol(QObject):
 
                 keys = recording.keys()
 
-                required_keys = [
-                    "emg",
-                    "kinematics",
-                    "timings_kinematics",
-                    "timings_emg",
-                    "label",
-                    "task",
-                ]
+                # Check for MindMove virtual hand format
+                mindmove_vh_keys = ["emg", "kinematics", "timings_emg", "label", "task"]
+                # Check for MindMove keyboard format
+                mindmove_kb_keys = ["emg", "gt", "timings_emg", "label", "task"]
 
-                if not all(key in keys for key in required_keys):
+                is_valid = (
+                    all(key in keys for key in mindmove_vh_keys) or
+                    all(key in keys for key in mindmove_kb_keys)
+                )
+
+                if not is_valid:
                     print(f" {f} is an invalid recording!")
+                    print(f"  Keys found: {list(keys)}")
                     continue
 
                 selected_recordings_key = (
@@ -173,15 +175,30 @@ class TrainingProtocol(QObject):
         df = {}
         for k, v in self.selected_recordings.items():
             task_name = v["task"]
+
+            # Get EMG data
+            emg = v["emg"]
+
+            # Get kinematics/GT - handle both formats
+            if "kinematics" in v:
+                kinematics = v["kinematics"]
+            elif "gt" in v:
+                # Keyboard format: gt is binary at EMG sample rate
+                gt = v["gt"]
+                kinematics = gt.reshape(1, -1) if gt.ndim == 1 else gt
+            else:
+                print(f"Warning: No kinematics or gt found in {k}, skipping")
+                continue
+
             if task_name in df.keys():
-                df[task_name]["emg"] = np.concatenate([df[task_name]["emg"], v["emg"]])
+                df[task_name]["emg"] = np.concatenate([df[task_name]["emg"], emg])
                 df[task_name]["kinematics"] = np.concatenate(
-                    [df[task_name]["kinematics"], v["kinematics"]], axis=-1
+                    [df[task_name]["kinematics"], kinematics], axis=-1
                 )
             else:
                 df[task_name] = {}
-                df[task_name]["emg"] = v["emg"]
-                df[task_name]["kinematics"] = v["kinematics"]
+                df[task_name]["emg"] = emg
+                df[task_name]["kinematics"] = kinematics
 
         for k, v in df.items():
             print(k, v["emg"].shape, v["kinematics"].shape)
@@ -776,12 +793,16 @@ class TrainingProtocol(QObject):
                 if recording is None:
                     continue
 
-                # Check for MindMove format
-                mindmove_keys = ["emg", "kinematics"]
+                # Check for MindMove virtual hand format
+                mindmove_vh_keys = ["emg", "kinematics"]
+                # Check for MindMove keyboard format
+                mindmove_kb_keys = ["emg", "gt"]
                 # Check for VHI format
                 vhi_keys = ["biosignal", "ground_truth"]
 
-                if all(key in recording for key in mindmove_keys):
+                if all(key in recording for key in mindmove_vh_keys):
+                    valid_recordings.append(filepath)
+                elif all(key in recording for key in mindmove_kb_keys):
                     valid_recordings.append(filepath)
                 elif all(key in recording for key in vhi_keys):
                     valid_recordings.append(filepath)
