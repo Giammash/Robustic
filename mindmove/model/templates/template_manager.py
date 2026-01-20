@@ -39,11 +39,14 @@ class TemplateManager:
     def __init__(self):
         self.templates: Dict[str, List[np.ndarray]] = {"open": [], "closed": []}
         self.all_activations: Dict[str, List[np.ndarray]] = {"open": [], "closed": []}
-        self.template_type: Literal["hold_only", "onset_hold"] = "hold_only"
+        self.template_type: Literal["hold_only", "onset_hold", "onset", "manual"] = "hold_only"
         self.selection_mode: Literal["manual", "auto", "first_n"] = "manual"
 
         # Configurable template duration (default 1.0 second)
         self._template_duration_s: float = 1.0
+
+        # Context window for manual mode (seconds before GT=1 to include)
+        self.manual_context_before_s: float = 2.0
 
         # Paths
         self.templates_base_path = "data"
@@ -367,7 +370,9 @@ class TemplateManager:
             emg: (n_channels, n_samples)
             gt_binary: Binary ground truth at EMG sample rate
             min_duration_s: Minimum activation duration to keep
-            include_pre_activation: If True, include ONSET_OFFSET_S before activation
+            include_pre_activation: If True, include pre-activation samples
+                                   (uses manual_context_before_s for manual mode,
+                                    ONSET_OFFSET_S otherwise)
 
         Returns:
             List of EMG segments
@@ -392,7 +397,16 @@ class TemplateManager:
         # Extract segments
         segments = []
         min_samples = int(min_duration_s * config.FSAMP)
-        pre_samples = int(config.ONSET_OFFSET_S * config.FSAMP) if include_pre_activation else 0
+
+        # Determine pre-activation samples based on mode
+        if include_pre_activation:
+            if self.template_type == "manual":
+                # Use larger context for manual mode
+                pre_samples = int(self.manual_context_before_s * config.FSAMP)
+            else:
+                pre_samples = int(config.ONSET_OFFSET_S * config.FSAMP)
+        else:
+            pre_samples = 0
 
         for start, end in zip(starts, ends):
             duration = end - start
@@ -406,7 +420,8 @@ class TemplateManager:
     def cut_template_from_activation(
         self,
         activation: np.ndarray,
-        pre_activation_samples: int = 0
+        pre_activation_samples: int = 0,
+        manual_start_idx: Optional[int] = None
     ) -> Optional[np.ndarray]:
         """
         Cut a template of configured duration from an activation segment.
@@ -414,16 +429,23 @@ class TemplateManager:
         Args:
             activation: Raw activation segment (n_channels, n_samples)
             pre_activation_samples: Number of samples before GT=1 included in activation
+            manual_start_idx: If provided, use this as the start index (for manual mode)
 
         Returns:
             Template (n_channels, template_nsamp) or None if too short
         """
         template_samples = self.template_nsamp
 
-        if self.template_type == "hold_only":
-            # Skip 0.5s after GT=1, take 1s
+        if manual_start_idx is not None:
+            # Manual mode: use the provided start index
+            start_idx = manual_start_idx
+        elif self.template_type == "hold_only":
+            # Skip 0.5s after GT=1, take template
             # If pre_activation_samples > 0, we need to account for that
             start_idx = pre_activation_samples + int(config.HOLD_SKIP_S * config.FSAMP)
+        elif self.template_type == "onset":
+            # Start exactly at GT=1 (accounting for any pre-activation samples)
+            start_idx = pre_activation_samples
         else:  # onset_hold
             # Start from the beginning (which includes 0.2s before GT=1)
             start_idx = 0

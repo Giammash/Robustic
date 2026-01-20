@@ -516,9 +516,16 @@ class TrainingProtocol(QObject):
         self.data_format_combo = self.main_window.ui.trainingDataFormatComboBox
         self.data_format_combo.currentIndexChanged.connect(self._on_data_format_changed)
 
-        # Template type combo
+        # Template type combo - add new options programmatically
         self.template_type_combo = self.main_window.ui.trainingTemplateTypeComboBox
+        # Add new options (UI file has "Hold Only" at 0, "Onset + Hold" at 1)
+        self.template_type_combo.addItem("Onset (GT=1 start)")  # index 2
+        self.template_type_combo.addItem("Manual Selection")     # index 3
         self.template_type_combo.currentIndexChanged.connect(self._on_template_type_changed)
+
+        # Track if we're in manual selection mode
+        self._manual_selection_mode: bool = False
+        self._manual_templates: List[np.ndarray] = []
 
         # Recording selection (at original row 3)
         self.select_recordings_for_extraction_btn = (
@@ -694,8 +701,23 @@ class TrainingProtocol(QObject):
 
     def _on_template_type_changed(self, index: int) -> None:
         """Handle template type combo box change."""
-        include_onset = index == 1  # "Onset + Hold" is at index 1
-        self.template_manager.set_template_type(include_onset)
+        # Index 0: "Hold Only (skip 0.5s)" - hold_only mode
+        # Index 1: "Onset + Hold (start -0.2s)" - onset_hold mode
+        # Index 2: "Onset (GT=1 start)" - onset mode (start exactly at GT=1)
+        # Index 3: "Manual Selection" - manual interactive mode
+
+        self._manual_selection_mode = (index == 3)
+
+        if index == 0:
+            self.template_manager.set_template_type(include_onset=False)
+        elif index == 1:
+            self.template_manager.set_template_type(include_onset=True)
+        elif index == 2:
+            # Set to "onset" mode - starts exactly at GT=1
+            self.template_manager.template_type = "onset"
+        elif index == 3:
+            # Manual mode - will be handled in extraction
+            self.template_manager.template_type = "manual"
 
     def _on_template_duration_changed(self, index: int) -> None:
         """Handle template duration combo box change."""
@@ -978,8 +1000,12 @@ class TrainingProtocol(QObject):
 
     def _extract_activations_thread(self, class_label: str, is_legacy: bool = False) -> None:
         """Thread function to extract activations from recordings."""
-        # Check if onset mode to include pre-activation samples
-        include_pre_activation = self.template_manager.template_type == "onset_hold"
+        # Check if we need to include pre-activation samples
+        # Include them for onset_hold mode OR for manual mode (to show context)
+        include_pre_activation = (
+            self.template_manager.template_type == "onset_hold" or
+            self._manual_selection_mode
+        )
 
         if is_legacy:
             # Load legacy format (separate EMG + GT folders)
@@ -1052,12 +1078,20 @@ class TrainingProtocol(QObject):
         activation_count = self.template_manager.get_activation_count(class_label)
         self.activation_count_label.setText(f"{activation_count} activations found")
 
-        # Populate activation list widget
-        self._populate_activation_list(class_label)
+        if activation_count == 0:
+            return
 
-        # Enable select templates button if we have activations
-        if activation_count > 0:
-            self.select_templates_btn.setEnabled(True)
+        # Check if manual selection mode is enabled
+        if self._manual_selection_mode:
+            # Launch interactive manual selection for each activation
+            self._start_manual_template_selection(class_label)
+        else:
+            # Populate activation list widget for automatic modes
+            self._populate_activation_list(class_label)
+
+            # Enable select templates button if we have activations
+            if activation_count > 0:
+                self.select_templates_btn.setEnabled(True)
 
     def _populate_activation_list(self, class_label: str) -> None:
         """Populate the activation list widget with extracted activations."""
@@ -1068,6 +1102,235 @@ class TrainingProtocol(QObject):
         for i, duration in enumerate(durations):
             item = QListWidgetItem(f"Activation {i + 1}: {duration:.2f}s")
             self.activation_list_widget.addItem(item)
+
+    def _start_manual_template_selection(self, class_label: str) -> None:
+        """
+        Start interactive manual template selection for all activations.
+
+        Opens a matplotlib plot for each activation where user can click
+        to set the template start position.
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.widgets import Cursor
+
+        activations = self.template_manager.all_activations[class_label]
+        template_duration_s = self.template_manager.template_duration_s
+        template_samples = self.template_manager.template_nsamp
+        channel = self.plot_channel_spinbox.value() - 1  # Convert to 0-indexed
+
+        # Clear any previous manual templates
+        self._manual_templates = []
+        self.template_manager.templates[class_label] = []
+
+        print(f"\n{'='*60}")
+        print(f"MANUAL TEMPLATE SELECTION - {len(activations)} activations")
+        print(f"Template duration: {template_duration_s}s ({template_samples} samples)")
+        print(f"Click to set template start, close window to skip")
+        print(f"{'='*60}\n")
+
+        # Process each activation
+        for i, activation in enumerate(activations):
+            print(f"\nProcessing activation {i + 1}/{len(activations)}...")
+
+            # Get the GT signal for this activation (reconstruct from context)
+            # For manual mode, we include manual_context_before_s before GT=1
+            n_samples = activation.shape[1]
+            pre_samples = int(self.template_manager.manual_context_before_s * config.FSAMP)
+
+            # Build a simple GT overlay: 0 before GT=1, 1 after
+            # The activation starts with pre_samples of GT=0, then GT=1
+            gt_overlay = np.zeros(n_samples)
+            if pre_samples < n_samples:
+                gt_overlay[pre_samples:] = 1
+
+            # Call the interactive selection for this activation
+            template = self._interactive_template_selection(
+                activation,
+                gt_overlay,
+                channel,
+                template_samples,
+                activation_idx=i + 1,
+                total_activations=len(activations)
+            )
+
+            if template is not None:
+                self._manual_templates.append(template)
+                self.template_manager.templates[class_label].append(template)
+                print(f"  Template {len(self._manual_templates)} captured!")
+
+        # Update UI after manual selection is complete
+        self._manual_selection_finished(class_label)
+
+    def _interactive_template_selection(
+        self,
+        activation: np.ndarray,
+        gt_overlay: np.ndarray,
+        channel: int,
+        template_samples: int,
+        activation_idx: int,
+        total_activations: int
+    ) -> Optional[np.ndarray]:
+        """
+        Show interactive plot for a single activation and let user click to select template start.
+
+        Args:
+            activation: EMG data (n_channels, n_samples)
+            gt_overlay: Ground truth signal at same sample rate
+            channel: Which channel to display (0-indexed)
+            template_samples: Number of samples for template
+            activation_idx: Current activation number (1-indexed for display)
+            total_activations: Total number of activations
+
+        Returns:
+            Template array or None if skipped
+        """
+        import matplotlib.pyplot as plt
+        from matplotlib.patches import Rectangle
+
+        n_samples = activation.shape[1]
+        time_axis = np.arange(n_samples) / config.FSAMP
+
+        # Find GT=1 start (rising edge)
+        gt_start_idx = np.argmax(gt_overlay > 0.5)
+        gt_start_time = gt_start_idx / config.FSAMP
+
+        # Show full activation segment
+        # Default view: 2 seconds before GT=1 and show at least 3 seconds after
+        display_start_s = max(0, gt_start_time - 2.0)
+        display_end_s = min(time_axis[-1], gt_start_time + 3.0)
+
+        # But ensure we show enough context - at least the full activation
+        if display_end_s - display_start_s < 4.0:
+            display_end_s = min(time_axis[-1], display_start_s + 5.0)
+
+        # Get EMG signal for the selected channel
+        emg_signal = activation[channel, :]
+
+        # Normalize for display
+        emg_normalized = emg_signal / (np.max(np.abs(emg_signal)) + 1e-10)
+
+        # Create figure
+        fig, ax = plt.subplots(figsize=(12, 6))
+        fig.canvas.manager.set_window_title(f'Manual Selection - Activation {activation_idx}/{total_activations}')
+
+        # Plot EMG signal
+        ax.plot(time_axis, emg_normalized, 'b-', linewidth=0.8, label=f'EMG Ch{channel + 1}')
+
+        # Plot GT overlay (scaled to fit)
+        ax.fill_between(time_axis, -1, 1, where=gt_overlay > 0.5,
+                        alpha=0.2, color='green', label='GT=1 (Activation)')
+
+        # Mark GT=1 start
+        ax.axvline(x=gt_start_time, color='green', linestyle='--', linewidth=2,
+                   label=f'GT=1 start ({gt_start_time:.2f}s)')
+
+        # Set axis limits
+        ax.set_xlim(display_start_s, display_end_s)
+        ax.set_ylim(-1.2, 1.2)
+        ax.set_xlabel('Time (s)')
+        ax.set_ylabel('Normalized EMG')
+        ax.set_title(f'Activation {activation_idx}/{total_activations} - Click to set template start\n'
+                     f'(Template duration: {template_samples/config.FSAMP:.2f}s)')
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+        # Store selection state
+        selection_state = {'start_time': None, 'vline': None, 'rect': None}
+
+        def on_click(event):
+            """Handle mouse click to set template start."""
+            if event.inaxes != ax:
+                return
+            if event.button != 1:  # Left click only
+                return
+
+            click_time = event.xdata
+            click_idx = int(click_time * config.FSAMP)
+
+            # Check if we have enough samples for the template
+            if click_idx + template_samples > n_samples:
+                print(f"  Warning: Not enough samples after click position. Try clicking earlier.")
+                return
+
+            # Remove previous markers
+            if selection_state['vline'] is not None:
+                selection_state['vline'].remove()
+            if selection_state['rect'] is not None:
+                selection_state['rect'].remove()
+
+            # Draw new markers
+            selection_state['vline'] = ax.axvline(x=click_time, color='red', linestyle='-',
+                                                   linewidth=2, label='Template start')
+
+            # Draw rectangle showing template region
+            template_end_time = click_time + template_samples / config.FSAMP
+            selection_state['rect'] = ax.add_patch(
+                Rectangle((click_time, -1.2), template_samples / config.FSAMP, 2.4,
+                          facecolor='red', alpha=0.2, edgecolor='red', linewidth=2)
+            )
+
+            selection_state['start_time'] = click_time
+            ax.set_title(f'Activation {activation_idx}/{total_activations} - Template: {click_time:.2f}s to {template_end_time:.2f}s\n'
+                         f'Close window to confirm, or click again to adjust')
+            fig.canvas.draw()
+
+        # Connect click event
+        cid = fig.canvas.mpl_connect('button_press_event', on_click)
+
+        # Show instructions
+        ax.text(0.5, -0.12, 'Left-click to set template start | Close window to confirm/skip',
+                transform=ax.transAxes, ha='center', fontsize=10, style='italic')
+
+        # Show plot (blocking)
+        plt.tight_layout()
+        plt.show()
+
+        # Disconnect event
+        fig.canvas.mpl_disconnect(cid)
+
+        # Extract template if user made a selection
+        if selection_state['start_time'] is not None:
+            start_idx = int(selection_state['start_time'] * config.FSAMP)
+            end_idx = start_idx + template_samples
+            if end_idx <= n_samples:
+                return activation[:, start_idx:end_idx]
+
+        return None
+
+    def _manual_selection_finished(self, class_label: str) -> None:
+        """Called when manual selection is complete."""
+        template_count = len(self._manual_templates)
+        target_count = config.TARGET_TEMPLATES_PER_CLASS
+
+        print(f"\n{'='*60}")
+        print(f"MANUAL SELECTION COMPLETE")
+        print(f"Templates captured: {template_count}")
+        print(f"{'='*60}\n")
+
+        # Update UI
+        self.activation_count_label.setText(f"{template_count} templates manually selected")
+        self.template_count_label.setText(f"{template_count}/{target_count} templates")
+
+        # Populate list with selected templates
+        self.activation_list_widget.clear()
+        for i in range(template_count):
+            template = self._manual_templates[i]
+            duration = template.shape[1] / config.FSAMP
+            item = QListWidgetItem(f"Template {i + 1}: {duration:.2f}s")
+            self.activation_list_widget.addItem(item)
+
+        # Enable save button if we have templates
+        if template_count > 0:
+            self.save_templates_btn.setEnabled(True)
+            self.plot_selected_btn.setEnabled(True)
+
+        QMessageBox.information(
+            self.main_window,
+            "Manual Selection Complete",
+            f"Manually selected {template_count} templates for class '{class_label}'.\n\n"
+            f"You can plot them to review, then click 'Save Templates' when ready.",
+            QMessageBox.Ok,
+        )
 
     def _select_templates(self) -> None:
         """Apply selection mode to choose templates."""
