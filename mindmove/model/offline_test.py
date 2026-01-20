@@ -703,7 +703,7 @@ TEST_FOLDER = "recordings"
 
 # Model file (inside data/models/)
 # Use None for default (dtw_model_0.pkl), or specify a filename
-MODEL_FILE = "MindMove_Model_20260120_152906_test_manual.pkl"
+MODEL_FILE = "MindMove_Model_20260120_152906_test_manual_average.pkl"
 # "dtw_model_0.pkl"  # e.g., "dtw_model_tslearn.pkl" for tslearn model
 
 # DTW implementation (set ONE to True, others to False)
