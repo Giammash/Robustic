@@ -1173,6 +1173,8 @@ class TrainingProtocol(QObject):
         """
         Show interactive plot for a single activation and let user click to select template start.
 
+        Uses a Qt dialog with embedded matplotlib canvas to work properly with Qt event loop.
+
         Args:
             activation: EMG data (n_channels, n_samples)
             gt_overlay: Ground truth signal at same sample rate
@@ -1184,7 +1186,10 @@ class TrainingProtocol(QObject):
         Returns:
             Template array or None if skipped
         """
-        import matplotlib.pyplot as plt
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QLabel
+        from PySide6.QtCore import Qt
+        from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+        from matplotlib.figure import Figure
         from matplotlib.patches import Rectangle
 
         n_samples = activation.shape[1]
@@ -1195,28 +1200,33 @@ class TrainingProtocol(QObject):
         gt_start_time = gt_start_idx / config.FSAMP
 
         # Show full activation segment
-        # Default view: 2 seconds before GT=1 and show at least 3 seconds after
         display_start_s = max(0, gt_start_time - 2.0)
         display_end_s = min(time_axis[-1], gt_start_time + 3.0)
-
-        # But ensure we show enough context - at least the full activation
         if display_end_s - display_start_s < 4.0:
             display_end_s = min(time_axis[-1], display_start_s + 5.0)
 
-        # Get EMG signal for the selected channel
+        # Get EMG signal and normalize
         emg_signal = activation[channel, :]
-
-        # Normalize for display
         emg_normalized = emg_signal / (np.max(np.abs(emg_signal)) + 1e-10)
 
-        # Create figure
-        fig, ax = plt.subplots(figsize=(12, 6))
-        fig.canvas.manager.set_window_title(f'Manual Selection - Activation {activation_idx}/{total_activations}')
+        # Create dialog
+        dialog = QDialog(self.main_window)
+        dialog.setWindowTitle(f'Manual Selection - Activation {activation_idx}/{total_activations}')
+        dialog.setMinimumSize(1000, 600)
+        dialog.setModal(True)
+
+        # Store selection state
+        selection_state = {'start_time': None, 'vline': None, 'rect': None, 'confirmed': False}
+
+        # Create matplotlib figure
+        fig = Figure(figsize=(12, 6))
+        canvas = FigureCanvas(fig)
+        ax = fig.add_subplot(111)
 
         # Plot EMG signal
         ax.plot(time_axis, emg_normalized, 'b-', linewidth=0.8, label=f'EMG Ch{channel + 1}')
 
-        # Plot GT overlay (scaled to fit)
+        # Plot GT overlay
         ax.fill_between(time_axis, -1, 1, where=gt_overlay > 0.5,
                         alpha=0.2, color='green', label='GT=1 (Activation)')
 
@@ -1233,21 +1243,21 @@ class TrainingProtocol(QObject):
                      f'(Template duration: {template_samples/config.FSAMP:.2f}s)')
         ax.legend(loc='upper right')
         ax.grid(True, alpha=0.3)
-
-        # Store selection state
-        selection_state = {'start_time': None, 'vline': None, 'rect': None}
+        fig.tight_layout()
 
         def on_click(event):
             """Handle mouse click to set template start."""
             if event.inaxes != ax:
                 return
-            if event.button != 1:  # Left click only
+            if event.button != 1:
                 return
 
             click_time = event.xdata
+            if click_time is None:
+                return
+
             click_idx = int(click_time * config.FSAMP)
 
-            # Check if we have enough samples for the template
             if click_idx + template_samples > n_samples:
                 print(f"  Warning: Not enough samples after click position. Try clicking earlier.")
                 return
@@ -1260,9 +1270,7 @@ class TrainingProtocol(QObject):
 
             # Draw new markers
             selection_state['vline'] = ax.axvline(x=click_time, color='red', linestyle='-',
-                                                   linewidth=2, label='Template start')
-
-            # Draw rectangle showing template region
+                                                   linewidth=2)
             template_end_time = click_time + template_samples / config.FSAMP
             selection_state['rect'] = ax.add_patch(
                 Rectangle((click_time, -1.2), template_samples / config.FSAMP, 2.4,
@@ -1271,25 +1279,48 @@ class TrainingProtocol(QObject):
 
             selection_state['start_time'] = click_time
             ax.set_title(f'Activation {activation_idx}/{total_activations} - Template: {click_time:.2f}s to {template_end_time:.2f}s\n'
-                         f'Close window to confirm, or click again to adjust')
-            fig.canvas.draw()
+                         f'Click "Confirm" or click again to adjust')
+            canvas.draw()
+            confirm_btn.setEnabled(True)
+            status_label.setText(f"Selected: {click_time:.2f}s to {template_end_time:.2f}s")
 
-        # Connect click event
-        cid = fig.canvas.mpl_connect('button_press_event', on_click)
+        canvas.mpl_connect('button_press_event', on_click)
 
-        # Show instructions
-        ax.text(0.5, -0.12, 'Left-click to set template start | Close window to confirm/skip',
-                transform=ax.transAxes, ha='center', fontsize=10, style='italic')
+        # Create layout
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(canvas)
 
-        # Show plot (blocking)
-        plt.tight_layout()
-        plt.show()
+        # Status label
+        status_label = QLabel("Click on the plot to set template start position")
+        status_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(status_label)
 
-        # Disconnect event
-        fig.canvas.mpl_disconnect(cid)
+        # Buttons
+        btn_layout = QHBoxLayout()
 
-        # Extract template if user made a selection
-        if selection_state['start_time'] is not None:
+        confirm_btn = QPushButton("Confirm Selection")
+        confirm_btn.setEnabled(False)
+        confirm_btn.setStyleSheet("background-color: #4CAF50; color: white; padding: 8px 16px;")
+        def on_confirm():
+            selection_state['confirmed'] = True
+            dialog.accept()
+        confirm_btn.clicked.connect(on_confirm)
+
+        skip_btn = QPushButton("Skip This Activation")
+        skip_btn.setStyleSheet("background-color: #f44336; color: white; padding: 8px 16px;")
+        skip_btn.clicked.connect(dialog.reject)
+
+        btn_layout.addStretch()
+        btn_layout.addWidget(confirm_btn)
+        btn_layout.addWidget(skip_btn)
+        btn_layout.addStretch()
+        layout.addLayout(btn_layout)
+
+        # Show dialog (blocking)
+        result = dialog.exec()
+
+        # Extract template if confirmed
+        if selection_state['confirmed'] and selection_state['start_time'] is not None:
             start_idx = int(selection_state['start_time'] * config.FSAMP)
             end_idx = start_idx + template_samples
             if end_idx <= n_samples:
