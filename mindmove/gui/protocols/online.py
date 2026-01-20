@@ -313,18 +313,18 @@ class OnlineProtocol(QObject):
         main_layout.addWidget(open_label)
 
         open_slider_layout = QHBoxLayout()
-        open_slider_layout.addWidget(QLabel("0.5"))
+        open_slider_layout.addWidget(QLabel("0.0"))
 
         self.threshold_slider_open = QSlider(Qt.Horizontal)
-        self.threshold_slider_open.setMinimum(50)
-        self.threshold_slider_open.setMaximum(300)
-        self.threshold_slider_open.setValue(100)  # Default s=1.0
+        self.threshold_slider_open.setMinimum(0)      # s = 0.0
+        self.threshold_slider_open.setMaximum(500)    # s = 5.0
+        self.threshold_slider_open.setValue(100)      # Default s=1.0
         self.threshold_slider_open.setTickPosition(QSlider.TicksBelow)
-        self.threshold_slider_open.setTickInterval(50)
+        self.threshold_slider_open.setTickInterval(100)  # Tick every 1.0
         self.threshold_slider_open.valueChanged.connect(self._on_threshold_open_changed)
         open_slider_layout.addWidget(self.threshold_slider_open)
 
-        open_slider_layout.addWidget(QLabel("3.0"))
+        open_slider_layout.addWidget(QLabel("5.0"))
         main_layout.addLayout(open_slider_layout)
 
         self.threshold_open_label = QLabel("s_open = 1.00 | Threshold: Not loaded")
@@ -335,18 +335,18 @@ class OnlineProtocol(QObject):
         main_layout.addWidget(closed_label)
 
         closed_slider_layout = QHBoxLayout()
-        closed_slider_layout.addWidget(QLabel("0.5"))
+        closed_slider_layout.addWidget(QLabel("0.0"))
 
         self.threshold_slider_closed = QSlider(Qt.Horizontal)
-        self.threshold_slider_closed.setMinimum(50)
-        self.threshold_slider_closed.setMaximum(300)
-        self.threshold_slider_closed.setValue(100)  # Default s=1.0
+        self.threshold_slider_closed.setMinimum(0)    # s = 0.0
+        self.threshold_slider_closed.setMaximum(500)  # s = 5.0
+        self.threshold_slider_closed.setValue(100)    # Default s=1.0
         self.threshold_slider_closed.setTickPosition(QSlider.TicksBelow)
-        self.threshold_slider_closed.setTickInterval(50)
+        self.threshold_slider_closed.setTickInterval(100)  # Tick every 1.0
         self.threshold_slider_closed.valueChanged.connect(self._on_threshold_closed_changed)
         closed_slider_layout.addWidget(self.threshold_slider_closed)
 
-        closed_slider_layout.addWidget(QLabel("3.0"))
+        closed_slider_layout.addWidget(QLabel("5.0"))
         main_layout.addLayout(closed_slider_layout)
 
         self.threshold_closed_label = QLabel("s_closed = 1.00 | Threshold: Not loaded")
@@ -360,7 +360,7 @@ class OnlineProtocol(QObject):
 
     def _on_threshold_open_changed(self, value: int) -> None:
         """Called when OPEN threshold slider is moved."""
-        s_open = value / 100.0  # Convert back to float (50-300 -> 0.5-3.0)
+        s_open = value / 100.0  # Convert back to float (0-500 -> 0.0-5.0)
 
         # Update model threshold
         self.model_interface.update_threshold_open(s_open)
@@ -376,7 +376,7 @@ class OnlineProtocol(QObject):
 
     def _on_threshold_closed_changed(self, value: int) -> None:
         """Called when CLOSED threshold slider is moved."""
-        s_closed = value / 100.0  # Convert back to float (50-300 -> 0.5-3.0)
+        s_closed = value / 100.0  # Convert back to float (0-500 -> 0.0-5.0)
 
         # Update model threshold
         self.model_interface.update_threshold_closed(s_closed)

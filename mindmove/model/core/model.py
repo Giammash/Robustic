@@ -113,6 +113,10 @@ class Model:
         # Threshold tuning parameter (s value)
         self.threshold_s = 1.0  # Default s=1 (mean + 1*std)
 
+        # Last computed distance and threshold (for cleaner terminal output)
+        self._last_distance = 0.0
+        self._last_threshold = 0.0
+
 
 
     def _update_buffer(self, new_samples: np.ndarray) -> bool:
@@ -361,12 +365,10 @@ class Model:
         # --- DTW computation (every increment_dtw samples) ---
         dtw_start_time = time.perf_counter()
         current_time = time.time()
-        print(f"Time since last DTW: {(current_time - self.last_dtw_time) * 1000} ms")
-        time_since_last =  current_time - self.last_dtw_time
-        
+        time_since_last = current_time - self.last_dtw_time
+
         # apply filtering
         emg_buffer = apply_rtfiltering(self.emg_rt_buffer) if config.ENABLE_FILTERING else self.emg_rt_buffer.copy()
-        # print("EMG BUFFER SHAPE:", emg_buffer.shape)
 
         # extract features from the template_nsamp buffer
         windowed_emg_buffer = sliding_window(emg_buffer, self.window_length, self.increment)
@@ -391,12 +393,12 @@ class Model:
                 triggered_state = "CLOSED"
             else:
                 triggered_state = "OPEN"
-            print(f"[DTW] State: OPEN | D_closed: {D_closed:.4f} | Threshold: {self.THRESHOLD_CLOSED:.4f} | "
-              f"Trigger: {triggered_state} | Δt: {time_since_last:.1f}ms")
 
             self.dtw_distances.append(("closed", D_closed, self.THRESHOLD_CLOSED))
             # Store in history: (timestamp, D_open=None, D_closed, state)
             self.distance_history.append((timestamp, None, D_closed, self.current_state))
+            self._last_distance = D_closed
+            self._last_threshold = self.THRESHOLD_CLOSED
 
         elif self.current_state == "CLOSED":
             # Check if should switch to OPEN
@@ -411,12 +413,11 @@ class Model:
             else:
                 triggered_state = "CLOSED"
 
-            print(f"[DTW] State: CLOSED | D_open: {D_open:.4f} | Threshold: {self.THRESHOLD_OPEN:.4f} | "
-              f"Trigger: {triggered_state} | Δt: {time_since_last:.1f}ms")
-
             self.dtw_distances.append(("open", D_open, self.THRESHOLD_OPEN))
             # Store in history: (timestamp, D_open, D_closed=None, state)
             self.distance_history.append((timestamp, D_open, None, self.current_state))
+            self._last_distance = D_open
+            self._last_threshold = self.THRESHOLD_OPEN
         
         # D_open = compute_distance_from_training_set_online(features_emg_buffer, templates_open, feature_name)
         # D_closed = compute_distance_from_training_set_online(features_emg_buffer, templates_closed, feature_name)
@@ -471,38 +472,29 @@ class Model:
                         # Clear buffer after state transition to require fresh consecutive predictions
                         self.last_predictions = []
 
-        # Debug timing
+        # Update timing
         current_time = time.time()
-        time_diff = current_time - self.last_dtw_time 
         self.last_dtw_time = current_time
 
-        if time_diff > 0:
-            print(f"DTW computed: {self.current_state} (Δt={time_diff*1000:.1f}ms)")
-        
-        # Print transition with prominent message
+        # Print transition with clear, compact message
         if previous_state != self.current_state:
             transition_time = time.time()
             # Store state transition for plotting
             self.state_transitions.append((transition_time, previous_state, self.current_state))
 
-            print("\n")
-            print("=" * 70)
-            print("=" * 70)
-            print("||" + " " * 66 + "||")
+            time_str = datetime.now().strftime('%H:%M:%S.%f')[:-3]
             if self.current_state == "OPEN":
-                print("||" + "           ****   HAND OPENED   ****".center(66) + "||")
+                print(f"\n{'='*50}")
+                print(f"  >>> HAND OPENED <<<  [{time_str}]")
+                print(f"  Distance: {self._last_distance:.4f} < Threshold: {self._last_threshold:.4f}")
+                print(f"{'='*50}\n")
             else:
-                print("||" + "           ****   HAND CLOSED   ****".center(66) + "||")
-            print("||" + " " * 66 + "||")
-            print("||" + f"  {previous_state}  --->  {self.current_state}".center(66) + "||")
-            print("||" + " " * 66 + "||")
-            print("||" + f"  Time: {datetime.now().strftime('%H:%M:%S.%f')[:-3]}".center(66) + "||")
-            print("||" + " " * 66 + "||")
-            print("=" * 70)
-            print("=" * 70)
-            print("\n")
-        
-        # update timing
+                print(f"\n{'='*50}")
+                print(f"  >>> HAND CLOSED <<<  [{time_str}]")
+                print(f"  Distance: {self._last_distance:.4f} < Threshold: {self._last_threshold:.4f}")
+                print(f"{'='*50}\n")
+
+        # Update timing stats
         dtw_end_time = time.perf_counter()
         dtw_computation_time = (dtw_end_time - dtw_start_time) * 1000
         self.dtw_times.append(dtw_computation_time)
@@ -510,18 +502,14 @@ class Model:
         if len(self.dtw_times) >= 100:
             self.dtw_times.pop(0)
 
-        self.last_dtw_time = current_time
         self.dtw_count += 1
 
-        # everz 20 DTW computations print statistic
-
-        if self.dtw_count % 20 == 0:
+        # Print periodic summary (every 100 DTW computations = every 5 seconds)
+        if self.dtw_count % 100 == 0:
             avg_time = np.mean(self.dtw_times)
-            print(f"\n stats (last {len(self.dtw_times)} DTW): "
-            f"AVG computation={avg_time}ms"
-            f"avg dt={np.mean([time_since_last])}ms")
-                    
-        # return self.current_state
-        return 1.0 if self.current_state == "CLOSED" else 0.0
+            elapsed_s = self.dtw_count * 0.05  # Each DTW is ~50ms
+            print(f"[{elapsed_s:.0f}s] State: {self.current_state} | "
+                  f"D={self._last_distance:.3f} vs T={self._last_threshold:.3f} | "
+                  f"DTW: {avg_time:.1f}ms avg")
 
-        # pass
+        return 1.0 if self.current_state == "CLOSED" else 0.0

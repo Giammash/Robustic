@@ -36,9 +36,11 @@ def load_test_recording(recording_path: str) -> np.ndarray:
     """
     Load test recording and convert to (n_channels, n_samples) format.
 
-    Supports both .pkl and .mat file formats.
-    The Muovi recordings have shape (38, samples_per_frame, n_frames).
-    We need to reshape to (32, total_samples) taking only EMG channels.
+    Supports multiple formats:
+    - MindMove keyboard format: {emg, gt, ...}
+    - MindMove virtual hand format: {emg, kinematics, ...}
+    - VHI format: {biosignal, device_information, ...}
+    - MAT files with biosignal data
     """
     recording_path = Path(recording_path)
     file_ext = recording_path.suffix.lower()
@@ -46,10 +48,60 @@ def load_test_recording(recording_path: str) -> np.ndarray:
     if file_ext == '.pkl':
         with open(recording_path, 'rb') as f:
             data = pickle.load(f)
-        biosignal = data['biosignal']
-        device_info = data['device_information']
-        n_emg_channels = device_info['number_of_biosignal_channels']
-        sampling_freq = device_info['sampling_frequency']
+
+        # Detect format based on keys
+        if 'emg' in data:
+            # MindMove format (keyboard or virtual hand)
+            emg_data = data['emg']
+            n_emg_channels = emg_data.shape[0]
+            sampling_freq = config.FSAMP
+
+            # Get ground truth if available
+            if 'gt' in data:
+                gt_data = data['gt']
+                gt_mode = "keyboard"
+            elif 'kinematics' in data:
+                gt_data = data['kinematics']
+                gt_mode = "virtual_hand"
+            else:
+                gt_data = None
+                gt_mode = "none"
+
+            # Add GT to data for later use
+            data['_gt_data'] = gt_data
+            data['_gt_mode'] = gt_mode
+
+            print(f"Loaded recording: {recording_path}")
+            print(f"  Format: MindMove ({gt_mode})")
+            print(f"  EMG data shape: {emg_data.shape}")
+            print(f"  Duration: {emg_data.shape[1] / sampling_freq:.1f} seconds")
+            if gt_data is not None:
+                gt_shape = gt_data.shape if hasattr(gt_data, 'shape') else len(gt_data)
+                print(f"  GT data shape: {gt_shape}")
+
+            return emg_data, data
+
+        elif 'biosignal' in data:
+            # VHI format
+            biosignal = data['biosignal']
+            device_info = data['device_information']
+            n_emg_channels = device_info['number_of_biosignal_channels']
+            sampling_freq = device_info['sampling_frequency']
+
+            # Take only EMG channels and reshape
+            emg_data = biosignal[:n_emg_channels, :, :]
+            emg_data = np.concatenate(emg_data.T, axis=0).T
+
+            print(f"Loaded recording: {recording_path}")
+            print(f"  Format: VHI")
+            print(f"  Original shape: {biosignal.shape}")
+            print(f"  EMG data shape: {emg_data.shape}")
+            print(f"  Duration: {emg_data.shape[1] / sampling_freq:.1f} seconds")
+
+            return emg_data, data
+
+        else:
+            raise ValueError(f"Unknown pickle format. Keys: {list(data.keys())}")
 
     elif file_ext == '.mat':
         mat_data = loadmat(str(recording_path), squeeze_me=True)
@@ -70,20 +122,20 @@ def load_test_recording(recording_path: str) -> np.ndarray:
             sampling_freq = config.FSAMP
             device_info = {'number_of_biosignal_channels': n_emg_channels, 'sampling_frequency': sampling_freq}
         data = {'biosignal': biosignal, 'device_information': device_info}
+
+        # Take only EMG channels (first 32) and reshape to (n_channels, n_samples)
+        emg_data = biosignal[:n_emg_channels, :, :]  # (32, 18, 11000)
+        emg_data = np.concatenate(emg_data.T, axis=0).T  # (32, 198000)
+
+        print(f"Loaded recording: {recording_path}")
+        print(f"  Format: MAT")
+        print(f"  Original shape: {biosignal.shape}")
+        print(f"  EMG data shape: {emg_data.shape}")
+        print(f"  Duration: {emg_data.shape[1] / sampling_freq:.1f} seconds")
+
+        return emg_data, data
     else:
         raise ValueError(f"Unsupported file format: {file_ext}. Use .pkl or .mat")
-
-    # Take only EMG channels (first 32) and reshape to (n_channels, n_samples)
-    emg_data = biosignal[:n_emg_channels, :, :]  # (32, 18, 11000)
-    emg_data = np.concatenate(emg_data.T, axis=0).T  # (32, 198000)
-
-    print(f"Loaded recording: {recording_path}")
-    print(f"  File format: {file_ext}")
-    print(f"  Original shape: {biosignal.shape}")
-    print(f"  EMG data shape: {emg_data.shape}")
-    print(f"  Duration: {emg_data.shape[1] / sampling_freq:.1f} seconds")
-
-    return emg_data, data
 
 
 def simulate_realtime_dtw(
@@ -283,7 +335,8 @@ def plot_distance_results(
     title: str = "DTW Distance Analysis",
     ch_to_plot: int = 0,
     save_path: str = None,
-    show_filtered: bool = True
+    show_filtered: bool = True,
+    gt_data: np.ndarray = None
 ):
     """
     Plot DTW distances over time with EMG signal.
@@ -295,6 +348,7 @@ def plot_distance_results(
         ch_to_plot: Channel to display
         save_path: Optional path to save figure
         show_filtered: If True, show reconstructed real-time filtered signal
+        gt_data: Ground truth data (optional, for overlay on prediction plot)
     """
     timestamps = results['timestamps']
     D_open = results['D_open']
@@ -320,9 +374,17 @@ def plot_distance_results(
 
     plot_idx = 0
 
-    # Plot 1: Raw EMG
+    # Plot 1: Raw EMG with GT overlay
     ax = axs[plot_idx]
     ax.plot(time_emg, emg_data[ch_to_plot, :], 'b-', alpha=0.7, linewidth=0.5)
+    # Add GT overlay if available
+    if gt_data is not None:
+        gt_1d = gt_data.flatten() if gt_data.ndim > 1 else gt_data
+        if len(gt_1d) == n_samples:
+            # Scale GT to match EMG range for visualization
+            emg_max = np.max(np.abs(emg_data[ch_to_plot, :]))
+            ax.fill_between(time_emg, -emg_max, emg_max, where=gt_1d > 0.5,
+                           alpha=0.15, color='green', label='GT=1')
     ax.set_ylabel(f"EMG CH{ch_to_plot+1} (µV)")
     ax.set_title(f"{title} - Channel {ch_to_plot+1} (RAW)")
     ax.grid(True, alpha=0.3)
@@ -362,13 +424,19 @@ def plot_distance_results(
     ax.grid(True, alpha=0.3)
     plot_idx += 1
 
-    # Predictions
+    # Predictions with GT overlay
     ax = axs[plot_idx]
     pred_numeric = [1 if p == "CLOSED" else 0 for p in predictions]
-    ax.step(timestamps, pred_numeric, 'purple', linewidth=2, where='post')
+    ax.step(timestamps, pred_numeric, 'purple', linewidth=2, where='post', label='Predicted')
+    # Add GT overlay
+    if gt_data is not None:
+        gt_1d = gt_data.flatten() if gt_data.ndim > 1 else gt_data
+        if len(gt_1d) == n_samples:
+            ax.step(time_emg, gt_1d, 'green', linewidth=1.5, where='post', alpha=0.7, label='Ground Truth')
+            ax.legend(loc='upper right')
     ax.set_ylabel("State")
     ax.set_xlabel("Time (s)")
-    ax.set_title("Predicted State (0=OPEN, 1=CLOSED)")
+    ax.set_title("Predicted State vs Ground Truth (0=OPEN, 1=CLOSED)")
     ax.set_ylim(-0.1, 1.1)
     ax.set_yticks([0, 1])
     ax.set_yticklabels(['OPEN', 'CLOSED'])
@@ -483,7 +551,8 @@ def run_offline_test_single(
     threshold_closed: float,
     feature_name: str,
     save_dir: Path,
-    verbose: bool = True
+    verbose: bool = True,
+    gt_data: np.ndarray = None
 ) -> dict:
     """
     Run offline test on a single recording.
@@ -509,7 +578,8 @@ def run_offline_test_single(
 
     plot_distance_results(
         emg_data, results, title=plot_title,
-        save_path=str(save_path)
+        save_path=str(save_path),
+        gt_data=gt_data
     )
 
     return results
@@ -534,10 +604,13 @@ def run_offline_test_folder(
     if model_path is None:
         model_path = base_path / "data" / "models" / "dtw_model_0.pkl"
 
-    # Test folder path
+    # Test folder path - check multiple locations
     test_dir = base_path / "data" / "tests" / test_folder
     if not test_dir.exists():
-        raise FileNotFoundError(f"Test folder not found: {test_dir}")
+        # Also check data/recordings/ directly
+        test_dir = base_path / "data" / test_folder
+        if not test_dir.exists():
+            raise FileNotFoundError(f"Test folder not found in data/tests/{test_folder} or data/{test_folder}")
 
     # Find all recordings (.pkl and .mat files)
     test_files = sorted(list(test_dir.glob("*.pkl")) + list(test_dir.glob("*.mat")))
@@ -580,14 +653,18 @@ def run_offline_test_folder(
         print(f"\n[{i+1}/{len(test_files)}] Loading {recording_path.name}...")
 
         try:
-            emg_data, _ = load_test_recording(str(recording_path))
+            emg_data, data = load_test_recording(str(recording_path))
+
+            # Extract GT data if available
+            gt_data = data.get('_gt_data', None)
 
             results = run_offline_test_single(
                 emg_data, recording_path,
                 templates_open, templates_closed,
                 threshold_open, threshold_closed,
                 feature_name, save_dir,
-                verbose=True
+                verbose=True,
+                gt_data=gt_data
             )
 
             all_results.append({
@@ -622,11 +699,11 @@ def run_offline_test_folder(
 
 # Test folder (inside data/tests/)
 # Available: "test", "test open", "test closed for closed detector", "test closed for open detector"
-TEST_FOLDER = "openings and closings (different session)"
+TEST_FOLDER = "recordings"
 
 # Model file (inside data/models/)
 # Use None for default (dtw_model_0.pkl), or specify a filename
-MODEL_FILE = "MindMove_Model_20260116_132747_default.pkl"
+MODEL_FILE = "MindMove_Model_20260120_152906_test_manual.pkl"
 # "dtw_model_0.pkl"  # e.g., "dtw_model_tslearn.pkl" for tslearn model
 
 # DTW implementation (set ONE to True, others to False)
