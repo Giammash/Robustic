@@ -609,8 +609,16 @@ class DTWVisualizer:
 
 def main():
     """Main interactive testing function."""
+    import argparse
     import matplotlib
     matplotlib.use('TkAgg')  # Use interactive backend
+
+    # Parse command line arguments
+    parser = argparse.ArgumentParser(description='DTW Offline Testing and Visualization')
+    parser.add_argument('--recording', '-r', type=str, help='Path to recording file (.pkl or .mat)')
+    parser.add_argument('--model', '-m', type=str, help='Path to model or template file (.pkl)')
+    parser.add_argument('--no-gui', action='store_true', help='Skip file dialogs, use command line only')
+    args = parser.parse_args()
 
     print("=" * 60)
     print("DTW Offline Testing and Visualization")
@@ -618,36 +626,84 @@ def main():
 
     visualizer = DTWVisualizer()
 
-    # File selection
-    from tkinter import Tk, filedialog
-    root = Tk()
-    root.withdraw()
+    recording_path = args.recording
+    model_path = args.model
+    root = None  # tkinter root window
 
-    # 1. Load recording
-    print("\n[1] Select a recording file...")
-    recording_path = filedialog.askopenfilename(
-        title="Select Recording",
-        initialdir="data/recordings",
-        filetypes=[("Pickle files", "*.pkl"), ("MAT files", "*.mat"), ("All files", "*.*")]
-    )
+    # If paths not provided via command line, use file dialogs or manual input
+    if not recording_path:
+        if args.no_gui:
+            print("\n[1] Enter the recording file path:")
+            recording_path = input().strip().strip('"').strip("'")
+        else:
+            # File selection - improved for Windows
+            from tkinter import Tk, filedialog
+            root = Tk()
+            root.withdraw()
+            # Bring dialog to front on Windows
+            root.attributes('-topmost', True)
+            root.update()
+
+            print("\n[1] Select a recording file...")
+            print("    (A file dialog should open - check your taskbar if you don't see it)")
+
+            recording_path = filedialog.askopenfilename(
+                parent=root,
+                title="Select Recording",
+                initialdir="data/recordings",
+                filetypes=[("Pickle files", "*.pkl"), ("MAT files", "*.mat"), ("All files", "*.*")]
+            )
+
+            if not recording_path:
+                print("No recording selected via dialog.")
+                print("\nEnter the recording file path manually (or press Enter to exit):")
+                recording_path = input().strip().strip('"').strip("'")
 
     if not recording_path:
-        print("No recording selected. Exiting.")
+        print("No recording provided. Exiting.")
+        if root:
+            root.destroy()
         return
 
     visualizer.load_recording(recording_path)
 
-    # 2. Load model or templates
-    print("\n[2] Select a model or template file...")
-    model_path = filedialog.askopenfilename(
-        title="Select Model or Templates",
-        initialdir="data/models",
-        filetypes=[("Pickle files", "*.pkl"), ("All files", "*.*")]
-    )
+    # Load model or templates
+    if not model_path:
+        if args.no_gui:
+            print("\n[2] Enter the model/template file path:")
+            model_path = input().strip().strip('"').strip("'")
+        else:
+            if root is None:
+                from tkinter import Tk, filedialog
+                root = Tk()
+                root.withdraw()
+                root.attributes('-topmost', True)
+                root.update()
+
+            print("\n[2] Select a model or template file...")
+            print("    (A file dialog should open - check your taskbar if you don't see it)")
+
+            model_path = filedialog.askopenfilename(
+                parent=root,
+                title="Select Model or Templates",
+                initialdir="data/models",
+                filetypes=[("Pickle files", "*.pkl"), ("All files", "*.*")]
+            )
+
+            if not model_path:
+                print("No model/templates selected via dialog.")
+                print("\nEnter the model/template file path manually (or press Enter to exit):")
+                model_path = input().strip().strip('"').strip("'")
 
     if not model_path:
-        print("No model/templates selected. Exiting.")
+        print("No model provided. Exiting.")
+        if root:
+            root.destroy()
         return
+
+    # Clean up tkinter if it was used
+    if root:
+        root.destroy()
 
     # Detect if it's a model or raw templates
     with open(model_path, 'rb') as f:
@@ -739,7 +795,343 @@ def main():
         print(f"  Predicted class: {'OPEN' if min_open < min_closed else 'CLOSED'}")
         print(f"  Confidence margin: {abs(min_open - min_closed):.4f}")
 
-    print("\n[Done] You can re-run to test different windows.")
+    # Enter interactive menu for further exploration
+    print("\n" + "=" * 60)
+    print("Entering interactive exploration mode...")
+    print("=" * 60)
+    interactive_menu(visualizer, test_features, open_templates, closed_templates)
+
+
+def visualize_warping_alignment(test_features: np.ndarray, template_features: np.ndarray,
+                                 path: List[Tuple[int, int]], active_channels: List[int],
+                                 channel_to_show: int = 0):
+    """
+    Detailed visualization of how DTW warps the two time series.
+
+    Shows the original signals with connecting lines between aligned points.
+    """
+    import matplotlib.pyplot as plt
+
+    if channel_to_show not in active_channels:
+        channel_to_show = active_channels[0]
+
+    fig, axes = plt.subplots(3, 1, figsize=(14, 10))
+
+    # Get signals for the channel
+    test_signal = test_features[:, channel_to_show]
+    template_signal = template_features[:, channel_to_show]
+
+    # 1. Original signals stacked with warping lines
+    ax1 = axes[0]
+    offset = np.max(np.abs(template_signal)) * 1.5
+
+    ax1.plot(test_signal, 'b-', linewidth=2, label=f'Test (Ch{channel_to_show + 1})')
+    ax1.plot(template_signal - offset, 'r-', linewidth=2, label=f'Template (Ch{channel_to_show + 1})')
+
+    # Draw warping lines (subsample for clarity)
+    step = max(1, len(path) // 30)
+    for idx, (i, j) in enumerate(path[::step]):
+        ax1.plot([i, j], [test_signal[i], template_signal[j] - offset],
+                'g-', alpha=0.3, linewidth=0.5)
+
+    ax1.set_xlabel('Window index')
+    ax1.set_ylabel('Feature value')
+    ax1.set_title('DTW Warping Alignment\n(Green lines show how points are matched)')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # 2. Warping function visualization
+    ax2 = axes[1]
+    path_i, path_j = zip(*path)
+
+    ax2.plot(path_i, 'b-', linewidth=2, label='Test index')
+    ax2.plot(path_j, 'r-', linewidth=2, label='Template index')
+    ax2.plot([0, len(path)-1], [0, len(test_signal)-1], 'k--', alpha=0.5, label='Diagonal (no warping)')
+
+    ax2.fill_between(range(len(path)), path_i, path_j, alpha=0.2, color='green')
+    ax2.set_xlabel('Alignment step')
+    ax2.set_ylabel('Original index')
+    ax2.set_title('Warping Function\n(Deviation from diagonal = time warping)')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+
+    # 3. Local cost along the path
+    ax3 = axes[2]
+    local_costs = []
+    for i, j in path:
+        t1_vec = test_features[i, active_channels]
+        t2_vec = template_features[j, active_channels]
+        num = np.dot(t1_vec, t2_vec)
+        den = (np.linalg.norm(t1_vec) * np.linalg.norm(t2_vec) + 1e-8)
+        dist = 1 - num / den
+        local_costs.append(dist)
+
+    ax3.plot(local_costs, 'purple', linewidth=2)
+    ax3.fill_between(range(len(local_costs)), local_costs, alpha=0.3, color='purple')
+    ax3.axhline(y=np.mean(local_costs), color='red', linestyle='--',
+                label=f'Mean: {np.mean(local_costs):.4f}')
+
+    # Mark high-cost regions
+    threshold = np.mean(local_costs) + np.std(local_costs)
+    high_cost_mask = np.array(local_costs) > threshold
+    ax3.fill_between(range(len(local_costs)), 0, local_costs,
+                     where=high_cost_mask, alpha=0.5, color='red', label='High cost regions')
+
+    ax3.set_xlabel('Alignment step')
+    ax3.set_ylabel('Local cosine distance')
+    ax3.set_title('Cost Along Warping Path\n(Red regions contribute most to total distance)')
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    plt.tight_layout()
+    plt.show()
+
+
+def noise_sensitivity_analysis(visualizer, test_features: np.ndarray,
+                               template_features: np.ndarray,
+                               active_channels: List[int]):
+    """
+    Analyze how adding noise affects DTW distance.
+
+    Adds progressively more noise to the test signal and plots
+    the effect on DTW distance.
+    """
+    import matplotlib.pyplot as plt
+
+    # Baseline distance
+    baseline_cost, _, _, _ = dtw_with_path(test_features, template_features, active_channels)
+
+    # Test different noise levels
+    noise_levels = np.linspace(0, 0.5, 20)
+    distances = []
+    distances_std = []
+
+    print("\nNoise sensitivity analysis...")
+    for noise_level in noise_levels:
+        trial_distances = []
+        for _ in range(5):  # 5 trials per noise level
+            # Add Gaussian noise
+            noise = np.random.randn(*test_features.shape) * noise_level * np.std(test_features)
+            noisy_features = test_features + noise
+
+            cost, _, _, _ = dtw_with_path(noisy_features, template_features, active_channels)
+            trial_distances.append(cost)
+
+        distances.append(np.mean(trial_distances))
+        distances_std.append(np.std(trial_distances))
+
+    distances = np.array(distances)
+    distances_std = np.array(distances_std)
+
+    # Plot
+    fig, axes = plt.subplots(1, 2, figsize=(12, 5))
+
+    ax1 = axes[0]
+    ax1.plot(noise_levels, distances, 'b-', linewidth=2, label='Mean DTW')
+    ax1.fill_between(noise_levels, distances - distances_std, distances + distances_std,
+                     alpha=0.3, color='blue', label='±1 std')
+    ax1.axhline(y=baseline_cost, color='green', linestyle='--',
+                label=f'Baseline: {baseline_cost:.4f}')
+    ax1.set_xlabel('Noise level (fraction of std)')
+    ax1.set_ylabel('DTW distance')
+    ax1.set_title('Effect of Noise on DTW Distance')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # Relative change
+    ax2 = axes[1]
+    relative_change = (distances - baseline_cost) / baseline_cost * 100
+    ax2.plot(noise_levels, relative_change, 'r-', linewidth=2)
+    ax2.fill_between(noise_levels, relative_change - distances_std/baseline_cost*100,
+                     relative_change + distances_std/baseline_cost*100, alpha=0.3, color='red')
+    ax2.axhline(y=0, color='green', linestyle='--')
+    ax2.set_xlabel('Noise level (fraction of std)')
+    ax2.set_ylabel('Distance change (%)')
+    ax2.set_title('Relative Distance Change')
+    ax2.grid(True, alpha=0.3)
+
+    plt.suptitle('Noise Sensitivity Analysis', fontsize=12, fontweight='bold')
+    plt.tight_layout()
+    plt.show()
+
+    return noise_levels, distances
+
+
+def artifact_simulation(visualizer, test_features: np.ndarray,
+                       template_features: np.ndarray,
+                       active_channels: List[int]):
+    """
+    Simulate common EMG artifacts and show their effect on DTW.
+
+    Artifacts tested:
+    - Spike artifact (brief high-amplitude)
+    - Baseline shift
+    - Muscle fatigue (amplitude decay)
+    - Channel dropout
+    """
+    import matplotlib.pyplot as plt
+
+    baseline_cost, _, _, _ = dtw_with_path(test_features, template_features, active_channels)
+
+    n_windows, n_channels = test_features.shape
+
+    results = {}
+
+    # 1. Spike artifact
+    spike_features = test_features.copy()
+    spike_pos = n_windows // 2
+    spike_features[spike_pos:spike_pos+2, :] *= 5  # 5x amplitude spike
+    spike_cost, _, _, _ = dtw_with_path(spike_features, template_features, active_channels)
+    results['Spike (5x amp)'] = spike_cost
+
+    # 2. Baseline shift
+    shift_features = test_features.copy()
+    shift_features += np.std(test_features) * 0.5  # Shift by 0.5 std
+    shift_cost, _, _, _ = dtw_with_path(shift_features, template_features, active_channels)
+    results['Baseline shift'] = shift_cost
+
+    # 3. Amplitude decay (fatigue)
+    decay_features = test_features.copy()
+    decay_factor = np.linspace(1, 0.5, n_windows).reshape(-1, 1)
+    decay_features *= decay_factor
+    decay_cost, _, _, _ = dtw_with_path(decay_features, template_features, active_channels)
+    results['Amplitude decay'] = decay_cost
+
+    # 4. Channel dropout (zero out 2 channels)
+    dropout_features = test_features.copy()
+    dropout_channels = active_channels[:2] if len(active_channels) >= 2 else active_channels[:1]
+    dropout_features[:, dropout_channels] = 0
+    dropout_cost, _, _, _ = dtw_with_path(dropout_features, template_features, active_channels)
+    results[f'Channel dropout ({len(dropout_channels)} ch)'] = dropout_cost
+
+    # 5. Random noise burst
+    burst_features = test_features.copy()
+    burst_start = n_windows // 3
+    burst_end = burst_start + n_windows // 6
+    burst_features[burst_start:burst_end, :] += np.random.randn(burst_end - burst_start, n_channels) * np.std(test_features)
+    burst_cost, _, _, _ = dtw_with_path(burst_features, template_features, active_channels)
+    results['Noise burst'] = burst_cost
+
+    # Plot
+    fig, ax = plt.subplots(figsize=(10, 6))
+
+    artifacts = list(results.keys())
+    costs = list(results.values())
+    colors = ['red' if c > baseline_cost * 1.2 else 'orange' if c > baseline_cost * 1.1 else 'green'
+              for c in costs]
+
+    x = np.arange(len(artifacts))
+    bars = ax.bar(x, costs, color=colors, alpha=0.7)
+    ax.axhline(y=baseline_cost, color='blue', linestyle='--', linewidth=2,
+               label=f'Baseline: {baseline_cost:.4f}')
+
+    ax.set_xticks(x)
+    ax.set_xticklabels(artifacts, rotation=15, ha='right')
+    ax.set_ylabel('DTW distance')
+    ax.set_title('Effect of Common Artifacts on DTW Distance\n'
+                 '(Green = <10% change, Orange = 10-20%, Red = >20%)')
+    ax.legend()
+
+    # Add percentage change labels
+    for bar, cost in zip(bars, costs):
+        pct_change = (cost - baseline_cost) / baseline_cost * 100
+        ax.annotate(f'{pct_change:+.1f}%',
+                   (bar.get_x() + bar.get_width()/2, bar.get_height()),
+                   textcoords="offset points", xytext=(0, 5), ha='center', fontsize=9)
+
+    plt.tight_layout()
+    plt.show()
+
+    return results
+
+
+def interactive_menu(visualizer, test_features, open_templates, closed_templates):
+    """Interactive menu for exploring different visualizations."""
+
+    active_channels = config.active_channels
+
+    while True:
+        print("\n" + "=" * 50)
+        print("DTW Analysis Menu")
+        print("=" * 50)
+        print("1. Compare with all OPEN templates")
+        print("2. Compare with all CLOSED templates")
+        print("3. Detailed DTW visualization (select template)")
+        print("4. Warping alignment visualization")
+        print("5. Noise sensitivity analysis")
+        print("6. Artifact simulation")
+        print("7. Select new window from recording")
+        print("8. Change active channels")
+        print("9. Exit")
+        print("-" * 50)
+
+        choice = input("Enter choice (1-9): ").strip()
+
+        if choice == '1' and open_templates:
+            distances = visualizer.compare_with_all_templates(test_features, open_templates, "OPEN")
+
+        elif choice == '2' and closed_templates:
+            distances = visualizer.compare_with_all_templates(test_features, closed_templates, "CLOSED")
+
+        elif choice == '3':
+            class_choice = input("Which class? (open/closed): ").strip().lower()
+            templates = open_templates if class_choice == 'open' else closed_templates
+
+            if templates:
+                idx = int(input(f"Template index (1-{len(templates)}): ")) - 1
+                if 0 <= idx < len(templates):
+                    visualizer.visualize_dtw_full(test_features, templates[idx], idx, active_channels)
+                else:
+                    print("Invalid index")
+            else:
+                print("No templates for that class")
+
+        elif choice == '4':
+            class_choice = input("Which class? (open/closed): ").strip().lower()
+            templates = open_templates if class_choice == 'open' else closed_templates
+
+            if templates:
+                idx = int(input(f"Template index (1-{len(templates)}): ")) - 1
+                channel = int(input(f"Channel to show (1-{test_features.shape[1]}): ")) - 1
+
+                _, _, _, path = dtw_with_path(test_features, templates[idx], active_channels)
+                visualize_warping_alignment(test_features, templates[idx], path, active_channels, channel)
+
+        elif choice == '5':
+            class_choice = input("Which class? (open/closed): ").strip().lower()
+            templates = open_templates if class_choice == 'open' else closed_templates
+
+            if templates:
+                idx = int(input(f"Template index (1-{len(templates)}): ")) - 1
+                noise_sensitivity_analysis(visualizer, test_features, templates[idx], active_channels)
+
+        elif choice == '6':
+            class_choice = input("Which class? (open/closed): ").strip().lower()
+            templates = open_templates if class_choice == 'open' else closed_templates
+
+            if templates:
+                idx = int(input(f"Template index (1-{len(templates)}): ")) - 1
+                artifact_simulation(visualizer, test_features, templates[idx], active_channels)
+
+        elif choice == '7':
+            window = visualizer.interactive_window_selection(channel=0)
+            if window is not None:
+                test_features = visualizer.extract_features(window)
+                print(f"New test features shape: {test_features.shape}")
+
+        elif choice == '8':
+            print(f"Current active channels: {[c+1 for c in active_channels]}")
+            new_channels = input("Enter new active channels (comma-separated, 1-indexed): ").strip()
+            if new_channels:
+                active_channels = [int(c.strip()) - 1 for c in new_channels.split(',')]
+                print(f"Updated active channels: {[c+1 for c in active_channels]}")
+
+        elif choice == '9':
+            print("Goodbye!")
+            break
+
+        else:
+            print("Invalid choice or no templates available for that class")
 
 
 if __name__ == "__main__":

@@ -50,20 +50,22 @@ class OnlineProtocol(QObject):
 
     def online_emg_update(self, data: np.ndarray) -> None:
         # TODO: Implement online prediction in model interface and model class
-        emg_data = self.main_window.device.extract_emg_data(data) 
+        emg_data = self.main_window.device.extract_emg_data(data)
         # shape (32, nsamp)
         # forward to model interface: the Model.predict must handel buffer inside model
-        
+
         prediction = self.model_interface.predict(emg_data)
-                
+
         # Stream prediction values to the virtual hand interface
         self.main_window.virtual_hand_interface.output_message_signal.emit(
             str(prediction).encode("utf-8")
         )
 
         if self.online_record_toggle_push_button.isChecked():
-            self.emg_buffer.append(emg_data)
+            # Store with timestamp for proper reconstruction (same format as record protocol)
+            self.emg_buffer.append((time.time(), emg_data))
             self.predictions_buffer.append(prediction)
+            # Note: emg_timings_buffer is now redundant but kept for compatibility
             self.emg_timings_buffer.append(time.time())
 
     def online_kinematics_update(self, data: np.ndarray) -> None:
@@ -138,12 +140,42 @@ class OnlineProtocol(QObject):
         s_open = history.get("s_open", 1.0)
         s_closed = history.get("s_closed", 1.0)
 
-        # Get EMG data from buffer
-        emg_data = np.array(self.emg_buffer) if self.emg_buffer else None
+        # Reconstruct continuous EMG signal from buffer
+        # emg_buffer is now list of (timestamp, emg_data) tuples
+        if self.emg_buffer:
+            emg_timestamps = np.array([t for t, _ in self.emg_buffer])
+            emg_signal = np.hstack([emg_data for _, emg_data in self.emg_buffer])  # (32, total_samples)
+            n_channels, n_samples = emg_signal.shape
+
+            # Create continuous time axis for EMG
+            # Each packet has a timestamp; reconstruct sample-level times
+            emg_time_axis = np.zeros(n_samples)
+            sample_idx = 0
+            for i, (pkt_time, pkt_data) in enumerate(self.emg_buffer):
+                pkt_samples = pkt_data.shape[1]
+                if i == 0:
+                    # First packet: samples end at pkt_time
+                    pkt_duration = pkt_samples / config.FSAMP
+                    emg_time_axis[sample_idx:sample_idx + pkt_samples] = np.linspace(
+                        pkt_time - pkt_duration, pkt_time, pkt_samples, endpoint=False
+                    )
+                else:
+                    # Subsequent packets: interpolate between timestamps
+                    prev_time = self.emg_buffer[i-1][0]
+                    emg_time_axis[sample_idx:sample_idx + pkt_samples] = np.linspace(
+                        prev_time, pkt_time, pkt_samples, endpoint=False
+                    )
+                sample_idx += pkt_samples
+        else:
+            emg_signal = None
+            emg_time_axis = None
 
         # Normalize timestamps to start from 0
         t0 = timestamps[0] if len(timestamps) > 0 else 0
         timestamps_rel = timestamps - t0
+
+        if emg_time_axis is not None:
+            emg_time_rel = emg_time_axis - t0
 
         # Total duration
         total_duration = timestamps_rel[-1] if len(timestamps_rel) > 0 else 0
@@ -154,13 +186,14 @@ class OnlineProtocol(QObject):
 
         print(f"\n[PLOT] Creating {n_windows} plot(s) for {total_duration:.1f}s recording")
         print(f"       DTW computations: {len(timestamps)}")
+        print(f"       EMG samples: {emg_signal.shape[1] if emg_signal is not None else 0}")
         print(f"       State transitions: {len(state_transitions)}")
 
         for window_idx in range(n_windows):
             t_start = window_idx * window_size
             t_end = min((window_idx + 1) * window_size, total_duration + 1)
 
-            # Filter data for this window
+            # Filter DTW data for this window
             mask = (timestamps_rel >= t_start) & (timestamps_rel < t_end)
             t_window = timestamps_rel[mask]
 
@@ -172,31 +205,13 @@ class OnlineProtocol(QObject):
 
             # --- Plot 1: EMG Signal ---
             ax1 = axes[0]
-            if emg_data is not None and len(emg_data) > 0:
-                # Reconstruct EMG timeline
-                # Each emg_buffer entry corresponds to a DTW computation
-                emg_indices = np.where(mask)[0]
-                if len(emg_indices) > 0:
-                    # Get EMG data for this window (channel 0 for display)
-                    emg_window = []
-                    emg_times = []
-                    for idx in emg_indices:
-                        if idx < len(emg_data):
-                            # Each emg_data[idx] is (n_channels, n_samples) from the packet
-                            packet = emg_data[idx]
-                            if packet.ndim == 2:
-                                emg_window.extend(packet[0, :])  # Channel 0
-                                # Create time points for this packet
-                                packet_duration = packet.shape[1] / 2000  # 2000 Hz
-                                packet_times = np.linspace(
-                                    timestamps_rel[idx] - packet_duration,
-                                    timestamps_rel[idx],
-                                    packet.shape[1]
-                                )
-                                emg_times.extend(packet_times)
-
-                    if emg_window:
-                        ax1.plot(emg_times, emg_window, 'b-', linewidth=0.5, alpha=0.7)
+            if emg_signal is not None and emg_time_rel is not None:
+                # Filter EMG samples for this time window
+                emg_mask = (emg_time_rel >= t_start) & (emg_time_rel < t_end)
+                if np.any(emg_mask):
+                    emg_times_window = emg_time_rel[emg_mask]
+                    emg_values_window = emg_signal[0, emg_mask]  # Channel 0
+                    ax1.plot(emg_times_window, emg_values_window, 'b-', linewidth=0.5, alpha=0.7)
 
             ax1.set_ylabel("EMG Ch1 (µV)", fontsize=11)
             ax1.set_title(f"Online Session Analysis - Window {window_idx + 1}/{n_windows} "
@@ -284,14 +299,26 @@ class OnlineProtocol(QObject):
         print(f"[PLOT] Done plotting {n_windows} window(s)")
 
     def _save_data(self) -> None:
-        # TODO: add code to save buffered data
+        # Reconstruct EMG as (32, total_samples) - same format as record protocol
+        if self.emg_buffer:
+            # emg_buffer is list of (timestamp, emg_data) tuples
+            emg_signal = np.hstack([emg_data for _, emg_data in self.emg_buffer])
+            emg_timings = np.array([timestamp for timestamp, _ in self.emg_buffer])
+        else:
+            emg_signal = np.array([])
+            emg_timings = np.array([])
+
         save_pickle_dict = {
-            "emg": np.array(self.emg_buffer),
-            "kinematics": np.array(self.kinematics_buffer),
-            "timings_emg": np.array(self.emg_timings_buffer),
+            "emg": emg_signal,  # Shape: (32, total_samples) - consistent with record protocol
+            "kinematics": np.array(self.kinematics_buffer) if self.kinematics_buffer else np.array([]),
+            "timings_emg": emg_timings,
             "timings_kinematics": np.array(self.kinematics_timings_buffer),
-            "label": np.array(self.model_label),
+            "predictions": self.predictions_buffer,
+            "label": self.model_label,
+            # Include distance history for offline analysis
+            "distance_history": self.model_interface.get_distance_history(),
         }
+
         now = datetime.now()
         formatted_now = now.strftime("%Y%m%d_%H%M%S%f")
         file_name = (
@@ -303,6 +330,9 @@ class OnlineProtocol(QObject):
 
         with open(os.path.join(self.prediction_dir_path, file_name), "wb") as f:
             pickle.dump(save_pickle_dict, f)
+
+        print(f"[SAVE] Saved prediction data to {file_name}")
+        print(f"       EMG shape: {emg_signal.shape if len(emg_signal) > 0 else 'empty'}")
 
         # Reset buffers
         self.emg_buffer = []
