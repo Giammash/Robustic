@@ -281,6 +281,46 @@ class Model:
 
         print(f"[THRESHOLD] CLOSED: s={s_closed:.2f} → threshold={self.THRESHOLD_CLOSED:.4f}")
 
+    def set_threshold_open_direct(self, threshold: float) -> None:
+        """
+        Set OPEN threshold directly and compute corresponding s value.
+
+        Args:
+            threshold: Direct threshold value.
+        """
+        if not hasattr(self, 'mean_open') or not hasattr(self, 'std_open'):
+            print("Warning: Model statistics not loaded, cannot update threshold")
+            return
+
+        self.THRESHOLD_OPEN = max(0, threshold)  # Clamp to non-negative
+        # Compute s from threshold: threshold = mean + s*std => s = (threshold - mean) / std
+        if self.std_open > 0:
+            self.s_open = (self.THRESHOLD_OPEN - self.mean_open) / self.std_open
+        else:
+            self.s_open = 0
+
+        print(f"[THRESHOLD] OPEN: threshold={self.THRESHOLD_OPEN:.4f} (s={self.s_open:.2f})")
+
+    def set_threshold_closed_direct(self, threshold: float) -> None:
+        """
+        Set CLOSED threshold directly and compute corresponding s value.
+
+        Args:
+            threshold: Direct threshold value.
+        """
+        if not hasattr(self, 'mean_closed') or not hasattr(self, 'std_closed'):
+            print("Warning: Model statistics not loaded, cannot update threshold")
+            return
+
+        self.THRESHOLD_CLOSED = max(0, threshold)  # Clamp to non-negative
+        # Compute s from threshold: threshold = mean + s*std => s = (threshold - mean) / std
+        if self.std_closed > 0:
+            self.s_closed = (self.THRESHOLD_CLOSED - self.mean_closed) / self.std_closed
+        else:
+            self.s_closed = 0
+
+        print(f"[THRESHOLD] CLOSED: threshold={self.THRESHOLD_CLOSED:.4f} (s={self.s_closed:.2f})")
+
     def update_thresholds(self, s_open: float = None, s_closed: float = None) -> None:
         """
         Update both thresholds. If only one is provided, only that one is updated.

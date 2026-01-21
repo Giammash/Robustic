@@ -365,8 +365,8 @@ def plot_distance_results(
     n_samples = emg_data.shape[1]
     time_emg = np.arange(n_samples) / config.FSAMP
 
-    # Check if we have filtered signal to show
-    has_filtered = show_filtered and filtered_signal is not None
+    # Check if we have filtered signal to show (only if filtering is enabled)
+    has_filtered = show_filtered and filtered_signal is not None and config.ENABLE_FILTERING
 
     # Create figure (5 subplots if showing filtered, 4 otherwise)
     n_plots = 5 if has_filtered else 4
@@ -629,8 +629,8 @@ def run_offline_test_folder(
     model_data = load_model(str(model_path))
     templates_open = model_data['open_templates']
     templates_closed = model_data['closed_templates']
-    threshold_open = model_data['threshold_base_open'] * 2
-    threshold_closed = model_data['threshold_base_closed'] * 2
+    threshold_open = model_data['threshold_base_open'] #* 2
+    threshold_closed = model_data['threshold_base_closed'] #* 2
     feature_name = model_data['feature_name']
 
     print(f"\nModel loaded:")
@@ -703,7 +703,7 @@ TEST_FOLDER = "recordings"
 
 # Model file (inside data/models/)
 # Use None for default (dtw_model_0.pkl), or specify a filename
-MODEL_FILE = "MindMove_Model_20260120_152906_test_manual_average.pkl"
+MODEL_FILE = "MindMove_Model_20260121_104221_test_average_2.pkl"
 # "dtw_model_0.pkl"  # e.g., "dtw_model_tslearn.pkl" for tslearn model
 
 # DTW implementation (set ONE to True, others to False)

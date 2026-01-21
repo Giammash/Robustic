@@ -299,6 +299,91 @@ def tune_thresholds(mean_distance, std_distance, s=1):
     return threshold
 
 
+def compute_per_template_statistics(templates, active_channels=None, n_worst=3):
+    """
+    Compute per-template distance statistics to identify outliers.
+
+    For each template, computes its average distance to all other templates.
+    Templates with high average distance may be poor quality or inconsistent.
+
+    Parameters
+    ----------
+    templates : list of np.ndarray
+        List of templates already windowed and feature extracted.
+        Each element has shape (n_windows, n_channels).
+    active_channels : list or None
+        List of active channel indices (0-indexed). If None, uses config.active_channels.
+    n_worst : int
+        Number of worst templates to identify (default: 3).
+
+    Returns
+    -------
+    dict with keys:
+        'per_template_avg': list of float - Average distance for each template
+        'per_template_max': list of float - Max distance for each template
+        'per_template_min': list of float - Min distance for each template
+        'worst_indices': list of int - Indices of worst templates (1-indexed for display)
+        'best_indices': list of int - Indices of best templates (1-indexed for display)
+        'overall_mean': float - Mean of all pairwise distances
+        'overall_std': float - Std of all pairwise distances
+    """
+    n_templates = len(templates)
+    if n_templates < 2:
+        return {
+            'per_template_avg': [0.0] * n_templates,
+            'per_template_max': [0.0] * n_templates,
+            'per_template_min': [0.0] * n_templates,
+            'worst_indices': [],
+            'best_indices': [],
+            'overall_mean': 0.0,
+            'overall_std': 0.0,
+        }
+
+    # Distance matrix (only upper triangle computed)
+    distance_matrix = np.zeros((n_templates, n_templates))
+
+    for i in range(n_templates):
+        for j in range(i + 1, n_templates):
+            dist = compute_dtw(templates[i], templates[j], active_channels=active_channels)
+            distance_matrix[i, j] = dist
+            distance_matrix[j, i] = dist  # Symmetric
+
+    # Compute per-template statistics
+    per_template_avg = []
+    per_template_max = []
+    per_template_min = []
+
+    for i in range(n_templates):
+        # Get distances to all OTHER templates (exclude diagonal = 0)
+        other_distances = [distance_matrix[i, j] for j in range(n_templates) if i != j]
+        per_template_avg.append(np.mean(other_distances))
+        per_template_max.append(np.max(other_distances))
+        per_template_min.append(np.min(other_distances))
+
+    # Extract upper triangle for overall statistics
+    all_distances = distance_matrix[np.triu_indices(n_templates, k=1)]
+    overall_mean = np.mean(all_distances)
+    overall_std = np.std(all_distances)
+
+    # Identify worst templates (highest average distance = most different from others)
+    sorted_by_avg = np.argsort(per_template_avg)[::-1]  # Descending
+    worst_indices = [int(idx) + 1 for idx in sorted_by_avg[:n_worst]]  # 1-indexed for display
+
+    # Identify best templates (lowest average distance = most consistent)
+    best_indices = [int(idx) + 1 for idx in sorted_by_avg[-n_worst:][::-1]]  # 1-indexed for display
+
+    return {
+        'per_template_avg': per_template_avg,
+        'per_template_max': per_template_max,
+        'per_template_min': per_template_min,
+        'worst_indices': worst_indices,
+        'best_indices': best_indices,
+        'overall_mean': overall_mean,
+        'overall_std': overall_std,
+        'distance_matrix': distance_matrix,
+    }
+
+
 def compute_distance_from_training_set_offline(test_recording, templates, feature_name = 'wl' , window_length=1, increment = 0.050):
     """
     test_recording : offling emg recording (has to be extracted for data)

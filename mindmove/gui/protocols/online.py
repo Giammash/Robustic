@@ -112,92 +112,176 @@ class OnlineProtocol(QObject):
             self._save_data()
 
     def _plot_distance_history(self) -> None:
-        """Plot distance history after stopping recording."""
+        """
+        Plot distance history after stopping recording.
+
+        Creates a 3-subplot figure:
+        - Top: EMG signal reconstruction
+        - Middle: State over time (0=OPEN, 1=CLOSED)
+        - Bottom: Distance to opposite-state templates with threshold
+
+        For long recordings (>100s), creates multiple plots.
+        """
         history = self.model_interface.get_distance_history()
 
         if history is None or len(history.get("timestamps", [])) == 0:
             print("[PLOT] No distance history to plot")
             return
 
-        timestamps = history["timestamps"]
+        timestamps = np.array(history["timestamps"])
         D_open = history["D_open"]
         D_closed = history["D_closed"]
         states = history["states"]
         threshold_open = history["threshold_open"]
         threshold_closed = history["threshold_closed"]
         state_transitions = history.get("state_transitions", [])
-
-        # Normalize transition timestamps
-        t0 = timestamps[0] if timestamps else 0
-        t0_abs = history["timestamps"][0] if history["timestamps"] else 0
-
-        # Create figure with 2 subplots
-        fig, axes = plt.subplots(2, 1, figsize=(14, 8), sharex=True)
-
-        # --- Plot 1: Distance to OPEN templates ---
-        ax1 = axes[0]
-        # Filter out None values for plotting
-        t_open = [t for t, d in zip(timestamps, D_open) if d is not None]
-        d_open_valid = [d for d in D_open if d is not None]
-
-        if t_open and d_open_valid:
-            ax1.scatter(t_open, d_open_valid, c='blue', s=10, alpha=0.7, label='D_open (when CLOSED)')
-            ax1.plot(t_open, d_open_valid, 'b-', alpha=0.3, linewidth=0.5)
-
-        # Threshold line
-        if threshold_open is not None:
-            ax1.axhline(y=threshold_open, color='blue', linestyle='--', linewidth=2,
-                       label=f'Threshold OPEN: {threshold_open:.4f}')
-
-        # Mark state transitions
-        for trans_time, from_state, to_state in state_transitions:
-            trans_t = trans_time - t0_abs
-            if to_state == "OPEN":
-                ax1.axvline(x=trans_t, color='green', linestyle='-', linewidth=2, alpha=0.7)
-
-        ax1.set_ylabel("Distance to OPEN templates", fontsize=12)
-        ax1.set_title("Distance to OPEN Templates (computed when state is CLOSED)", fontsize=12)
-        ax1.legend(loc='upper right')
-        ax1.grid(True, alpha=0.3)
-
-        # --- Plot 2: Distance to CLOSED templates ---
-        ax2 = axes[1]
-        # Filter out None values for plotting
-        t_closed = [t for t, d in zip(timestamps, D_closed) if d is not None]
-        d_closed_valid = [d for d in D_closed if d is not None]
-
-        if t_closed and d_closed_valid:
-            ax2.scatter(t_closed, d_closed_valid, c='red', s=10, alpha=0.7, label='D_closed (when OPEN)')
-            ax2.plot(t_closed, d_closed_valid, 'r-', alpha=0.3, linewidth=0.5)
-
-        # Threshold line
-        if threshold_closed is not None:
-            ax2.axhline(y=threshold_closed, color='red', linestyle='--', linewidth=2,
-                       label=f'Threshold CLOSED: {threshold_closed:.4f}')
-
-        # Mark state transitions
-        for trans_time, from_state, to_state in state_transitions:
-            trans_t = trans_time - t0_abs
-            if to_state == "CLOSED":
-                ax2.axvline(x=trans_t, color='orange', linestyle='-', linewidth=2, alpha=0.7)
-
-        ax2.set_xlabel("Time (seconds)", fontsize=12)
-        ax2.set_ylabel("Distance to CLOSED templates", fontsize=12)
-        ax2.set_title("Distance to CLOSED Templates (computed when state is OPEN)", fontsize=12)
-        ax2.legend(loc='upper right')
-        ax2.grid(True, alpha=0.3)
-
-        # Add info text
         s_open = history.get("s_open", 1.0)
         s_closed = history.get("s_closed", 1.0)
-        fig.suptitle(f"Online Session Distance Analysis (s_open={s_open:.2f}, s_closed={s_closed:.2f})",
-                     fontsize=14, fontweight='bold')
 
-        plt.tight_layout()
-        plt.show()
+        # Get EMG data from buffer
+        emg_data = np.array(self.emg_buffer) if self.emg_buffer else None
 
-        print(f"\n[PLOT] Distance history plotted: {len(timestamps)} DTW computations")
+        # Normalize timestamps to start from 0
+        t0 = timestamps[0] if len(timestamps) > 0 else 0
+        timestamps_rel = timestamps - t0
+
+        # Total duration
+        total_duration = timestamps_rel[-1] if len(timestamps_rel) > 0 else 0
+
+        # Window size for plotting (100 seconds)
+        window_size = 100.0
+        n_windows = max(1, int(np.ceil(total_duration / window_size)))
+
+        print(f"\n[PLOT] Creating {n_windows} plot(s) for {total_duration:.1f}s recording")
+        print(f"       DTW computations: {len(timestamps)}")
         print(f"       State transitions: {len(state_transitions)}")
+
+        for window_idx in range(n_windows):
+            t_start = window_idx * window_size
+            t_end = min((window_idx + 1) * window_size, total_duration + 1)
+
+            # Filter data for this window
+            mask = (timestamps_rel >= t_start) & (timestamps_rel < t_end)
+            t_window = timestamps_rel[mask]
+
+            if len(t_window) == 0:
+                continue
+
+            # Create figure with 3 subplots
+            fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
+
+            # --- Plot 1: EMG Signal ---
+            ax1 = axes[0]
+            if emg_data is not None and len(emg_data) > 0:
+                # Reconstruct EMG timeline
+                # Each emg_buffer entry corresponds to a DTW computation
+                emg_indices = np.where(mask)[0]
+                if len(emg_indices) > 0:
+                    # Get EMG data for this window (channel 0 for display)
+                    emg_window = []
+                    emg_times = []
+                    for idx in emg_indices:
+                        if idx < len(emg_data):
+                            # Each emg_data[idx] is (n_channels, n_samples) from the packet
+                            packet = emg_data[idx]
+                            if packet.ndim == 2:
+                                emg_window.extend(packet[0, :])  # Channel 0
+                                # Create time points for this packet
+                                packet_duration = packet.shape[1] / 2000  # 2000 Hz
+                                packet_times = np.linspace(
+                                    timestamps_rel[idx] - packet_duration,
+                                    timestamps_rel[idx],
+                                    packet.shape[1]
+                                )
+                                emg_times.extend(packet_times)
+
+                    if emg_window:
+                        ax1.plot(emg_times, emg_window, 'b-', linewidth=0.5, alpha=0.7)
+
+            ax1.set_ylabel("EMG Ch1 (µV)", fontsize=11)
+            ax1.set_title(f"Online Session Analysis - Window {window_idx + 1}/{n_windows} "
+                         f"[{t_start:.0f}s - {t_end:.0f}s]", fontsize=12, fontweight='bold')
+            ax1.grid(True, alpha=0.3)
+
+            # --- Plot 2: State Over Time ---
+            ax2 = axes[1]
+            states_window = [states[i] for i in range(len(states)) if mask[i]]
+            states_numeric = [1 if s == "CLOSED" else 0 for s in states_window]
+
+            if len(t_window) > 0 and len(states_numeric) > 0:
+                ax2.step(t_window, states_numeric, 'purple', linewidth=2, where='post')
+                ax2.fill_between(t_window, 0, states_numeric, step='post', alpha=0.3, color='purple')
+
+            ax2.set_ylabel("State", fontsize=11)
+            ax2.set_ylim(-0.1, 1.1)
+            ax2.set_yticks([0, 1])
+            ax2.set_yticklabels(['OPEN', 'CLOSED'])
+            ax2.grid(True, alpha=0.3)
+
+            # Mark state transitions in this window
+            for trans_time, from_state, to_state in state_transitions:
+                trans_t = trans_time - t0
+                if t_start <= trans_t < t_end:
+                    color = 'green' if to_state == "OPEN" else 'orange'
+                    ax2.axvline(x=trans_t, color=color, linestyle='-', linewidth=2, alpha=0.7)
+
+            # --- Plot 3: Distance to Opposite-State Templates ---
+            ax3 = axes[2]
+
+            # For each point, plot the distance that was computed (opposite state)
+            # When state=CLOSED, we computed D_open (checking if should open)
+            # When state=OPEN, we computed D_closed (checking if should close)
+
+            distances_to_plot = []
+            thresholds_to_plot = []
+            colors = []
+
+            for i, (t, state) in enumerate(zip(timestamps_rel, states)):
+                if not (t_start <= t < t_end):
+                    continue
+
+                if state == "CLOSED":
+                    # Was computing D_open to check if should open
+                    if D_open[i] is not None:
+                        distances_to_plot.append((t, D_open[i]))
+                        thresholds_to_plot.append((t, threshold_open))
+                        colors.append('green')  # Green for D_open
+                else:  # OPEN
+                    # Was computing D_closed to check if should close
+                    if D_closed[i] is not None:
+                        distances_to_plot.append((t, D_closed[i]))
+                        thresholds_to_plot.append((t, threshold_closed))
+                        colors.append('red')  # Red for D_closed
+
+            if distances_to_plot:
+                t_dist = [d[0] for d in distances_to_plot]
+                d_vals = [d[1] for d in distances_to_plot]
+                t_thresh = [th[0] for th in thresholds_to_plot]
+                th_vals = [th[1] for th in thresholds_to_plot]
+
+                # Plot distances with color indicating which template set
+                for i in range(len(t_dist)):
+                    ax3.scatter(t_dist[i], d_vals[i], c=colors[i], s=15, alpha=0.7)
+
+                # Plot threshold line (step function that changes with state)
+                ax3.step(t_thresh, th_vals, 'k--', linewidth=2, where='post',
+                        label='Threshold (adaptive)')
+
+                # Add legend
+                ax3.scatter([], [], c='green', s=30, label=f'D_open (T={threshold_open:.3f})')
+                ax3.scatter([], [], c='red', s=30, label=f'D_closed (T={threshold_closed:.3f})')
+                ax3.legend(loc='upper right', fontsize=9)
+
+            ax3.set_xlabel("Time (seconds)", fontsize=11)
+            ax3.set_ylabel("DTW Distance", fontsize=11)
+            ax3.set_title(f"Distance to Opposite-State Templates (s_open={s_open:.2f}, s_closed={s_closed:.2f})",
+                         fontsize=11)
+            ax3.grid(True, alpha=0.3)
+
+            plt.tight_layout()
+            plt.show()
+
+        print(f"[PLOT] Done plotting {n_windows} window(s)")
 
     def _save_data(self) -> None:
         # TODO: add code to save buffered data
@@ -259,28 +343,53 @@ class OnlineProtocol(QObject):
         self._update_threshold_display()
 
     def _update_threshold_display(self) -> None:
-        """Update the threshold labels after model load."""
+        """Update the threshold sliders and labels after model load."""
         thresholds = self.model_interface.get_current_thresholds()
         if thresholds and thresholds.get("threshold_open") is not None:
+            # Get model statistics
+            mean_open = thresholds.get("mean_open", 0)
+            std_open = thresholds.get("std_open", 0.1)
+            mean_closed = thresholds.get("mean_closed", 0)
+            std_closed = thresholds.get("std_closed", 0.1)
+
+            threshold_open = thresholds["threshold_open"]
+            threshold_closed = thresholds["threshold_closed"]
             s_open = thresholds.get("s_open", 1.0)
             s_closed = thresholds.get("s_closed", 1.0)
 
-            # Update slider positions to match model's s values
+            # Calculate max threshold for sliders (mean + 5*std to give enough range)
+            self._max_threshold_open = mean_open + 5 * std_open
+            self._max_threshold_closed = mean_closed + 5 * std_closed
+
+            # Ensure max is at least as large as current threshold
+            self._max_threshold_open = max(self._max_threshold_open, threshold_open * 1.5)
+            self._max_threshold_closed = max(self._max_threshold_closed, threshold_closed * 1.5)
+
+            # Update slider range labels
+            self._open_max_label.setText(f"{self._max_threshold_open:.3f}")
+            self._closed_max_label.setText(f"{self._max_threshold_closed:.3f}")
+
+            # Update slider positions to match current threshold values
             self.threshold_slider_open.blockSignals(True)
-            self.threshold_slider_open.setValue(int(s_open * 100))
+            slider_val_open = int((threshold_open / self._max_threshold_open) * self._slider_resolution)
+            self.threshold_slider_open.setValue(min(slider_val_open, self._slider_resolution))
             self.threshold_slider_open.blockSignals(False)
 
             self.threshold_slider_closed.blockSignals(True)
-            self.threshold_slider_closed.setValue(int(s_closed * 100))
+            slider_val_closed = int((threshold_closed / self._max_threshold_closed) * self._slider_resolution)
+            self.threshold_slider_closed.setValue(min(slider_val_closed, self._slider_resolution))
             self.threshold_slider_closed.blockSignals(False)
 
-            # Update labels
+            # Update labels with threshold and s values
             self.threshold_open_label.setText(
-                f"s_open = {s_open:.2f} | Threshold: {thresholds['threshold_open']:.4f}"
+                f"Threshold OPEN: {threshold_open:.4f} (s={s_open:.2f})"
             )
             self.threshold_closed_label.setText(
-                f"s_closed = {s_closed:.2f} | Threshold: {thresholds['threshold_closed']:.4f}"
+                f"Threshold CLOSED: {threshold_closed:.4f} (s={s_closed:.2f})"
             )
+
+            print(f"[THRESHOLD UI] OPEN range: 0 - {self._max_threshold_open:.4f}, current: {threshold_open:.4f}")
+            print(f"[THRESHOLD UI] CLOSED range: 0 - {self._max_threshold_closed:.4f}, current: {threshold_closed:.4f}")
 
     def _setup_protocol_ui(self) -> None:
         self.online_load_model_group_box = self.main_window.ui.onlineLoadModelGroupBox
@@ -302,54 +411,63 @@ class OnlineProtocol(QObject):
         self._setup_threshold_slider()
 
     def _setup_threshold_slider(self) -> None:
-        """Setup threshold tuning sliders UI (separate for OPEN and CLOSED)."""
+        """Setup threshold tuning sliders UI (direct threshold control)."""
         # Create a group box for threshold tuning
         self.threshold_group_box = QGroupBox("Threshold Tuning")
+
+        # Store max threshold values (will be updated when model is loaded)
+        self._max_threshold_open = 1.0  # Default, updated on model load
+        self._max_threshold_closed = 1.0  # Default, updated on model load
+        self._slider_resolution = 1000  # Slider units per threshold range
 
         main_layout = QVBoxLayout()
 
         # --- OPEN threshold slider ---
-        open_label = QLabel("s_open (OPEN threshold):")
+        open_label = QLabel("OPEN threshold (distance to open templates):")
         main_layout.addWidget(open_label)
 
         open_slider_layout = QHBoxLayout()
-        open_slider_layout.addWidget(QLabel("0.0"))
+        self._open_min_label = QLabel("0")
+        open_slider_layout.addWidget(self._open_min_label)
 
         self.threshold_slider_open = QSlider(Qt.Horizontal)
-        self.threshold_slider_open.setMinimum(0)      # s = 0.0
-        self.threshold_slider_open.setMaximum(500)    # s = 5.0
-        self.threshold_slider_open.setValue(100)      # Default s=1.0
+        self.threshold_slider_open.setMinimum(0)
+        self.threshold_slider_open.setMaximum(self._slider_resolution)
+        self.threshold_slider_open.setValue(self._slider_resolution // 2)  # Default to middle
         self.threshold_slider_open.setTickPosition(QSlider.TicksBelow)
-        self.threshold_slider_open.setTickInterval(100)  # Tick every 1.0
+        self.threshold_slider_open.setTickInterval(self._slider_resolution // 10)
         self.threshold_slider_open.valueChanged.connect(self._on_threshold_open_changed)
         open_slider_layout.addWidget(self.threshold_slider_open)
 
-        open_slider_layout.addWidget(QLabel("5.0"))
+        self._open_max_label = QLabel("1.0")
+        open_slider_layout.addWidget(self._open_max_label)
         main_layout.addLayout(open_slider_layout)
 
-        self.threshold_open_label = QLabel("s_open = 1.00 | Threshold: Not loaded")
+        self.threshold_open_label = QLabel("Threshold OPEN: Not loaded")
         main_layout.addWidget(self.threshold_open_label)
 
         # --- CLOSED threshold slider ---
-        closed_label = QLabel("s_closed (CLOSED threshold):")
+        closed_label = QLabel("CLOSED threshold (distance to closed templates):")
         main_layout.addWidget(closed_label)
 
         closed_slider_layout = QHBoxLayout()
-        closed_slider_layout.addWidget(QLabel("0.0"))
+        self._closed_min_label = QLabel("0")
+        closed_slider_layout.addWidget(self._closed_min_label)
 
         self.threshold_slider_closed = QSlider(Qt.Horizontal)
-        self.threshold_slider_closed.setMinimum(0)    # s = 0.0
-        self.threshold_slider_closed.setMaximum(500)  # s = 5.0
-        self.threshold_slider_closed.setValue(100)    # Default s=1.0
+        self.threshold_slider_closed.setMinimum(0)
+        self.threshold_slider_closed.setMaximum(self._slider_resolution)
+        self.threshold_slider_closed.setValue(self._slider_resolution // 2)  # Default to middle
         self.threshold_slider_closed.setTickPosition(QSlider.TicksBelow)
-        self.threshold_slider_closed.setTickInterval(100)  # Tick every 1.0
+        self.threshold_slider_closed.setTickInterval(self._slider_resolution // 10)
         self.threshold_slider_closed.valueChanged.connect(self._on_threshold_closed_changed)
         closed_slider_layout.addWidget(self.threshold_slider_closed)
 
-        closed_slider_layout.addWidget(QLabel("5.0"))
+        self._closed_max_label = QLabel("1.0")
+        closed_slider_layout.addWidget(self._closed_max_label)
         main_layout.addLayout(closed_slider_layout)
 
-        self.threshold_closed_label = QLabel("s_closed = 1.00 | Threshold: Not loaded")
+        self.threshold_closed_label = QLabel("Threshold CLOSED: Not loaded")
         main_layout.addWidget(self.threshold_closed_label)
 
         self.threshold_group_box.setLayout(main_layout)
@@ -359,36 +477,40 @@ class OnlineProtocol(QObject):
             self.online_commands_group_box.layout().addWidget(self.threshold_group_box)
 
     def _on_threshold_open_changed(self, value: int) -> None:
-        """Called when OPEN threshold slider is moved."""
-        s_open = value / 100.0  # Convert back to float (0-500 -> 0.0-5.0)
+        """Called when OPEN threshold slider is moved (direct threshold control)."""
+        # Convert slider value to threshold (0 to max_threshold)
+        threshold = (value / self._slider_resolution) * self._max_threshold_open
 
-        # Update model threshold
-        self.model_interface.update_threshold_open(s_open)
+        # Update model threshold directly
+        self.model_interface.set_threshold_open_direct(threshold)
 
-        # Update label
+        # Update label with threshold and computed s
         thresholds = self.model_interface.get_current_thresholds()
         if thresholds and thresholds.get("threshold_open") is not None:
+            s_open = thresholds.get("s_open", 0)
             self.threshold_open_label.setText(
-                f"s_open = {s_open:.2f} | Threshold: {thresholds['threshold_open']:.4f}"
+                f"Threshold OPEN: {threshold:.4f} (s={s_open:.2f})"
             )
         else:
-            self.threshold_open_label.setText(f"s_open = {s_open:.2f} | Threshold: Not loaded")
+            self.threshold_open_label.setText(f"Threshold OPEN: {threshold:.4f}")
 
     def _on_threshold_closed_changed(self, value: int) -> None:
-        """Called when CLOSED threshold slider is moved."""
-        s_closed = value / 100.0  # Convert back to float (0-500 -> 0.0-5.0)
+        """Called when CLOSED threshold slider is moved (direct threshold control)."""
+        # Convert slider value to threshold (0 to max_threshold)
+        threshold = (value / self._slider_resolution) * self._max_threshold_closed
 
-        # Update model threshold
-        self.model_interface.update_threshold_closed(s_closed)
+        # Update model threshold directly
+        self.model_interface.set_threshold_closed_direct(threshold)
 
-        # Update label
+        # Update label with threshold and computed s
         thresholds = self.model_interface.get_current_thresholds()
         if thresholds and thresholds.get("threshold_closed") is not None:
+            s_closed = thresholds.get("s_closed", 0)
             self.threshold_closed_label.setText(
-                f"s_closed = {s_closed:.2f} | Threshold: {thresholds['threshold_closed']:.4f}"
+                f"Threshold CLOSED: {threshold:.4f} (s={s_closed:.2f})"
             )
         else:
-            self.threshold_closed_label.setText(f"s_closed = {s_closed:.2f} | Threshold: Not loaded")
+            self.threshold_closed_label.setText(f"Threshold CLOSED: {threshold:.4f}")
 
 
 ######################################

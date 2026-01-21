@@ -1483,13 +1483,13 @@ class TrainingProtocol(QObject):
         if not os.path.exists(templates_dir):
             os.makedirs(templates_dir)
 
-        dialog = QFileDialog(self.main_window)
-        dialog.setFileMode(QFileDialog.ExistingFile)
-        dialog.setNameFilter("Pickle files (*.pkl)")
-        dialog.setDirectory(templates_dir)
-        dialog.setWindowTitle(f"Select {class_label.capitalize()} Templates")
-
-        filename, _ = dialog.getOpenFileName()
+        # Use static method with explicit title parameter
+        filename, _ = QFileDialog.getOpenFileName(
+            self.main_window,
+            f"Select {class_label.capitalize()} Templates",
+            templates_dir,
+            "Pickle files (*.pkl)"
+        )
 
         if not filename:
             return
@@ -1613,7 +1613,7 @@ class TrainingProtocol(QObject):
         """Thread function to create DTW model."""
         from mindmove.model.core.features.features_registry import FEATURES
         from mindmove.model.core.windowing import sliding_window
-        from mindmove.model.core.algorithm import compute_threshold
+        from mindmove.model.core.algorithm import compute_threshold, compute_per_template_statistics
 
         # Get parameters
         window_samples, overlap_samples = self._get_window_overlap_samples()
@@ -1714,6 +1714,32 @@ class TrainingProtocol(QObject):
 
         print(f"  Open threshold: {threshold_open:.4f} (mean: {mean_open:.4f}, std: {std_open:.4f})")
         print(f"  Closed threshold: {threshold_closed:.4f} (mean: {mean_closed:.4f}, std: {std_closed:.4f})")
+
+        # Compute per-template statistics
+        print("\nAnalyzing template quality...")
+
+        # Open templates statistics
+        print("\n  --- OPEN Templates ---")
+        open_stats = compute_per_template_statistics(open_templates_features, n_worst=3)
+        print(f"  Per-template avg distances:")
+        for i, avg_dist in enumerate(open_stats['per_template_avg']):
+            marker = " ***" if (i + 1) in open_stats['worst_indices'] else ""
+            print(f"    Template {i + 1}: avg={avg_dist:.4f}, max={open_stats['per_template_max'][i]:.4f}, min={open_stats['per_template_min'][i]:.4f}{marker}")
+        print(f"  WORST templates (highest avg distance): {open_stats['worst_indices']}")
+        print(f"  BEST templates (lowest avg distance): {open_stats['best_indices']}")
+
+        # Closed templates statistics
+        print("\n  --- CLOSED Templates ---")
+        closed_stats = compute_per_template_statistics(closed_templates_features, n_worst=3)
+        print(f"  Per-template avg distances:")
+        for i, avg_dist in enumerate(closed_stats['per_template_avg']):
+            marker = " ***" if (i + 1) in closed_stats['worst_indices'] else ""
+            print(f"    Template {i + 1}: avg={avg_dist:.4f}, max={closed_stats['per_template_max'][i]:.4f}, min={closed_stats['per_template_min'][i]:.4f}{marker}")
+        print(f"  WORST templates (highest avg distance): {closed_stats['worst_indices']}")
+        print(f"  BEST templates (lowest avg distance): {closed_stats['best_indices']}")
+
+        print("\n  Note: Templates marked *** have highest avg distance to others")
+        print("  Consider removing these if model performance is poor.")
 
         # Save model
         print("\nSaving model...")

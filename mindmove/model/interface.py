@@ -176,6 +176,16 @@ class MindMoveInterface(QObject):
         if self.model and hasattr(self.model, 'update_thresholds'):
             self.model.update_thresholds(s_open, s_closed)
 
+    def set_threshold_open_direct(self, threshold: float) -> None:
+        """Set OPEN threshold directly (not via s multiplier)."""
+        if self.model and hasattr(self.model, 'set_threshold_open_direct'):
+            self.model.set_threshold_open_direct(threshold)
+
+    def set_threshold_closed_direct(self, threshold: float) -> None:
+        """Set CLOSED threshold directly (not via s multiplier)."""
+        if self.model and hasattr(self.model, 'set_threshold_closed_direct'):
+            self.model.set_threshold_closed_direct(threshold)
+
     def reset_history(self) -> None:
         """Reset history buffers for new acquisition session."""
         if self.model and hasattr(self.model, 'reset_history'):
