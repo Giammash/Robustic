@@ -241,7 +241,7 @@ def compute_dtw(t1, t2, active_channels=None):
         return dtw(t1, t2, active_channels=active_channels)
 
 
-def compute_threshold(templates, s=1, active_channels=None):
+def compute_threshold(templates, s=1, active_channels=None, verbose=False):
     """
     Compute threshold from template inter-distances.
 
@@ -254,6 +254,8 @@ def compute_threshold(templates, s=1, active_channels=None):
         Number of standard deviations away from the mean distance between samples allowed
     active_channels : list or None
         List of active channel indices (0-indexed). If None, uses config.active_channels
+    verbose : bool
+        If True, print every pairwise distance (default: False)
 
     Returns
     -------
@@ -276,15 +278,13 @@ def compute_threshold(templates, s=1, active_channels=None):
             t2 = templates[j]
             # alignment_cost, _ = dtw(t1,t2)
             alignment_cost = compute_dtw(t1, t2, active_channels=active_channels)
-            print(f"alignment cost between template {i+1} and {j+1}: {alignment_cost}")
+            if verbose:
+                print(f"alignment cost between template {i+1} and {j+1}: {alignment_cost}")
 
             distances[n] = alignment_cost
             n += 1
 
     D = sum(distances)
-    print(f"std_dev = {np.std(distances)}")
-    print(f"mean = {D/N}")
-    print(f"s = {s}")
     threshold = D/N + s*np.std(distances)
 
     return D/N, np.std(distances), threshold
@@ -314,7 +314,7 @@ def compute_per_template_statistics(templates, active_channels=None, n_worst=3):
     active_channels : list or None
         List of active channel indices (0-indexed). If None, uses config.active_channels.
     n_worst : int
-        Number of worst templates to identify (default: 3).
+        Number of worst/best pairs and templates to identify (default: 3).
 
     Returns
     -------
@@ -326,6 +326,12 @@ def compute_per_template_statistics(templates, active_channels=None, n_worst=3):
         'best_indices': list of int - Indices of best templates (1-indexed for display)
         'overall_mean': float - Mean of all pairwise distances
         'overall_std': float - Std of all pairwise distances
+        'distance_matrix': np.ndarray - Full distance matrix
+        'worst_pairs': list of tuples - (i, j, distance) for most dissimilar pairs (0-indexed)
+        'best_pairs': list of tuples - (i, j, distance) for most similar pairs (0-indexed)
+        'quartiles': np.ndarray - [min, Q1, median, Q3, max] of all pairwise distances
+        'consistency_score': float - Coefficient of variation (std/mean), lower is better
+        'outliers': list of tuples - (template_idx, avg_dist, sigma) for outliers (1-indexed)
     """
     n_templates = len(templates)
     if n_templates < 2:
@@ -337,6 +343,12 @@ def compute_per_template_statistics(templates, active_channels=None, n_worst=3):
             'best_indices': [],
             'overall_mean': 0.0,
             'overall_std': 0.0,
+            'distance_matrix': np.zeros((n_templates, n_templates)),
+            'worst_pairs': [],
+            'best_pairs': [],
+            'quartiles': np.array([0.0, 0.0, 0.0, 0.0, 0.0]),
+            'consistency_score': 0.0,
+            'outliers': [],
         }
 
     # Distance matrix (only upper triangle computed)
@@ -372,6 +384,36 @@ def compute_per_template_statistics(templates, active_channels=None, n_worst=3):
     # Identify best templates (lowest average distance = most consistent)
     best_indices = [int(idx) + 1 for idx in sorted_by_avg[-n_worst:][::-1]]  # 1-indexed for display
 
+    # Extract all pairwise distances with indices for worst/best pairs
+    pairs = []
+    for i in range(n_templates):
+        for j in range(i + 1, n_templates):
+            pairs.append((i, j, distance_matrix[i, j]))
+
+    # Sort by distance
+    pairs_sorted = sorted(pairs, key=lambda x: x[2], reverse=True)
+    worst_pairs = pairs_sorted[:n_worst]  # Highest distances
+    best_pairs = pairs_sorted[-n_worst:][::-1]  # Lowest distances (reversed for ascending order)
+
+    # Quartiles [min, Q1, median, Q3, max]
+    quartiles = np.percentile(all_distances, [0, 25, 50, 75, 100])
+
+    # Consistency score (coefficient of variation: std/mean, lower is better)
+    consistency_score = overall_std / overall_mean if overall_mean > 0 else 0.0
+
+    # Outlier detection: templates with avg distance > mean + 1.5*std
+    per_template_avg_arr = np.array(per_template_avg)
+    per_template_mean = np.mean(per_template_avg_arr)
+    per_template_std = np.std(per_template_avg_arr)
+    outlier_threshold = per_template_mean + 1.5 * per_template_std
+
+    outliers = []
+    if per_template_std > 0:  # Avoid division by zero
+        for i, avg in enumerate(per_template_avg):
+            if avg > outlier_threshold:
+                sigma = (avg - per_template_mean) / per_template_std
+                outliers.append((i + 1, avg, sigma))  # 1-indexed for display
+
     return {
         'per_template_avg': per_template_avg,
         'per_template_max': per_template_max,
@@ -381,6 +423,11 @@ def compute_per_template_statistics(templates, active_channels=None, n_worst=3):
         'overall_mean': overall_mean,
         'overall_std': overall_std,
         'distance_matrix': distance_matrix,
+        'worst_pairs': worst_pairs,
+        'best_pairs': best_pairs,
+        'quartiles': quartiles,
+        'consistency_score': consistency_score,
+        'outliers': outliers,
     }
 
 

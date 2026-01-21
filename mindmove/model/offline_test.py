@@ -699,11 +699,11 @@ def run_offline_test_folder(
 
 # Test folder (inside data/tests/)
 # Available: "test", "test open", "test closed for closed detector", "test closed for open detector"
-TEST_FOLDER = "recordings"
+TEST_FOLDER = "aperture"
 
 # Model file (inside data/models/)
 # Use None for default (dtw_model_0.pkl), or specify a filename
-MODEL_FILE = "MindMove_Model_20260121_104221_test_average_2.pkl"
+MODEL_FILE = "MindMove_Model_20260121_133757_test_average_5_no_outliers.pkl"
 # "dtw_model_0.pkl"  # e.g., "dtw_model_tslearn.pkl" for tslearn model
 
 # DTW implementation (set ONE to True, others to False)

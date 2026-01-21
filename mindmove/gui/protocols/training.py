@@ -1609,6 +1609,42 @@ class TrainingProtocol(QObject):
                     print(f"Warning: Channel {ch} out of range (1-32), ignoring")
         return sorted(set(dead_channels))
 
+    def _print_template_statistics(self, stats: dict, class_label: str, n_templates: int) -> None:
+        """Print compact template statistics summary.
+
+        Args:
+            stats: Dictionary from compute_per_template_statistics()
+            class_label: Label for the class (e.g., "OPEN", "CLOSED")
+            n_templates: Number of templates
+        """
+        print(f"\n  === {class_label} Templates ({n_templates}) ===")
+        print(f"  Overall: mean={stats['overall_mean']:.4f}, std={stats['overall_std']:.4f}")
+
+        q = stats['quartiles']
+        print(f"  Distribution: min={q[0]:.4f}, Q1={q[1]:.4f}, median={q[2]:.4f}, Q3={q[3]:.4f}, max={q[4]:.4f}")
+        print(f"  Consistency score: {stats['consistency_score']:.2f} (std/mean, lower=better)")
+
+        # Worst pairs (most dissimilar)
+        if stats['worst_pairs']:
+            print(f"\n  Worst pairs (most dissimilar):")
+            for i, j, dist in stats['worst_pairs']:
+                print(f"    Templates {i+1}-{j+1}: {dist:.4f}")
+
+        # Potential outliers
+        if stats['outliers']:
+            print(f"\n  Potential outliers (consider removing):")
+            for idx, avg, sigma in stats['outliers']:
+                print(f"    Template {idx}: avg={avg:.4f} ({sigma:.1f}σ above mean)")
+        else:
+            print(f"\n  No outliers detected (all templates consistent)")
+
+        # Best templates (most consistent)
+        if stats['best_indices']:
+            print(f"\n  Best templates (most consistent):")
+            for idx in stats['best_indices'][:3]:
+                avg = stats['per_template_avg'][idx - 1]  # Convert back to 0-indexed
+                print(f"    Template {idx}: avg={avg:.4f}")
+
     def _create_dtw_model_thread(self) -> None:
         """Thread function to create DTW model."""
         from mindmove.model.core.features.features_registry import FEATURES
@@ -1719,27 +1755,12 @@ class TrainingProtocol(QObject):
         print("\nAnalyzing template quality...")
 
         # Open templates statistics
-        print("\n  --- OPEN Templates ---")
         open_stats = compute_per_template_statistics(open_templates_features, n_worst=3)
-        print(f"  Per-template avg distances:")
-        for i, avg_dist in enumerate(open_stats['per_template_avg']):
-            marker = " ***" if (i + 1) in open_stats['worst_indices'] else ""
-            print(f"    Template {i + 1}: avg={avg_dist:.4f}, max={open_stats['per_template_max'][i]:.4f}, min={open_stats['per_template_min'][i]:.4f}{marker}")
-        print(f"  WORST templates (highest avg distance): {open_stats['worst_indices']}")
-        print(f"  BEST templates (lowest avg distance): {open_stats['best_indices']}")
+        self._print_template_statistics(open_stats, "OPEN", len(open_templates_features))
 
         # Closed templates statistics
-        print("\n  --- CLOSED Templates ---")
         closed_stats = compute_per_template_statistics(closed_templates_features, n_worst=3)
-        print(f"  Per-template avg distances:")
-        for i, avg_dist in enumerate(closed_stats['per_template_avg']):
-            marker = " ***" if (i + 1) in closed_stats['worst_indices'] else ""
-            print(f"    Template {i + 1}: avg={avg_dist:.4f}, max={closed_stats['per_template_max'][i]:.4f}, min={closed_stats['per_template_min'][i]:.4f}{marker}")
-        print(f"  WORST templates (highest avg distance): {closed_stats['worst_indices']}")
-        print(f"  BEST templates (lowest avg distance): {closed_stats['best_indices']}")
-
-        print("\n  Note: Templates marked *** have highest avg distance to others")
-        print("  Consider removing these if model performance is poor.")
+        self._print_template_statistics(closed_stats, "CLOSED", len(closed_templates_features))
 
         # Save model
         print("\nSaving model...")
