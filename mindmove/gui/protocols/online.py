@@ -49,17 +49,32 @@ class OnlineProtocol(QObject):
 
 
     def online_emg_update(self, data: np.ndarray) -> None:
-        # TODO: Implement online prediction in model interface and model class
+        # Extract EMG data (filtering is applied here if enabled in MuoviWidget)
         emg_data = self.main_window.device.extract_emg_data(data)
         # shape (32, nsamp)
-        # forward to model interface: the Model.predict must handel buffer inside model
 
+        # Get prediction from model
         prediction = self.model_interface.predict(emg_data)
 
-        # Stream prediction values to the virtual hand interface
-        self.main_window.virtual_hand_interface.output_message_signal.emit(
-            str(prediction).encode("utf-8")
-        )
+        # Get extended result with distance and threshold info
+        result = self.model_interface.get_last_result()
+
+        if result:
+            # Send enhanced data to Unity: [state, distance, threshold]
+            # Format: list that Unity can parse and use for real-time plotting
+            unity_data = [
+                result['state'],           # 0.0 (OPEN) or 1.0 (CLOSED)
+                result['distance'],        # Current DTW distance
+                result['threshold']        # Current threshold being used
+            ]
+            self.main_window.virtual_hand_interface.output_message_signal.emit(
+                str(unity_data).encode("utf-8")
+            )
+        else:
+            # Fallback: send just the state (backwards compatibility)
+            self.main_window.virtual_hand_interface.output_message_signal.emit(
+                str(prediction).encode("utf-8")
+            )
 
         if self.online_record_toggle_push_button.isChecked():
             # Store with timestamp for proper reconstruction (same format as record protocol)

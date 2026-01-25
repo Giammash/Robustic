@@ -19,8 +19,18 @@ class config:
 
 
         # Processing options
-        # self.ENABLE_FILTERING = True
-        self.ENABLE_FILTERING = False
+        self.ENABLE_FILTERING = True  # Default state of filter toggle in device interface
+
+        # === FILTERING CONFIGURATION ===
+        # Bandpass filter settings
+        self.FILTER_LOWCUT = 20      # High-pass cutoff (Hz) - removes motion artifacts
+        self.FILTER_HIGHCUT = 500    # Low-pass cutoff (Hz) - EMG bandwidth
+        self.FILTER_ORDER = 4        # Butterworth filter order
+
+        # Notch filter settings (powerline noise)
+        self.NOTCH_FREQ = 50         # Fundamental frequency (50 Hz EU, 60 Hz US)
+        self.NOTCH_HARMONICS = 8     # Number of harmonics to filter (50, 100, ... 400 Hz)
+        self.NOTCH_Q = 30            # Quality factor (higher = narrower notch)
 
         # Diagnostic mode
         self.DIAGNOSTIC_MODE = False

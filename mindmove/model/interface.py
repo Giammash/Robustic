@@ -211,3 +211,9 @@ class MindMoveInterface(QObject):
                 "std_closed": getattr(self.model, 'std_closed', None),
             }
         return None
+
+    def get_last_result(self):
+        """Get the last prediction result with extended info for Unity."""
+        if self.model and hasattr(self.model, 'get_last_result'):
+            return self.model.get_last_result()
+        return None

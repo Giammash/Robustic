@@ -1,12 +1,14 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING, Dict, Union
-from PySide6.QtWidgets import QWidget, QGroupBox
+from PySide6.QtWidgets import QWidget, QGroupBox, QGridLayout, QPushButton, QLabel
 from PySide6.QtCore import Signal
 from mindmove.device_interfaces.muovi import Muovi
 from mindmove.device_interfaces.dicts.muovi import *
 from mindmove.device_interfaces.enums.muovi import *
 from mindmove.device_interfaces.enums.device import LoggerLevel
 from mindmove.device_interfaces.gui.ui_compiled.muovi_widget import Ui_MuoviForm
+from mindmove.model.core.filtering import RealTimeEMGFilter
+from mindmove.config import config
 import numpy as np
 
 if TYPE_CHECKING:
@@ -77,6 +79,11 @@ class MuoviWidget(QWidget):
             self.input_parameters_group_box,
         ]
 
+        # Signal Processing - Real-time filter
+        self.rt_filter = RealTimeEMGFilter(n_channels=config.num_channels)
+        self.filtering_enabled = config.ENABLE_FILTERING
+        self._setup_signal_processing_group()
+
     def toggle_connection(self):
         if not self.device.is_connected:
             self.connect_button.setEnabled(False)
@@ -132,6 +139,8 @@ class MuoviWidget(QWidget):
     def toggle_streaming(self) -> None:
         self.device.toggle_streaming()
         if self.device.is_streaming:
+            # Reset filter state for new stream to avoid transients
+            self.rt_filter.reset()
             self.stream_button.setText("Stop Streaming")
             self.stream_button.setChecked(True)
             self.configure_button.setEnabled(False)
@@ -153,6 +162,9 @@ class MuoviWidget(QWidget):
         """
         Extracts the EMG Signals from the transmitted data.
 
+        When filtering is enabled, applies real-time bandpass and notch
+        filtering to the extracted EMG data.
+
         Args:
             data (np.ndarray):
                 Raw data that got transmitted.
@@ -163,9 +175,15 @@ class MuoviWidget(QWidget):
 
         Returns:
             np.ndarray:
-                Extracted EMG channels.
+                Extracted (and optionally filtered) EMG channels.
         """
-        return self.device.extract_emg_data(data, milli_volts)
+        emg_data = self.device.extract_emg_data(data, milli_volts)
+
+        # Apply real-time filtering if enabled
+        if self.filtering_enabled and emg_data.size > 0:
+            emg_data = self.rt_filter.filter(emg_data)
+
+        return emg_data
 
     def extract_aux_data(self, data: np.ndarray, index: int = 0) -> np.ndarray:
         """
@@ -204,3 +222,59 @@ class MuoviWidget(QWidget):
             "detection_mode": MuoviDetectionMode.MONOPOLAR_GAIN_8,
             "streaming_mode": MuoviStream.STOP,
         }
+
+    def _setup_signal_processing_group(self) -> None:
+        """Create Signal Processing group box with filter toggle."""
+        # Create group box
+        self.signal_processing_group_box = QGroupBox("Signal Processing")
+        self.signal_processing_group_box.setObjectName("signalProcessingGroupBox")
+
+        # Create layout for the group box
+        layout = QGridLayout(self.signal_processing_group_box)
+
+        # Create filter toggle button
+        self.filter_toggle_button = QPushButton("Filter: OFF")
+        self.filter_toggle_button.setCheckable(True)
+        self.filter_toggle_button.setChecked(self.filtering_enabled)
+        self.filter_toggle_button.toggled.connect(self._on_filter_toggled)
+
+        # Create filter description label
+        self.filter_description_label = QLabel(self.rt_filter.get_filter_description())
+
+        # Add widgets to layout
+        layout.addWidget(self.filter_toggle_button, 0, 0)
+        layout.addWidget(self.filter_description_label, 0, 1)
+
+        # Update button appearance based on initial state
+        self._update_filter_button_style()
+
+        # Add group box to main layout (after Commands group box, row 4)
+        self.ui.gridLayout.addWidget(self.signal_processing_group_box, 4, 0, 1, 2)
+
+        # Move spacer to row 5
+        self.ui.gridLayout.removeItem(self.ui.verticalSpacer)
+        self.ui.gridLayout.addItem(self.ui.verticalSpacer, 5, 0, 1, 1)
+
+    def _on_filter_toggled(self, checked: bool) -> None:
+        """Handle filter toggle button state change."""
+        self.filtering_enabled = checked
+        config.ENABLE_FILTERING = checked  # Update global config for consistency
+        self._update_filter_button_style()
+
+        if checked:
+            self.rt_filter.reset()  # Fresh start when enabling
+            self.device.log_info("Filter enabled: " + self.rt_filter.get_filter_description())
+        else:
+            self.device.log_info("Filter disabled: Raw EMG signal")
+
+    def _update_filter_button_style(self) -> None:
+        """Update filter button appearance based on state."""
+        if self.filtering_enabled:
+            self.filter_toggle_button.setText("Filter: ON")
+            self.filter_toggle_button.setStyleSheet(
+                "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }"
+                "QPushButton:checked { background-color: #4CAF50; }"
+            )
+        else:
+            self.filter_toggle_button.setText("Filter: OFF")
+            self.filter_toggle_button.setStyleSheet("")

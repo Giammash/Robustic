@@ -345,6 +345,22 @@ class Model:
         self.last_dtw_time = time.time()
         print("[MODEL] History reset for new session")
 
+    def get_last_result(self) -> Dict[str, Any]:
+        """
+        Get the last prediction result with extended info for Unity.
+
+        Returns:
+            Dictionary with state, distance, threshold, and state_name.
+        """
+        if hasattr(self, '_last_result'):
+            return self._last_result
+        return {
+            'state': 1.0 if self.current_state == "CLOSED" else 0.0,
+            'distance': 0.0,
+            'threshold': 0.0,
+            'state_name': self.current_state
+        }
+
     def get_distance_history(self) -> Dict[str, Any]:
         """
         Get the distance history for plotting.
@@ -403,19 +419,25 @@ class Model:
             return 1.0 if self.current_state == "CLOSED" else 0.0
         
         # --- DTW computation (every increment_dtw samples) ---
-        dtw_start_time = time.perf_counter()
+        computation_start = time.perf_counter()
         current_time = time.time()
-        time_since_last = current_time - self.last_dtw_time
+        time_since_last_ms = (current_time - self.last_dtw_time) * 1000
 
-        # apply filtering
-        emg_buffer = apply_rtfiltering(self.emg_rt_buffer) if config.ENABLE_FILTERING else self.emg_rt_buffer.copy()
+        # NOTE: Filtering now happens at source level in MuoviWidget.extract_emg_data()
+        # The buffer already contains filtered data when config.ENABLE_FILTERING is True
+        emg_buffer = self.emg_rt_buffer.copy()
 
-        # extract features from the template_nsamp buffer
+        # --- Feature extraction timing ---
+        feature_start = time.perf_counter()
         windowed_emg_buffer = sliding_window(emg_buffer, self.window_length, self.increment)
 
         feature_info = FEATURES[self.feature_name]
         feature_fn = feature_info["function"]
         features_emg_buffer = feature_fn(windowed_emg_buffer)
+        feature_time_ms = (time.perf_counter() - feature_start) * 1000
+
+        # --- DTW computation timing ---
+        dtw_start = time.perf_counter()
 
         # DTW distances (use model's active_channels and distance_aggregation)
         # Only compute distance to OPPOSITE state templates (efficient)
@@ -458,9 +480,8 @@ class Model:
             self.distance_history.append((timestamp, D_open, None, self.current_state))
             self._last_distance = D_open
             self._last_threshold = self.THRESHOLD_OPEN
-        
-        # D_open = compute_distance_from_training_set_online(features_emg_buffer, templates_open, feature_name)
-        # D_closed = compute_distance_from_training_set_online(features_emg_buffer, templates_closed, feature_name)
+
+        dtw_time_ms = (time.perf_counter() - dtw_start) * 1000
 
         # State machine logic
 
@@ -535,21 +556,65 @@ class Model:
                 print(f"{'='*50}\n")
 
         # Update timing stats
-        dtw_end_time = time.perf_counter()
-        dtw_computation_time = (dtw_end_time - dtw_start_time) * 1000
-        self.dtw_times.append(dtw_computation_time)
-        # Keep dtw_times buffer bounded
+        total_time_ms = (time.perf_counter() - computation_start) * 1000
+
+        # Store timing info for statistics
+        if not hasattr(self, 'timing_history'):
+            self.timing_history = {
+                'interval': [],
+                'feature': [],
+                'dtw': [],
+                'total': []
+            }
+
+        self.timing_history['interval'].append(time_since_last_ms)
+        self.timing_history['feature'].append(feature_time_ms)
+        self.timing_history['dtw'].append(dtw_time_ms)
+        self.timing_history['total'].append(total_time_ms)
+
+        # Keep timing history bounded
+        max_history = 100
+        for key in self.timing_history:
+            if len(self.timing_history[key]) > max_history:
+                self.timing_history[key].pop(0)
+
+        self.dtw_times.append(total_time_ms)
         if len(self.dtw_times) >= 100:
             self.dtw_times.pop(0)
 
         self.dtw_count += 1
 
-        # Print periodic summary (every 100 DTW computations = every 5 seconds)
-        if self.dtw_count % 100 == 0:
-            avg_time = np.mean(self.dtw_times)
-            elapsed_s = self.dtw_count * 0.05  # Each DTW is ~50ms
-            print(f"[{elapsed_s:.0f}s] State: {self.current_state} | "
-                  f"D={self._last_distance:.3f} vs T={self._last_threshold:.3f} | "
-                  f"DTW: {avg_time:.1f}ms avg")
+        # Print timing every computation (for real-time monitoring)
+        # Format: [count] Interval: Xms | Feature: Xms | DTW: Xms | Total: Xms | State | D vs T
+        interval_status = "OK" if 45 <= time_since_last_ms <= 55 else "DRIFT"
+        print(f"[{self.dtw_count:4d}] Δt:{time_since_last_ms:5.1f}ms ({interval_status}) | "
+              f"Feat:{feature_time_ms:4.1f}ms | DTW:{dtw_time_ms:5.1f}ms | "
+              f"Total:{total_time_ms:5.1f}ms | {self.current_state:6s} | "
+              f"D={self._last_distance:.4f} T={self._last_threshold:.4f}")
 
-        return 1.0 if self.current_state == "CLOSED" else 0.0
+        # Print summary statistics every 100 computations (every ~5 seconds)
+        if self.dtw_count % 100 == 0:
+            avg_interval = np.mean(self.timing_history['interval'])
+            avg_feature = np.mean(self.timing_history['feature'])
+            avg_dtw = np.mean(self.timing_history['dtw'])
+            avg_total = np.mean(self.timing_history['total'])
+
+            print(f"\n{'='*70}")
+            print(f"  TIMING SUMMARY (last 100 computations)")
+            print(f"  Interval: {avg_interval:.1f}ms avg (target: 50ms)")
+            print(f"  Feature extraction: {avg_feature:.2f}ms avg")
+            print(f"  DTW computation: {avg_dtw:.2f}ms avg")
+            print(f"  Total computation: {avg_total:.2f}ms avg")
+            print(f"  Headroom: {50 - avg_total:.1f}ms (time available before next update)")
+            print(f"{'='*70}\n")
+
+        # Prepare result with extended info for Unity
+        state_value = 1.0 if self.current_state == "CLOSED" else 0.0
+        self._last_result = {
+            'state': state_value,
+            'distance': self._last_distance,
+            'threshold': self._last_threshold,
+            'state_name': self.current_state
+        }
+
+        return state_value
