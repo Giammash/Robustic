@@ -294,7 +294,9 @@ class OnlineProtocol(QObject):
             ax3.grid(True, alpha=0.3)
 
             plt.tight_layout()
-            plt.show()
+            # Use non-blocking show to avoid Qt event loop conflict
+            plt.show(block=False)
+            plt.pause(0.1)  # Small pause to ensure the window renders
 
         print(f"[PLOT] Done plotting {n_windows} window(s)")
 
