@@ -584,7 +584,12 @@ class Model:
 
         self.dtw_count += 1
 
-        # Print summary statistics every 100 computations (every ~5 seconds)
+        # Print status every 40 computations (every ~2 seconds)
+        if self.dtw_count % 40 == 0:
+            elapsed_s = self.dtw_count * 0.05
+            print(f"[{elapsed_s:5.1f}s] {self.current_state:6s} | D={self._last_distance:.4f} T={self._last_threshold:.4f}")
+
+        # Print timing summary every 100 computations (every ~5 seconds)
         if self.dtw_count % 100 == 0:
             avg_interval = np.mean(self.timing_history['interval'])
             avg_feature = np.mean(self.timing_history['feature'])
