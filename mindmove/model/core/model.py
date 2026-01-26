@@ -584,14 +584,6 @@ class Model:
 
         self.dtw_count += 1
 
-        # Print timing every computation (for real-time monitoring)
-        # Format: [count] Interval: Xms | Feature: Xms | DTW: Xms | Total: Xms | State | D vs T
-        interval_status = "OK" if 45 <= time_since_last_ms <= 55 else "DRIFT"
-        print(f"[{self.dtw_count:4d}] Δt:{time_since_last_ms:5.1f}ms ({interval_status}) | "
-              f"Feat:{feature_time_ms:4.1f}ms | DTW:{dtw_time_ms:5.1f}ms | "
-              f"Total:{total_time_ms:5.1f}ms | {self.current_state:6s} | "
-              f"D={self._last_distance:.4f} T={self._last_threshold:.4f}")
-
         # Print summary statistics every 100 computations (every ~5 seconds)
         if self.dtw_count % 100 == 0:
             avg_interval = np.mean(self.timing_history['interval'])
