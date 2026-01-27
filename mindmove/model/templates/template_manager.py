@@ -686,18 +686,19 @@ class TemplateManager:
 
         # OPEN templates: GT=0 segments after falling edge
         # These represent the opening movement
-        # Note: We look for segments between falling edge and next rising edge
+        # Note: We limit duration to avoid capturing pause/rest periods
+        # The opening movement itself is typically short (transition_s duration)
+        max_open_samples = int(2 * min_duration_s * config.FSAMP)  # Limit to 2x min duration
+
         for fall_idx in falling_edges:
             # Find next rising edge (or end of recording)
             next_rises = rising_edges[rising_edges > fall_idx]
             if len(next_rises) > 0:
-                end_idx = next_rises[0]
+                # Limit to max duration even if next rising edge is further
+                end_idx = min(next_rises[0], fall_idx + max_open_samples)
             else:
-                # Use end of recording, but limit to reasonable duration
-                # (we don't want the "waiting" period between cycles)
-                # Use 2x the min_duration as max
-                max_samples = int(2 * min_duration_s * config.FSAMP)
-                end_idx = min(fall_idx + max_samples, len(gt_binary))
+                # Last segment - limit to reasonable duration
+                end_idx = min(fall_idx + max_open_samples, len(gt_binary))
 
             # Extract segment
             segment = emg[:, fall_idx:end_idx]

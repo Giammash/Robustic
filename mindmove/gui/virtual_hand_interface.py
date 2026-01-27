@@ -208,7 +208,7 @@ class VirtualHandInterface(QObject):
                     self._is_connected = True
                     self._update_status_indicator()
                     self._status_timeout_timer.stop()
-                    print(f"VHI connected! (status response received)")
+                    # Connection confirmed silently (status indicator turns green)
                     continue
 
                 # Parse as array data (no debug print - too spammy)

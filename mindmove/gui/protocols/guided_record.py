@@ -489,6 +489,7 @@ class GuidedRecordProtocol(QObject):
 
         print("\n" + "=" * 60)
         print("GUIDED RECORDING STARTED")
+        print("  Predicted Hand becomes Control Hand (visual guide)")
         print(f"  Hold Open: {self.hold_open_spinbox.value()}s")
         print(f"  Transition: {self.transition_spinbox.value()}s")
         print(f"  Hold Closed: {self.hold_closed_spinbox.value()}s")
