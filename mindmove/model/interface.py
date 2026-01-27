@@ -217,3 +217,14 @@ class MindMoveInterface(QObject):
         if self.model and hasattr(self.model, 'get_last_result'):
             return self.model.get_last_result()
         return None
+
+    def set_refractory_period(self, period_s: float) -> None:
+        """Set the refractory period in seconds."""
+        if self.model and hasattr(self.model, 'set_refractory_period'):
+            self.model.set_refractory_period(period_s)
+
+    def get_refractory_period(self) -> float:
+        """Get the current refractory period in seconds."""
+        if self.model and hasattr(self.model, 'get_refractory_period'):
+            return self.model.get_refractory_period()
+        return 1.0  # Default

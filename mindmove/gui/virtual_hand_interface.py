@@ -212,7 +212,12 @@ class VirtualHandInterface(QObject):
                     continue
 
                 # Parse as array data
-                print(f"Received text data: {data[:100]}...")  # Debug
+                # Rate-limited debug print (avoid terminal spam)
+                if not hasattr(self, '_recv_msg_count'):
+                    self._recv_msg_count = 0
+                self._recv_msg_count += 1
+                if self._recv_msg_count % 60 == 1:  # Print every ~1 second at 60Hz
+                    print(f"[VHI] Received data (port 1233): {data[:50]}...")
                 self.input_message_signal.emit(np.array(ast.literal_eval(data)))
             except UnicodeDecodeError:
                 # Binary data - print hex for debugging
@@ -267,6 +272,13 @@ class VirtualHandInterface(QObject):
 
             if output_bytes == -1:
                 print("Error sending message to Virtual Hand Interface")
+            else:
+                # Rate-limited debug print for sent messages
+                if not hasattr(self, '_sent_msg_count'):
+                    self._sent_msg_count = 0
+                self._sent_msg_count += 1
+                if self._sent_msg_count % 20 == 1:  # Print every ~20 messages
+                    print(f"[VHI] Sent to Unity (port {self.virtual_hand_interface_udp_port}): {message.data().decode()}")
 
     def _write_status_message(self) -> None:
         """Send a status check message to VHI."""

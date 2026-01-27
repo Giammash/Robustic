@@ -6,7 +6,7 @@ from datetime import datetime
 import pickle
 import os
 import time
-from PySide6.QtWidgets import QFileDialog, QSlider, QLabel, QHBoxLayout, QVBoxLayout, QGroupBox
+from PySide6.QtWidgets import QFileDialog, QSlider, QLabel, QHBoxLayout, QVBoxLayout, QGroupBox, QDoubleSpinBox
 from PySide6.QtCore import Qt
 import matplotlib.pyplot as plt
 
@@ -60,20 +60,21 @@ class OnlineProtocol(QObject):
         result = self.model_interface.get_last_result()
 
         if result:
-            # Send enhanced data to Unity: [state, distance, threshold]
-            # Format: list that Unity can parse and use for real-time plotting
-            unity_data = [
-                result['state'],           # 0.0 (OPEN) or 1.0 (CLOSED)
-                result['distance'],        # Current DTW distance
-                result['threshold']        # Current threshold being used
-            ]
+            # Convert binary state to 10-joint format for Unity VHI
+            # OPEN (state=0.0): all fingers extended [0,0,0,0,0,0,0,0,0,0]
+            # CLOSED (state=1.0): all fingers closed [1,1,1,1,1,1,1,1,1,1]
+            state = result['state']  # 0.0 or 1.0
+            joint_value = int(state)  # 0 or 1
+            unity_data = [joint_value] * 10  # All 10 joints same value
+
             self.main_window.virtual_hand_interface.output_message_signal.emit(
                 str(unity_data).encode("utf-8")
             )
         else:
-            # Fallback: send just the state (backwards compatibility)
+            # Fallback: send all zeros (OPEN state)
+            unity_data = [0] * 10
             self.main_window.virtual_hand_interface.output_message_signal.emit(
-                str(prediction).encode("utf-8")
+                str(unity_data).encode("utf-8")
             )
 
         if self.online_record_toggle_push_button.isChecked():
@@ -457,6 +458,9 @@ class OnlineProtocol(QObject):
         # Add threshold tuning slider (programmatically)
         self._setup_threshold_slider()
 
+        # Add refractory period control (programmatically)
+        self._setup_refractory_control()
+
     def _setup_threshold_slider(self) -> None:
         """Setup threshold tuning sliders UI (direct threshold control)."""
         # Create a group box for threshold tuning
@@ -522,6 +526,38 @@ class OnlineProtocol(QObject):
         # Add to the online commands group box layout
         if self.online_commands_group_box.layout():
             self.online_commands_group_box.layout().addWidget(self.threshold_group_box)
+
+    def _setup_refractory_control(self) -> None:
+        """Setup refractory period control UI."""
+        # Create a group box for refractory period
+        self.refractory_group_box = QGroupBox("Refractory Period")
+
+        layout = QHBoxLayout()
+
+        # Label
+        label = QLabel("Period after state change (no transitions allowed):")
+        layout.addWidget(label)
+
+        # Spinbox for refractory period (0.0 to 5.0 seconds)
+        self.refractory_spinbox = QDoubleSpinBox()
+        self.refractory_spinbox.setMinimum(0.0)
+        self.refractory_spinbox.setMaximum(5.0)
+        self.refractory_spinbox.setSingleStep(0.1)
+        self.refractory_spinbox.setValue(1.0)  # Default 1 second
+        self.refractory_spinbox.setSuffix(" s")
+        self.refractory_spinbox.setDecimals(1)
+        self.refractory_spinbox.valueChanged.connect(self._on_refractory_changed)
+        layout.addWidget(self.refractory_spinbox)
+
+        self.refractory_group_box.setLayout(layout)
+
+        # Add to the online commands group box layout
+        if self.online_commands_group_box.layout():
+            self.online_commands_group_box.layout().addWidget(self.refractory_group_box)
+
+    def _on_refractory_changed(self, value: float) -> None:
+        """Called when refractory period spinbox value changes."""
+        self.model_interface.set_refractory_period(value)
 
     def _on_threshold_open_changed(self, value: int) -> None:
         """Called when OPEN threshold slider is moved (direct threshold control)."""

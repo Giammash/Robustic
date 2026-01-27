@@ -84,9 +84,10 @@ class Model:
         self.window_majority_length = config.SMOOTHING_WINDOW
         self.last_predictions = []
 
-        # refractory period variables
-        self.refractory_period_s = 0.75  # seconds
-        # self.time_since_last_switch = 0.0 # seconds
+        # Refractory period variables
+        self.refractory_period_s = 1.0  # seconds (default)
+        self.last_state_change_time = 0.0  # timestamp of last state change
+        self.in_refractory = False  # True if currently in refractory period
 
         # time for debugging
         self.last_dtw_time = time.time()
@@ -343,7 +344,18 @@ class Model:
         self.last_predictions = []
         self.dtw_count = 0
         self.last_dtw_time = time.time()
+        self.last_state_change_time = 0.0  # Reset refractory timer
+        self.in_refractory = False
         print("[MODEL] History reset for new session")
+
+    def set_refractory_period(self, period_s: float) -> None:
+        """Set the refractory period in seconds."""
+        self.refractory_period_s = max(0.0, period_s)
+        print(f"[MODEL] Refractory period set to {self.refractory_period_s:.2f}s")
+
+    def get_refractory_period(self) -> float:
+        """Get the current refractory period in seconds."""
+        return self.refractory_period_s
 
     def get_last_result(self) -> Dict[str, Any]:
         """
@@ -491,40 +503,58 @@ class Model:
 
         previous_state = self.current_state
 
-        # Use model's smoothing method (defaults to config if not set)
-        smoothing = getattr(self, 'smoothing_method', config.POST_PREDICTION_SMOOTHING)
+        # --- Refractory Period Check ---
+        # Check if we're still in refractory period after last state change
+        time_since_last_change = current_time - self.last_state_change_time
+        was_in_refractory = self.in_refractory
 
-        if smoothing == "NONE":
-            # No smoothing - directly use triggered state
-            self.current_state = triggered_state
+        if self.in_refractory:
+            if time_since_last_change >= self.refractory_period_s:
+                # Refractory period ended - reset smoothing buffer
+                self.in_refractory = False
+                self.last_predictions = []  # Start fresh for smoothing
+                # print(f"[REFRACTORY] Ended after {time_since_last_change:.2f}s - smoothing buffer reset")
+            else:
+                # Still in refractory - skip smoothing, keep current state
+                # Don't accumulate predictions during refractory
+                pass
 
-        elif smoothing == "MAJORITY VOTE":
-            # Sliding window majority vote
-            self.last_predictions.append(triggered_state)
+        # Only apply smoothing logic if NOT in refractory period
+        if not self.in_refractory:
+            # Use model's smoothing method (defaults to config if not set)
+            smoothing = getattr(self, 'smoothing_method', config.POST_PREDICTION_SMOOTHING)
 
-            # Keep window at fixed size (sliding window)
-            if len(self.last_predictions) > self.window_majority_length:
-                self.last_predictions.pop(0)
+            if smoothing == "NONE":
+                # No smoothing - directly use triggered state
+                self.current_state = triggered_state
 
-            # Once we have enough predictions, use majority vote
-            if len(self.last_predictions) >= self.window_majority_length:
-                closed_count = self.last_predictions.count("CLOSED")
-                open_count = self.last_predictions.count("OPEN")
-                if closed_count > open_count:
-                    self.current_state = "CLOSED"
-                elif open_count > closed_count:
-                    self.current_state = "OPEN"
-                # If tied, keep current state (no change)
+            elif smoothing == "MAJORITY VOTE":
+                # Sliding window majority vote
+                self.last_predictions.append(triggered_state)
 
-        elif smoothing == "5 CONSECUTIVE":
-            # Require N consecutive identical predictions to switch state
-            self.last_predictions.append(triggered_state)
+                # Keep window at fixed size (sliding window)
+                if len(self.last_predictions) > self.window_majority_length:
+                    self.last_predictions.pop(0)
 
-            # Keep window at fixed size
-            if len(self.last_predictions) > self.consecutive_required:
-                self.last_predictions.pop(0)
+                # Once we have enough predictions, use majority vote
+                if len(self.last_predictions) >= self.window_majority_length:
+                    closed_count = self.last_predictions.count("CLOSED")
+                    open_count = self.last_predictions.count("OPEN")
+                    if closed_count > open_count:
+                        self.current_state = "CLOSED"
+                    elif open_count > closed_count:
+                        self.current_state = "OPEN"
+                    # If tied, keep current state (no change)
 
-            # Check if all predictions in window are the same AND different from current
+            elif smoothing == "5 CONSECUTIVE":
+                # Require N consecutive identical predictions to switch state
+                self.last_predictions.append(triggered_state)
+
+                # Keep window at fixed size
+                if len(self.last_predictions) > self.consecutive_required:
+                    self.last_predictions.pop(0)
+
+                # Check if all predictions in window are the same AND different from current
             if len(self.last_predictions) >= self.consecutive_required:
                 if all(p == self.last_predictions[0] for p in self.last_predictions):
                     new_state = self.last_predictions[0]
@@ -543,16 +573,23 @@ class Model:
             # Store state transition for plotting
             self.state_transitions.append((transition_time, previous_state, self.current_state))
 
+            # --- Start Refractory Period ---
+            self.last_state_change_time = transition_time
+            self.in_refractory = True
+            self.last_predictions = []  # Clear smoothing buffer
+
             time_str = datetime.now().strftime('%H:%M:%S.%f')[:-3]
             if self.current_state == "OPEN":
                 print(f"\n{'='*50}")
                 print(f"  >>> HAND OPENED <<<  [{time_str}]")
                 print(f"  Distance: {self._last_distance:.4f} < Threshold: {self._last_threshold:.4f}")
+                print(f"  Refractory: {self.refractory_period_s:.1f}s")
                 print(f"{'='*50}\n")
             else:
                 print(f"\n{'='*50}")
                 print(f"  >>> HAND CLOSED <<<  [{time_str}]")
                 print(f"  Distance: {self._last_distance:.4f} < Threshold: {self._last_threshold:.4f}")
+                print(f"  Refractory: {self.refractory_period_s:.1f}s")
                 print(f"{'='*50}\n")
 
         # Update timing stats
