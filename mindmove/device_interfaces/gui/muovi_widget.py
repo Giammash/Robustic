@@ -82,6 +82,8 @@ class MuoviWidget(QWidget):
         # Signal Processing - Real-time filter
         self.rt_filter = RealTimeEMGFilter(n_channels=config.num_channels)
         self.filtering_enabled = config.ENABLE_FILTERING
+        self._current_raw_data = None  # Cache for current packet
+        self._current_filtered_emg = None  # Cache for filtered result
         self._setup_signal_processing_group()
 
     def toggle_connection(self):
@@ -154,6 +156,11 @@ class MuoviWidget(QWidget):
             self.device.log_info("Stopped Streaming")
 
     def update(self, data: np.ndarray) -> None:
+        # Store raw data for extract_emg_data to process
+        # Filtering happens in extract_emg_data, but we cache the result
+        # to avoid filtering the same packet multiple times
+        self._current_raw_data = data
+        self._current_filtered_emg = None  # Reset cache for new packet
         self.ready_read_signal.emit(data)
 
     def extract_emg_data(
@@ -164,6 +171,11 @@ class MuoviWidget(QWidget):
 
         When filtering is enabled, applies real-time bandpass and notch
         filtering to the extracted EMG data.
+
+        IMPORTANT: Uses caching to ensure the filter is only called ONCE
+        per packet, even if multiple consumers call this method. This is
+        critical because the IIR filter has internal state that must not
+        be advanced multiple times for the same data.
 
         Args:
             data (np.ndarray):
@@ -177,11 +189,27 @@ class MuoviWidget(QWidget):
             np.ndarray:
                 Extracted (and optionally filtered) EMG channels.
         """
+        # Check if this is the same packet we already processed
+        # (multiple consumers may call extract_emg_data for the same packet)
+        is_same_packet = (
+            hasattr(self, '_current_raw_data') and
+            self._current_raw_data is data
+        )
+
+        if is_same_packet and hasattr(self, '_current_filtered_emg') and self._current_filtered_emg is not None:
+            # Return cached result to avoid filtering the same packet twice
+            return self._current_filtered_emg
+
+        # Extract EMG from raw data
         emg_data = self.device.extract_emg_data(data, milli_volts)
 
         # Apply real-time filtering if enabled
         if self.filtering_enabled and emg_data.size > 0:
             emg_data = self.rt_filter.filter(emg_data)
+
+        # Cache the result for this packet
+        if is_same_packet:
+            self._current_filtered_emg = emg_data
 
         return emg_data
 
