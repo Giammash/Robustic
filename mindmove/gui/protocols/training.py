@@ -1,17 +1,24 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional
+from typing import TYPE_CHECKING, List, Optional, Dict
 
-from PySide6.QtCore import QObject, Signal, QThread
+from PySide6.QtCore import QObject, Signal, QThread, Qt
 from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QListWidgetItem, QLabel, QLineEdit,
-    QComboBox, QPushButton, QSpinBox, QDoubleSpinBox, QGroupBox
+    QComboBox, QPushButton, QSpinBox, QDoubleSpinBox, QGroupBox,
+    QDialog, QVBoxLayout, QHBoxLayout, QSplitter, QWidget
 )
 import pickle
 from datetime import datetime
 import numpy as np
 import os
+
+# Matplotlib imports for review UI
+import matplotlib
+matplotlib.use('QtAgg')
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 
 # MindMove imports
 from mindmove.model.interface import MindMoveInterface
@@ -37,6 +44,361 @@ class PyQtThread(QThread):
 
     def quit(self) -> None:
         self.exit(0)
+
+
+class ActivationReviewWidget(QWidget):
+    """
+    Widget for reviewing and selecting template windows from activation segments.
+    Used in the Guided Recording Review Dialog.
+    """
+
+    template_accepted = Signal(np.ndarray)
+
+    def __init__(self, class_label: str, parent=None):
+        super().__init__(parent)
+        self.class_label = class_label
+        self.activations: List[np.ndarray] = []
+        self.current_index: int = 0
+        self.selected_start_sample: Optional[int] = None
+        self.template_duration_samples: int = int(1.0 * config.FSAMP)
+        self.accepted_templates: List[np.ndarray] = []
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        # Header
+        header_layout = QHBoxLayout()
+        self.header_label = QLabel(f"{self.class_label.upper()} Activations: 0")
+        self.header_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        header_layout.addWidget(self.header_label)
+
+        self.accepted_label = QLabel("Accepted: 0")
+        self.accepted_label.setStyleSheet("color: green;")
+        header_layout.addWidget(self.accepted_label)
+        header_layout.addStretch()
+        layout.addLayout(header_layout)
+
+        # Matplotlib figure
+        self.figure = Figure(figsize=(8, 3), dpi=100)
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumHeight(200)
+        self.ax = self.figure.add_subplot(111)
+        self.figure.tight_layout()
+        self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
+        layout.addWidget(self.canvas)
+
+        # Info label
+        self.info_label = QLabel("Click on plot to select 1-second template start point")
+        self.info_label.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(self.info_label)
+
+        # Buttons
+        button_layout = QHBoxLayout()
+
+        self.prev_button = QPushButton("◀ Prev")
+        self.prev_button.clicked.connect(self._go_prev)
+        button_layout.addWidget(self.prev_button)
+
+        self.index_label = QLabel("0 / 0")
+        self.index_label.setAlignment(Qt.AlignCenter)
+        self.index_label.setMinimumWidth(60)
+        button_layout.addWidget(self.index_label)
+
+        self.next_button = QPushButton("Next ▶")
+        self.next_button.clicked.connect(self._go_next)
+        button_layout.addWidget(self.next_button)
+
+        button_layout.addSpacing(20)
+
+        self.accept_button = QPushButton("✓ Accept Template")
+        self.accept_button.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }"
+            "QPushButton:disabled { background-color: #cccccc; color: #666666; }"
+        )
+        self.accept_button.clicked.connect(self._accept_current)
+        self.accept_button.setEnabled(False)
+        button_layout.addWidget(self.accept_button)
+
+        self.skip_button = QPushButton("Skip")
+        self.skip_button.clicked.connect(self._go_next)
+        button_layout.addWidget(self.skip_button)
+
+        layout.addLayout(button_layout)
+
+    def set_activations(self, activations: List[np.ndarray]):
+        self.activations = activations
+        self.current_index = 0
+        self.selected_start_sample = None
+        self.accepted_templates = []
+        self.header_label.setText(f"{self.class_label.upper()} Activations: {len(activations)}")
+        self._update_display()
+
+    def _update_display(self):
+        n_activations = len(self.activations)
+
+        self.index_label.setText(f"{self.current_index + 1} / {n_activations}" if n_activations > 0 else "0 / 0")
+        self.prev_button.setEnabled(self.current_index > 0)
+        self.next_button.setEnabled(self.current_index < n_activations - 1)
+        self.skip_button.setEnabled(self.current_index < n_activations - 1)
+        self.accepted_label.setText(f"Accepted: {len(self.accepted_templates)}")
+
+        self.ax.clear()
+
+        if n_activations == 0 or self.current_index >= n_activations:
+            self.ax.text(0.5, 0.5, "No activations to display",
+                        ha='center', va='center', transform=self.ax.transAxes)
+            self.canvas.draw()
+            self.accept_button.setEnabled(False)
+            return
+
+        activation = self.activations[self.current_index]
+        n_samples = activation.shape[1]
+        duration_s = n_samples / config.FSAMP
+        time_axis = np.arange(n_samples) / config.FSAMP
+
+        # Plot mean envelope
+        envelope = np.mean(np.abs(activation), axis=0)
+        self.ax.plot(time_axis, envelope, 'b-', linewidth=0.8, alpha=0.8, label='Mean |EMG|')
+
+        # Mark selected region
+        if self.selected_start_sample is not None:
+            start_s = self.selected_start_sample / config.FSAMP
+            end_s = (self.selected_start_sample + self.template_duration_samples) / config.FSAMP
+            self.ax.axvspan(start_s, end_s, alpha=0.3, color='green', label='Selected 1s')
+            self.ax.axvline(start_s, color='green', linestyle='--', linewidth=2)
+            self.ax.axvline(end_s, color='green', linestyle='--', linewidth=2)
+            self.info_label.setText(f"Selected: {start_s:.2f}s - {end_s:.2f}s (click to change)")
+            self.accept_button.setEnabled(True)
+        else:
+            self.info_label.setText("Click on plot to select 1-second template start point")
+            self.accept_button.setEnabled(False)
+
+        self.ax.set_xlabel('Time (s)')
+        self.ax.set_ylabel('Amplitude')
+        self.ax.set_title(f'{self.class_label.upper()} Activation {self.current_index + 1} ({duration_s:.2f}s)')
+        self.ax.set_xlim(0, duration_s)
+        self.ax.legend(loc='upper right', fontsize=8)
+        self.ax.grid(True, alpha=0.3)
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _on_canvas_click(self, event):
+        if event.inaxes != self.ax:
+            return
+        if len(self.activations) == 0 or self.current_index >= len(self.activations):
+            return
+
+        activation = self.activations[self.current_index]
+        n_samples = activation.shape[1]
+
+        click_time = event.xdata
+        if click_time is None:
+            return
+
+        click_sample = int(click_time * config.FSAMP)
+        max_start = n_samples - self.template_duration_samples
+        if max_start < 0:
+            self.info_label.setText("Activation too short for 1-second template!")
+            return
+
+        self.selected_start_sample = max(0, min(click_sample, max_start))
+        self._update_display()
+
+    def _go_prev(self):
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.selected_start_sample = None
+            self._update_display()
+
+    def _go_next(self):
+        if self.current_index < len(self.activations) - 1:
+            self.current_index += 1
+            self.selected_start_sample = None
+            self._update_display()
+
+    def _accept_current(self):
+        if self.selected_start_sample is None or self.current_index >= len(self.activations):
+            return
+
+        activation = self.activations[self.current_index]
+        start = self.selected_start_sample
+        end = start + self.template_duration_samples
+
+        if end > activation.shape[1]:
+            return
+
+        template = activation[:, start:end]
+        self.accepted_templates.append(template)
+        self.template_accepted.emit(template)
+        self.accepted_label.setText(f"Accepted: {len(self.accepted_templates)}")
+
+        if self.current_index < len(self.activations) - 1:
+            self.current_index += 1
+            self.selected_start_sample = None
+            self._update_display()
+        else:
+            self.info_label.setText("All activations reviewed!")
+
+    def get_accepted_templates(self) -> List[np.ndarray]:
+        return self.accepted_templates
+
+    def clear(self):
+        self.activations = []
+        self.current_index = 0
+        self.selected_start_sample = None
+        self.accepted_templates = []
+        self._update_display()
+
+
+class GuidedRecordingReviewDialog(QDialog):
+    """
+    Dialog for reviewing and extracting templates from guided recordings.
+    Shows both OPEN and CLOSED activations side by side for manual selection.
+    """
+
+    def __init__(self, recording: dict, template_manager: TemplateManager, parent=None):
+        super().__init__(parent)
+        self.recording = recording
+        self.template_manager = template_manager
+        self.saved = False
+
+        self.setWindowTitle("Review & Extract Templates from Guided Recording")
+        self.setMinimumSize(1200, 800)
+        self.setModal(True)
+
+        self._setup_ui()
+        self._extract_and_populate()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Title
+        title = QLabel("Review & Extract Templates")
+        title.setStyleSheet("font-size: 18px; font-weight: bold;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        info = QLabel("Click on each activation to select the 1-second window, then Accept. "
+                     "Review both CLOSED and OPEN activations.")
+        info.setStyleSheet("color: #666;")
+        info.setAlignment(Qt.AlignCenter)
+        layout.addWidget(info)
+
+        # Splitter for CLOSED and OPEN viewers
+        splitter = QSplitter(Qt.Vertical)
+
+        # CLOSED viewer
+        closed_group = QGroupBox("CLOSED Templates (from closing movements)")
+        closed_layout = QVBoxLayout(closed_group)
+        self.closed_viewer = ActivationReviewWidget("closed")
+        self.closed_viewer.template_accepted.connect(self._update_status)
+        closed_layout.addWidget(self.closed_viewer)
+        splitter.addWidget(closed_group)
+
+        # OPEN viewer
+        open_group = QGroupBox("OPEN Templates (from opening movements)")
+        open_layout = QVBoxLayout(open_group)
+        self.open_viewer = ActivationReviewWidget("open")
+        self.open_viewer.template_accepted.connect(self._update_status)
+        open_layout.addWidget(self.open_viewer)
+        splitter.addWidget(open_group)
+
+        layout.addWidget(splitter, stretch=1)
+
+        # Status and buttons
+        status_layout = QHBoxLayout()
+
+        self.status_label = QLabel("Ready to save: 0 CLOSED, 0 OPEN templates")
+        self.status_label.setStyleSheet("color: #666;")
+        status_layout.addWidget(self.status_label)
+
+        status_layout.addStretch()
+
+        self.save_button = QPushButton("Save All Accepted Templates")
+        self.save_button.setStyleSheet(
+            "QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 10px 20px; }"
+        )
+        self.save_button.clicked.connect(self._save_templates)
+        status_layout.addWidget(self.save_button)
+
+        cancel_button = QPushButton("Cancel")
+        cancel_button.clicked.connect(self.reject)
+        status_layout.addWidget(cancel_button)
+
+        layout.addLayout(status_layout)
+
+    def _extract_and_populate(self):
+        """Extract bidirectional activations and populate viewers."""
+        print("\n[REVIEW] Extracting OPEN and CLOSED activations from guided recording...")
+
+        # Clear previous data
+        self.template_manager.clear_all()
+
+        # Extract bidirectional activations
+        activations = self.template_manager.extract_activations_bidirectional(
+            self.recording,
+            min_duration_s=config.MIN_ACTIVATION_DURATION_S
+        )
+
+        # Populate viewers
+        self.closed_viewer.set_activations(activations["closed"])
+        self.open_viewer.set_activations(activations["open"])
+
+        print(f"[REVIEW] Found {len(activations['closed'])} CLOSED, {len(activations['open'])} OPEN activations")
+
+        self._update_status()
+
+    def _update_status(self):
+        n_closed = len(self.closed_viewer.get_accepted_templates())
+        n_open = len(self.open_viewer.get_accepted_templates())
+        self.status_label.setText(f"Ready to save: {n_closed} CLOSED, {n_open} OPEN templates")
+
+    def _save_templates(self):
+        closed_templates = self.closed_viewer.get_accepted_templates()
+        open_templates = self.open_viewer.get_accepted_templates()
+
+        if not closed_templates and not open_templates:
+            QMessageBox.warning(
+                self, "No Templates",
+                "No templates have been accepted. Please review activations and accept templates before saving."
+            )
+            return
+
+        # Set templates in template manager
+        self.template_manager.templates["closed"] = closed_templates
+        self.template_manager.templates["open"] = open_templates
+
+        # Get label from recording
+        label = self.recording.get("label", "")
+        template_set_name = label if label else None
+
+        saved_paths = []
+
+        # Save CLOSED templates
+        if closed_templates:
+            path = self.template_manager.save_templates("closed", template_set_name)
+            saved_paths.append(path)
+            print(f"[REVIEW] Saved {len(closed_templates)} CLOSED templates to {path}")
+
+        # Save OPEN templates
+        if open_templates:
+            path = self.template_manager.save_templates("open", template_set_name)
+            saved_paths.append(path)
+            print(f"[REVIEW] Saved {len(open_templates)} OPEN templates to {path}")
+
+        self.saved = True
+
+        # Show confirmation
+        msg = f"Templates saved successfully!\n\n"
+        msg += f"CLOSED templates: {len(closed_templates)}\n"
+        msg += f"OPEN templates: {len(open_templates)}\n\n"
+        msg += "Saved to:\n" + "\n".join(saved_paths)
+
+        QMessageBox.information(self, "Templates Saved", msg)
+        self.accept()
 
 
 class TrainingProtocol(QObject):
@@ -512,8 +874,10 @@ class TrainingProtocol(QObject):
         # Class selection combo
         self.template_class_combo = self.main_window.ui.trainingTemplateClassComboBox
 
-        # Data format combo
+        # Data format combo - add Guided Recording option
         self.data_format_combo = self.main_window.ui.trainingDataFormatComboBox
+        # Add new option for guided recordings (existing: 0=MindMove, 1=Legacy)
+        self.data_format_combo.addItem("Guided Recording (Bidirectional)")  # index 2
         self.data_format_combo.currentIndexChanged.connect(self._on_data_format_changed)
 
         # Template type combo - add new options programmatically
@@ -690,10 +1054,14 @@ class TrainingProtocol(QObject):
 
     def _on_data_format_changed(self, index: int) -> None:
         """Handle data format combo box change."""
-        is_legacy = index == 1  # "Legacy (EMG + GT folders)" is at index 1
-        if is_legacy:
+        # Index 0: MindMove format
+        # Index 1: Legacy (EMG + GT folders)
+        # Index 2: Guided Recording (Bidirectional)
+        if index == 1:  # Legacy
             self.select_recordings_for_extraction_btn.setText("Select EMG Folder")
-        else:
+        elif index == 2:  # Guided Recording
+            self.select_recordings_for_extraction_btn.setText("Select Guided Recording")
+        else:  # MindMove
             self.select_recordings_for_extraction_btn.setText("Select Recording(s)")
 
         # Clear previous selections
@@ -785,12 +1153,81 @@ class TrainingProtocol(QObject):
 
     def _select_recordings_for_extraction(self) -> None:
         """Open file/folder dialog to select recordings for template extraction."""
-        is_legacy = self.data_format_combo.currentIndex() == 1
+        format_index = self.data_format_combo.currentIndex()
 
-        if is_legacy:
+        if format_index == 1:  # Legacy
             self._select_legacy_folders()
-        else:
+        elif format_index == 2:  # Guided Recording (Bidirectional)
+            self._select_guided_recording()
+        else:  # MindMove format
             self._select_recording_files()
+
+    def _select_guided_recording(self) -> None:
+        """Select a guided recording file and open the review dialog."""
+        if not os.path.exists(self.recordings_dir_path):
+            os.makedirs(self.recordings_dir_path)
+
+        dialog = QFileDialog(self.main_window)
+        dialog.setFileMode(QFileDialog.ExistingFile)
+        dialog.setNameFilter("Pickle files (*.pkl)")
+        dialog.setDirectory(self.recordings_dir_path)
+
+        filename, _ = dialog.getOpenFileName()
+
+        if not filename:
+            return
+
+        # Load and validate the recording
+        try:
+            with open(filename, "rb") as f:
+                recording = pickle.load(f)
+
+            # Check if it's a guided recording
+            gt_mode = recording.get("gt_mode", "")
+            if gt_mode != "guided_animation":
+                # Also accept keyboard recordings with GT
+                if "emg" not in recording or "gt" not in recording:
+                    QMessageBox.warning(
+                        self.main_window,
+                        "Invalid Recording",
+                        f"Selected file is not a guided recording or doesn't have GT data.\n"
+                        f"gt_mode: {gt_mode}\n"
+                        f"Keys: {list(recording.keys())}",
+                        QMessageBox.Ok,
+                    )
+                    return
+
+            print(f"\n[TRAINING] Loaded guided recording: {os.path.basename(filename)}")
+            print(f"  gt_mode: {gt_mode}")
+            print(f"  EMG shape: {recording.get('emg', np.array([])).shape}")
+            if "cycles_completed" in recording:
+                print(f"  Cycles: {recording['cycles_completed']}")
+
+            # Open the review dialog
+            review_dialog = GuidedRecordingReviewDialog(
+                recording, self.template_manager, self.main_window
+            )
+            result = review_dialog.exec()
+
+            if review_dialog.saved:
+                # Update UI to show templates were saved
+                self.selected_recordings_for_extraction_label.setText(
+                    f"Templates saved from guided recording"
+                )
+                # Update template counts
+                n_closed = len(self.template_manager.templates.get("closed", []))
+                n_open = len(self.template_manager.templates.get("open", []))
+                self.template_count_label.setText(f"Saved: {n_closed} closed, {n_open} open")
+
+        except Exception as e:
+            QMessageBox.critical(
+                self.main_window,
+                "Error",
+                f"Failed to load guided recording: {e}",
+                QMessageBox.Ok,
+            )
+            import traceback
+            traceback.print_exc()
 
     def _select_recording_files(self) -> None:
         """Select recording files (auto-detect format). Supports .pkl and .mat files."""
