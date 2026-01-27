@@ -7,15 +7,16 @@ Patient-friendly template recording with VHI animation guide.
 - GT is automatically derived from VHI animation state
 - Therapist controls timing between cycles
 - Audio cues signal transitions
+- Post-recording review UI for manual template selection
 """
 
 from __future__ import annotations
-from typing import TYPE_CHECKING, Optional, Tuple, List
-from PySide6.QtCore import QObject, QTimer, Signal
+from typing import TYPE_CHECKING, Optional, Tuple, List, Dict
+from PySide6.QtCore import QObject, QTimer, Signal, Qt
 from PySide6.QtWidgets import (
     QWidget, QGroupBox, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QDoubleSpinBox, QCheckBox, QProgressBar,
-    QFrame
+    QFrame, QStackedWidget, QScrollArea, QSplitter, QMessageBox
 )
 import time
 import numpy as np
@@ -23,7 +24,14 @@ import pickle
 import os
 from datetime import datetime
 
+# Matplotlib imports for template review plots
+import matplotlib
+matplotlib.use('QtAgg')
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
+
 from mindmove.config import config
+from mindmove.model.templates.template_manager import TemplateManager
 
 if TYPE_CHECKING:
     from mindmove.gui.mindmove import MindMove
@@ -53,26 +61,34 @@ class HandAnimationSequencer:
 
         # Default timings
         self.hold_open_s: float = 2.0
-        self.transition_s: float = 1.0
+        self.closing_transition_s: float = 1.0
         self.hold_closed_s: float = 2.0
+        self.opening_transition_s: float = 0.3  # Faster opening by default
 
-    def setup_cycle(self, hold_open_s: float, transition_s: float, hold_closed_s: float):
+    def setup_cycle(
+        self,
+        hold_open_s: float,
+        closing_transition_s: float,
+        hold_closed_s: float,
+        opening_transition_s: float = 0.3
+    ):
         """Define one open→close→open cycle with specified timings."""
         self.hold_open_s = hold_open_s
-        self.transition_s = transition_s
+        self.closing_transition_s = closing_transition_s
         self.hold_closed_s = hold_closed_s
+        self.opening_transition_s = opening_transition_s
 
         # Open joints = 0, Closed joints = 1
         self.phases = [
             (self.PHASE_HOLD_OPEN, hold_open_s, [0.0] * 10),
-            (self.PHASE_CLOSING, transition_s, None),  # Interpolate 0→1
+            (self.PHASE_CLOSING, closing_transition_s, None),  # Interpolate 0→1
             (self.PHASE_HOLD_CLOSED, hold_closed_s, [1.0] * 10),
-            (self.PHASE_OPENING, transition_s, None),  # Interpolate 1→0
+            (self.PHASE_OPENING, opening_transition_s, None),  # Interpolate 1→0 (faster)
         ]
 
     def get_total_cycle_duration(self) -> float:
         """Get total duration of one cycle in seconds."""
-        return self.hold_open_s + self.transition_s + self.hold_closed_s + self.transition_s
+        return self.hold_open_s + self.closing_transition_s + self.hold_closed_s + self.opening_transition_s
 
     def start_cycle(self):
         """Begin a new animation cycle."""
@@ -244,6 +260,255 @@ class AudioCueManager:
             print(f"[AUDIO CUE] {cue_name}")
 
 
+class ActivationViewerWidget(QWidget):
+    """
+    Widget for viewing and selecting template windows from activation segments.
+
+    Displays EMG activation plot with click-to-select 1-second window functionality.
+    """
+
+    # Signal emitted when template is accepted
+    template_accepted = Signal(np.ndarray)  # Emits the template array
+
+    def __init__(self, class_label: str, parent=None):
+        super().__init__(parent)
+        self.class_label = class_label  # "open" or "closed"
+        self.activations: List[np.ndarray] = []
+        self.current_index: int = 0
+        self.selected_start_sample: Optional[int] = None
+        self.template_duration_samples: int = int(1.0 * config.FSAMP)  # 1 second
+        self.accepted_templates: List[np.ndarray] = []
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        """Create the viewer UI."""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        # Header with class label and count
+        header_layout = QHBoxLayout()
+        self.header_label = QLabel(f"{self.class_label.upper()} Activations: 0")
+        self.header_label.setStyleSheet("font-weight: bold; font-size: 12px;")
+        header_layout.addWidget(self.header_label)
+
+        self.accepted_label = QLabel("Accepted: 0")
+        self.accepted_label.setStyleSheet("color: green;")
+        header_layout.addWidget(self.accepted_label)
+        header_layout.addStretch()
+
+        layout.addLayout(header_layout)
+
+        # Matplotlib figure for EMG plot
+        self.figure = Figure(figsize=(8, 3), dpi=100)
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumHeight(200)
+        self.ax = self.figure.add_subplot(111)
+        self.figure.tight_layout()
+
+        # Connect click event
+        self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
+
+        layout.addWidget(self.canvas)
+
+        # Info label
+        self.info_label = QLabel("Click on plot to select 1-second template start point")
+        self.info_label.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(self.info_label)
+
+        # Navigation and action buttons
+        button_layout = QHBoxLayout()
+
+        self.prev_button = QPushButton("◀ Prev")
+        self.prev_button.clicked.connect(self._go_prev)
+        button_layout.addWidget(self.prev_button)
+
+        self.index_label = QLabel("0 / 0")
+        self.index_label.setAlignment(Qt.AlignCenter)
+        self.index_label.setMinimumWidth(60)
+        button_layout.addWidget(self.index_label)
+
+        self.next_button = QPushButton("Next ▶")
+        self.next_button.clicked.connect(self._go_next)
+        button_layout.addWidget(self.next_button)
+
+        button_layout.addSpacing(20)
+
+        self.accept_button = QPushButton("✓ Accept Template")
+        self.accept_button.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; }"
+            "QPushButton:disabled { background-color: #cccccc; color: #666666; }"
+        )
+        self.accept_button.clicked.connect(self._accept_current)
+        self.accept_button.setEnabled(False)
+        button_layout.addWidget(self.accept_button)
+
+        self.skip_button = QPushButton("Skip")
+        self.skip_button.clicked.connect(self._go_next)
+        button_layout.addWidget(self.skip_button)
+
+        layout.addLayout(button_layout)
+
+    def set_activations(self, activations: List[np.ndarray]):
+        """Set the list of activations to review."""
+        self.activations = activations
+        self.current_index = 0
+        self.selected_start_sample = None
+        self.accepted_templates = []
+
+        self.header_label.setText(f"{self.class_label.upper()} Activations: {len(activations)}")
+        self._update_display()
+
+    def _update_display(self):
+        """Update the plot and navigation controls."""
+        n_activations = len(self.activations)
+
+        # Update navigation
+        self.index_label.setText(f"{self.current_index + 1} / {n_activations}" if n_activations > 0 else "0 / 0")
+        self.prev_button.setEnabled(self.current_index > 0)
+        self.next_button.setEnabled(self.current_index < n_activations - 1)
+        self.skip_button.setEnabled(self.current_index < n_activations - 1)
+
+        # Update accepted count
+        self.accepted_label.setText(f"Accepted: {len(self.accepted_templates)}")
+
+        # Clear and redraw plot
+        self.ax.clear()
+
+        if n_activations == 0 or self.current_index >= n_activations:
+            self.ax.text(0.5, 0.5, "No activations to display",
+                        ha='center', va='center', transform=self.ax.transAxes)
+            self.canvas.draw()
+            self.accept_button.setEnabled(False)
+            return
+
+        activation = self.activations[self.current_index]
+        n_samples = activation.shape[1]
+        duration_s = n_samples / config.FSAMP
+
+        # Plot all channels (or subset for clarity)
+        time_axis = np.arange(n_samples) / config.FSAMP
+
+        # Plot mean envelope across channels for clarity
+        envelope = np.mean(np.abs(activation), axis=0)
+        self.ax.plot(time_axis, envelope, 'b-', linewidth=0.8, alpha=0.8, label='Mean |EMG|')
+
+        # Mark the selected template window
+        if self.selected_start_sample is not None:
+            start_s = self.selected_start_sample / config.FSAMP
+            end_s = (self.selected_start_sample + self.template_duration_samples) / config.FSAMP
+
+            # Shade the selected region
+            self.ax.axvspan(start_s, end_s, alpha=0.3, color='green', label='Selected 1s')
+            self.ax.axvline(start_s, color='green', linestyle='--', linewidth=2)
+            self.ax.axvline(end_s, color='green', linestyle='--', linewidth=2)
+
+            self.info_label.setText(f"Selected: {start_s:.2f}s - {end_s:.2f}s (click to change)")
+            self.accept_button.setEnabled(True)
+        else:
+            self.info_label.setText("Click on plot to select 1-second template start point")
+            self.accept_button.setEnabled(False)
+
+        self.ax.set_xlabel('Time (s)')
+        self.ax.set_ylabel('Amplitude')
+        self.ax.set_title(f'{self.class_label.upper()} Activation {self.current_index + 1} ({duration_s:.2f}s)')
+        self.ax.set_xlim(0, duration_s)
+        self.ax.legend(loc='upper right', fontsize=8)
+        self.ax.grid(True, alpha=0.3)
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+    def _on_canvas_click(self, event):
+        """Handle click on canvas to select template start."""
+        if event.inaxes != self.ax:
+            return
+
+        if len(self.activations) == 0 or self.current_index >= len(self.activations):
+            return
+
+        activation = self.activations[self.current_index]
+        n_samples = activation.shape[1]
+
+        # Convert click position to sample index
+        click_time = event.xdata
+        if click_time is None:
+            return
+
+        click_sample = int(click_time * config.FSAMP)
+
+        # Ensure the 1-second window fits within the activation
+        max_start = n_samples - self.template_duration_samples
+        if max_start < 0:
+            self.info_label.setText("Activation too short for 1-second template!")
+            return
+
+        # Clamp to valid range
+        self.selected_start_sample = max(0, min(click_sample, max_start))
+
+        self._update_display()
+
+    def _go_prev(self):
+        """Go to previous activation."""
+        if self.current_index > 0:
+            self.current_index -= 1
+            self.selected_start_sample = None
+            self._update_display()
+
+    def _go_next(self):
+        """Go to next activation."""
+        if self.current_index < len(self.activations) - 1:
+            self.current_index += 1
+            self.selected_start_sample = None
+            self._update_display()
+
+    def _accept_current(self):
+        """Accept the current template selection."""
+        if self.selected_start_sample is None:
+            return
+
+        if self.current_index >= len(self.activations):
+            return
+
+        activation = self.activations[self.current_index]
+
+        # Extract the selected 1-second template
+        start = self.selected_start_sample
+        end = start + self.template_duration_samples
+
+        if end > activation.shape[1]:
+            return
+
+        template = activation[:, start:end]
+        self.accepted_templates.append(template)
+
+        # Emit signal
+        self.template_accepted.emit(template)
+
+        # Update display
+        self.accepted_label.setText(f"Accepted: {len(self.accepted_templates)}")
+
+        # Move to next
+        if self.current_index < len(self.activations) - 1:
+            self.current_index += 1
+            self.selected_start_sample = None
+            self._update_display()
+        else:
+            self.info_label.setText("All activations reviewed!")
+
+    def get_accepted_templates(self) -> List[np.ndarray]:
+        """Return list of accepted templates."""
+        return self.accepted_templates
+
+    def clear(self):
+        """Clear all data."""
+        self.activations = []
+        self.current_index = 0
+        self.selected_start_sample = None
+        self.accepted_templates = []
+        self._update_display()
+
+
 class GuidedRecordProtocol(QObject):
     """
     Protocol for patient-friendly guided template recording.
@@ -254,6 +519,7 @@ class GuidedRecordProtocol(QObject):
     - Pause between cycles for therapist instructions
     - Audio cues for transitions
     - Automatic GT from animation state
+    - Post-recording review UI for template extraction
     """
 
     # Signals
@@ -294,14 +560,28 @@ class GuidedRecordProtocol(QObject):
         # File management
         self.recording_dir_path: str = "data/recordings/"
 
+        # Template management
+        self.template_manager = TemplateManager()
+        self.last_recording: Optional[dict] = None
+        self.last_recording_path: Optional[str] = None
+
         # Initialize UI
         self._setup_protocol_ui()
 
     def _setup_protocol_ui(self) -> None:
         """Create the UI for guided recording protocol."""
-        # Create main widget container
+        # Create main widget container with stacked widget for recording/review views
         self.main_widget = QWidget()
         main_layout = QVBoxLayout(self.main_widget)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+
+        # Stacked widget to switch between recording and review views
+        self.stacked_widget = QStackedWidget()
+        main_layout.addWidget(self.stacked_widget)
+
+        # === Recording View (index 0) ===
+        self.recording_view = QWidget()
+        recording_layout = QVBoxLayout(self.recording_view)
 
         # === Timing Configuration Group ===
         timing_group = QGroupBox("Timing Configuration")
@@ -316,14 +596,14 @@ class GuidedRecordProtocol(QObject):
         self.hold_open_spinbox.setSuffix(" s")
         timing_layout.addWidget(self.hold_open_spinbox, 0, 1)
 
-        # Transition duration
-        timing_layout.addWidget(QLabel("Transition:"), 1, 0)
-        self.transition_spinbox = QDoubleSpinBox()
-        self.transition_spinbox.setRange(0.5, 5.0)
-        self.transition_spinbox.setSingleStep(0.5)
-        self.transition_spinbox.setValue(1.0)
-        self.transition_spinbox.setSuffix(" s")
-        timing_layout.addWidget(self.transition_spinbox, 1, 1)
+        # Closing transition duration
+        timing_layout.addWidget(QLabel("Closing:"), 1, 0)
+        self.closing_transition_spinbox = QDoubleSpinBox()
+        self.closing_transition_spinbox.setRange(0.2, 5.0)
+        self.closing_transition_spinbox.setSingleStep(0.1)
+        self.closing_transition_spinbox.setValue(1.0)
+        self.closing_transition_spinbox.setSuffix(" s")
+        timing_layout.addWidget(self.closing_transition_spinbox, 1, 1)
 
         # Hold Closed duration
         timing_layout.addWidget(QLabel("Hold Closed:"), 2, 0)
@@ -334,13 +614,20 @@ class GuidedRecordProtocol(QObject):
         self.hold_closed_spinbox.setSuffix(" s")
         timing_layout.addWidget(self.hold_closed_spinbox, 2, 1)
 
+        # Opening transition duration (faster by default)
+        timing_layout.addWidget(QLabel("Opening:"), 3, 0)
+        self.opening_transition_spinbox = QDoubleSpinBox()
+        self.opening_transition_spinbox.setRange(0.1, 5.0)
+        self.opening_transition_spinbox.setSingleStep(0.1)
+        self.opening_transition_spinbox.setValue(0.3)  # Fast opening
+        self.opening_transition_spinbox.setSuffix(" s")
+        timing_layout.addWidget(self.opening_transition_spinbox, 3, 1)
+
         # Audio cues checkbox
         self.audio_checkbox = QCheckBox("Audio cues enabled")
         self.audio_checkbox.setChecked(True)
         self.audio_checkbox.toggled.connect(self._on_audio_toggled)
-        timing_layout.addWidget(self.audio_checkbox, 3, 0, 1, 2)
-
-        main_layout.addWidget(timing_group)
+        timing_layout.addWidget(self.audio_checkbox, 4, 0, 1, 2)
 
         # === Recording Control Group ===
         control_group = QGroupBox("Recording Control")
@@ -380,7 +667,7 @@ class GuidedRecordProtocol(QObject):
         )
         control_layout.addWidget(self.start_cycle_button)
 
-        main_layout.addWidget(control_group)
+        recording_layout.addWidget(control_group)
 
         # === Phase Progress Group ===
         progress_group = QGroupBox("Current Phase")
@@ -398,7 +685,7 @@ class GuidedRecordProtocol(QObject):
         self.time_remaining_label = QLabel("Time remaining: -")
         progress_layout.addWidget(self.time_remaining_label)
 
-        main_layout.addWidget(progress_group)
+        recording_layout.addWidget(progress_group)
 
         # === Label for saving ===
         label_group = QGroupBox("Recording Label")
@@ -410,10 +697,87 @@ class GuidedRecordProtocol(QObject):
         self.label_line_edit.setPlaceholderText("e.g., position_1, table_neutral")
         label_layout.addWidget(self.label_line_edit)
 
-        main_layout.addWidget(label_group)
+        recording_layout.addWidget(label_group)
 
         # Spacer
-        main_layout.addStretch()
+        recording_layout.addStretch()
+
+        self.stacked_widget.addWidget(self.recording_view)
+
+        # === Review & Extract View (index 1) ===
+        self._setup_review_ui()
+
+    def _setup_review_ui(self) -> None:
+        """Create the review & extract templates UI."""
+        self.review_view = QWidget()
+        review_layout = QVBoxLayout(self.review_view)
+
+        # Header with back button
+        header_layout = QHBoxLayout()
+
+        self.back_to_recording_button = QPushButton("← Back to Recording")
+        self.back_to_recording_button.clicked.connect(self._switch_to_recording_view)
+        header_layout.addWidget(self.back_to_recording_button)
+
+        header_layout.addStretch()
+
+        self.review_title = QLabel("Review & Extract Templates")
+        self.review_title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        header_layout.addWidget(self.review_title)
+
+        header_layout.addStretch()
+
+        review_layout.addLayout(header_layout)
+
+        # Splitter for CLOSED and OPEN viewers
+        splitter = QSplitter(Qt.Vertical)
+
+        # CLOSED activations viewer
+        closed_group = QGroupBox("CLOSED Templates (from closing movements)")
+        closed_layout = QVBoxLayout(closed_group)
+        self.closed_viewer = ActivationViewerWidget("closed")
+        self.closed_viewer.template_accepted.connect(self._on_template_accepted)
+        closed_layout.addWidget(self.closed_viewer)
+        splitter.addWidget(closed_group)
+
+        # OPEN activations viewer
+        open_group = QGroupBox("OPEN Templates (from opening movements)")
+        open_layout = QVBoxLayout(open_group)
+        self.open_viewer = ActivationViewerWidget("open")
+        self.open_viewer.template_accepted.connect(self._on_template_accepted)
+        open_layout.addWidget(self.open_viewer)
+        splitter.addWidget(open_group)
+
+        review_layout.addWidget(splitter, stretch=1)
+
+        # Bottom actions
+        actions_layout = QHBoxLayout()
+
+        self.save_status_label = QLabel("")
+        self.save_status_label.setStyleSheet("color: #666;")
+        actions_layout.addWidget(self.save_status_label)
+
+        actions_layout.addStretch()
+
+        self.save_all_button = QPushButton("Save All Accepted Templates")
+        self.save_all_button.setStyleSheet(
+            "QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 10px 20px; }"
+            "QPushButton:disabled { background-color: #cccccc; color: #666666; }"
+        )
+        self.save_all_button.clicked.connect(self._save_all_templates)
+        actions_layout.addWidget(self.save_all_button)
+
+        review_layout.addLayout(actions_layout)
+
+        self.stacked_widget.addWidget(self.review_view)
+
+    def _switch_to_recording_view(self):
+        """Switch back to recording view."""
+        self.stacked_widget.setCurrentIndex(0)
+
+    def _switch_to_review_view(self):
+        """Switch to review & extract view."""
+        self.stacked_widget.setCurrentIndex(1)
 
     def get_widget(self) -> QWidget:
         """Return the main widget for this protocol."""
@@ -450,8 +814,9 @@ class GuidedRecordProtocol(QObject):
         # Setup sequencer with current timing settings
         self.sequencer.setup_cycle(
             hold_open_s=self.hold_open_spinbox.value(),
-            transition_s=self.transition_spinbox.value(),
-            hold_closed_s=self.hold_closed_spinbox.value()
+            closing_transition_s=self.closing_transition_spinbox.value(),
+            hold_closed_s=self.hold_closed_spinbox.value(),
+            opening_transition_s=self.opening_transition_spinbox.value()
         )
 
         # Reset state
@@ -491,8 +856,9 @@ class GuidedRecordProtocol(QObject):
         print("GUIDED RECORDING STARTED")
         print("  Predicted Hand becomes Control Hand (visual guide)")
         print(f"  Hold Open: {self.hold_open_spinbox.value()}s")
-        print(f"  Transition: {self.transition_spinbox.value()}s")
+        print(f"  Closing: {self.closing_transition_spinbox.value()}s")
         print(f"  Hold Closed: {self.hold_closed_spinbox.value()}s")
+        print(f"  Opening: {self.opening_transition_spinbox.value()}s")
         print(f"  Cycle duration: {self.sequencer.get_total_cycle_duration()}s")
         print("Press 'Start Next Cycle' to begin first cycle")
         print("=" * 60 + "\n")
@@ -516,7 +882,7 @@ class GuidedRecordProtocol(QObject):
         self.is_cycle_running = False
 
         # Save data
-        self._save_recording()
+        recording_path = self._save_recording()
 
         # Update UI
         self.start_recording_button.setChecked(False)
@@ -532,6 +898,11 @@ class GuidedRecordProtocol(QObject):
         # Send open hand to VHI
         self._send_joints_to_vhi([0.0] * 10)
 
+        # Extract activations and switch to review view
+        if self.last_recording is not None:
+            self._populate_review_ui()
+            self._switch_to_review_view()
+
     def _on_start_next_cycle(self):
         """Start the next animation cycle."""
         if not self.is_recording:
@@ -540,8 +911,9 @@ class GuidedRecordProtocol(QObject):
         # Update sequencer timings in case they changed
         self.sequencer.setup_cycle(
             hold_open_s=self.hold_open_spinbox.value(),
-            transition_s=self.transition_spinbox.value(),
-            hold_closed_s=self.hold_closed_spinbox.value()
+            closing_transition_s=self.closing_transition_spinbox.value(),
+            hold_closed_s=self.hold_closed_spinbox.value(),
+            opening_transition_s=self.opening_transition_spinbox.value()
         )
 
         # Start new cycle
@@ -632,9 +1004,9 @@ class GuidedRecordProtocol(QObject):
         time_remaining = self.sequencer.get_time_remaining_in_phase(current_time)
         phase_durations = {
             "HOLD_OPEN": self.hold_open_spinbox.value(),
-            "CLOSING": self.transition_spinbox.value(),
+            "CLOSING": self.closing_transition_spinbox.value(),
             "HOLD_CLOSED": self.hold_closed_spinbox.value(),
-            "OPENING": self.transition_spinbox.value(),
+            "OPENING": self.opening_transition_spinbox.value(),
         }
         phase_duration = phase_durations.get(phase_name, 1.0)
         if phase_duration > 0:
@@ -660,14 +1032,15 @@ class GuidedRecordProtocol(QObject):
     def _set_timing_controls_enabled(self, enabled: bool):
         """Enable/disable timing controls."""
         self.hold_open_spinbox.setEnabled(enabled)
-        self.transition_spinbox.setEnabled(enabled)
+        self.closing_transition_spinbox.setEnabled(enabled)
         self.hold_closed_spinbox.setEnabled(enabled)
+        self.opening_transition_spinbox.setEnabled(enabled)
 
-    def _save_recording(self):
+    def _save_recording(self) -> Optional[str]:
         """Save the recording to file."""
         if not self.emg_buffer:
             print("[GUIDED] No EMG data to save!")
-            return
+            return None
 
         # Build EMG array
         emg_signal = self.main_window.device.extract_emg_data(
@@ -692,8 +1065,9 @@ class GuidedRecordProtocol(QObject):
             "gt_mode": "guided_animation",
             "animation_config": {
                 "hold_open_s": self.hold_open_spinbox.value(),
-                "transition_s": self.transition_spinbox.value(),
+                "closing_transition_s": self.closing_transition_spinbox.value(),
                 "hold_closed_s": self.hold_closed_spinbox.value(),
+                "opening_transition_s": self.opening_transition_spinbox.value(),
             },
             "cycles": self.cycle_boundaries,
             "cycles_completed": self.cycles_completed,
@@ -709,15 +1083,115 @@ class GuidedRecordProtocol(QObject):
         now = datetime.now()
         formatted_now = now.strftime("%Y%m%d_%H%M%S%f")
         file_name = f"MindMove_GuidedRecording_{formatted_now}_{label}.pkl"
+        file_path = os.path.join(self.recording_dir_path, file_name)
 
-        with open(os.path.join(self.recording_dir_path, file_name), "wb") as f:
+        with open(file_path, "wb") as f:
             pickle.dump(save_dict, f)
+
+        # Store for review
+        self.last_recording = save_dict
+        self.last_recording_path = file_path
 
         print(f"\n[GUIDED] Recording saved: {file_name}")
         print(f"  EMG shape: {emg_signal.shape}")
         print(f"  GT shape: {gt_signal.shape}")
         print(f"  Cycles completed: {self.cycles_completed}")
         print(f"  Total duration: {save_dict['recording_duration_s']:.1f}s")
+
+        return file_path
+
+    def _populate_review_ui(self):
+        """Extract activations and populate the review UI."""
+        if self.last_recording is None:
+            print("[GUIDED] No recording to review!")
+            return
+
+        # Clear previous data
+        self.template_manager.clear_all()
+        self.closed_viewer.clear()
+        self.open_viewer.clear()
+
+        # Extract bidirectional activations
+        print("\n[GUIDED] Extracting OPEN and CLOSED activations...")
+        activations = self.template_manager.extract_activations_bidirectional(
+            self.last_recording,
+            min_duration_s=config.MIN_ACTIVATION_DURATION_S
+        )
+
+        # Populate viewers
+        self.closed_viewer.set_activations(activations["closed"])
+        self.open_viewer.set_activations(activations["open"])
+
+        # Update save status
+        self._update_save_status()
+
+        print(f"[GUIDED] Review UI populated:")
+        print(f"  CLOSED activations: {len(activations['closed'])}")
+        print(f"  OPEN activations: {len(activations['open'])}")
+
+    def _update_save_status(self):
+        """Update the save status label."""
+        n_closed = len(self.closed_viewer.get_accepted_templates())
+        n_open = len(self.open_viewer.get_accepted_templates())
+        self.save_status_label.setText(
+            f"Ready to save: {n_closed} CLOSED, {n_open} OPEN templates"
+        )
+
+    def _on_template_accepted(self, template: np.ndarray):
+        """Called when a template is accepted in either viewer."""
+        self._update_save_status()
+
+    def _save_all_templates(self):
+        """Save all accepted templates to disk."""
+        closed_templates = self.closed_viewer.get_accepted_templates()
+        open_templates = self.open_viewer.get_accepted_templates()
+
+        if not closed_templates and not open_templates:
+            QMessageBox.warning(
+                self.main_widget,
+                "No Templates",
+                "No templates have been accepted. Please review activations and accept templates before saving."
+            )
+            return
+
+        # Set templates in template manager
+        self.template_manager.templates["closed"] = closed_templates
+        self.template_manager.templates["open"] = open_templates
+
+        # Get label for template set name
+        label = self.label_line_edit.text().strip()
+        template_set_name = label if label else None
+
+        saved_paths = []
+
+        # Save CLOSED templates
+        if closed_templates:
+            path = self.template_manager.save_templates("closed", template_set_name)
+            saved_paths.append(path)
+            print(f"[GUIDED] Saved {len(closed_templates)} CLOSED templates to {path}")
+
+        # Save OPEN templates
+        if open_templates:
+            path = self.template_manager.save_templates("open", template_set_name)
+            saved_paths.append(path)
+            print(f"[GUIDED] Saved {len(open_templates)} OPEN templates to {path}")
+
+        # Show confirmation
+        msg = f"Templates saved successfully!\n\n"
+        msg += f"CLOSED templates: {len(closed_templates)}\n"
+        msg += f"OPEN templates: {len(open_templates)}\n\n"
+        msg += "Saved to:\n" + "\n".join(saved_paths)
+
+        QMessageBox.information(
+            self.main_widget,
+            "Templates Saved",
+            msg
+        )
+
+        self.save_status_label.setText(
+            f"Saved: {len(closed_templates)} CLOSED, {len(open_templates)} OPEN templates"
+        )
+        self.save_status_label.setStyleSheet("color: green; font-weight: bold;")
 
     def _build_gt_signal_at_emg_rate(self, n_emg_samples: int) -> np.ndarray:
         """
