@@ -211,13 +211,7 @@ class VirtualHandInterface(QObject):
                     print(f"VHI connected! (status response received)")
                     continue
 
-                # Parse as array data
-                # Rate-limited debug print (avoid terminal spam)
-                if not hasattr(self, '_recv_msg_count'):
-                    self._recv_msg_count = 0
-                self._recv_msg_count += 1
-                if self._recv_msg_count % 60 == 1:  # Print every ~1 second at 60Hz
-                    print(f"[VHI] Received data (port 1233): {data[:50]}...")
+                # Parse as array data (no debug print - too spammy)
                 self.input_message_signal.emit(np.array(ast.literal_eval(data)))
             except UnicodeDecodeError:
                 # Binary data - print hex for debugging
@@ -240,12 +234,6 @@ class VirtualHandInterface(QObject):
                     continue
 
                 hand_data = np.array(ast.literal_eval(data))
-                # Only print occasionally to avoid spam
-                if not hasattr(self, '_hand_msg_count'):
-                    self._hand_msg_count = 0
-                self._hand_msg_count += 1
-                if self._hand_msg_count % 60 == 1:  # Print every ~1 second
-                    print(f"Kinematics data (port 1234): {hand_data}")
                 self.predicted_hand_signal.emit(hand_data)
             except UnicodeDecodeError:
                 print(f"Binary kinematics ({len(raw_data)} bytes): {raw_data[:20].hex()}...")
@@ -271,14 +259,7 @@ class VirtualHandInterface(QObject):
             )
 
             if output_bytes == -1:
-                print("Error sending message to Virtual Hand Interface")
-            else:
-                # Rate-limited debug print for sent messages
-                if not hasattr(self, '_sent_msg_count'):
-                    self._sent_msg_count = 0
-                self._sent_msg_count += 1
-                if self._sent_msg_count % 20 == 1:  # Print every ~20 messages
-                    print(f"[VHI] Sent to Unity (port {self.virtual_hand_interface_udp_port}): {message.data().decode()}")
+                print("[VHI] Error sending message to Virtual Hand Interface")
 
     def _write_status_message(self) -> None:
         """Send a status check message to VHI."""
@@ -368,6 +349,8 @@ class VirtualHandInterface(QObject):
             if self._unity_process.state() == QProcess.NotRunning:
                 self.start_unity_interface()
 
+            print("[VHI] Streaming started - sending predictions to Unity")
+
         else:
             # Stop streaming
             self._status_request_timer.stop()
@@ -389,6 +372,8 @@ class VirtualHandInterface(QObject):
             self.is_streaming = False
             self._is_connected = False
             self._update_status_indicator()
+
+            print("[VHI] Streaming stopped")
 
     def _check_and_validate_ip(self, ip_line_edit: QLineEdit, default: str) -> None:
         """Validate IP address input."""

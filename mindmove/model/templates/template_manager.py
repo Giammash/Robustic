@@ -621,3 +621,123 @@ class TemplateManager:
         """Clear both activations and templates."""
         self.clear_activations(class_label)
         self.clear_templates(class_label)
+
+    def extract_activations_bidirectional(
+        self,
+        recording: dict,
+        min_duration_s: float = 1.5
+    ) -> Dict[str, List[np.ndarray]]:
+        """
+        Extract both OPEN and CLOSED activations from the same recording.
+
+        Designed for guided recording protocol where one recording contains
+        multiple open→close→open cycles. Templates are classified based on
+        GT transitions:
+        - Rising edge (0→1): CLOSED activation (closing movement)
+        - Falling edge (1→0): OPEN activation (opening movement)
+
+        Args:
+            recording: Recording dict in any supported format
+            min_duration_s: Minimum activation duration to keep
+
+        Returns:
+            Dict with "open" and "closed" keys, each containing list of
+            EMG segments (n_channels, n_samples)
+        """
+        # Normalize recording to standard format
+        normalized = self.normalize_recording(recording)
+
+        emg = normalized["emg"]
+        kinematics = normalized["kinematics"]
+        gt_mode = normalized.get("gt_mode", None)
+
+        # Determine how to process ground truth
+        if gt_mode in ["keyboard", "guided_animation"] or kinematics.shape[0] == 1:
+            # Keyboard/guided format - kinematics is already binary at EMG rate
+            gt_binary = kinematics.flatten().astype(int)
+        else:
+            # Virtual hand: Multi-dimensional kinematics - convert to binary
+            gt_binary = self._convert_kinematics_to_binary(kinematics, emg.shape[1])
+
+        # Find all transitions
+        gt_diff = np.diff(gt_binary, prepend=gt_binary[0])
+        rising_edges = np.where(gt_diff == 1)[0]   # 0→1 = CLOSING starts
+        falling_edges = np.where(gt_diff == -1)[0]  # 1→0 = OPENING starts
+
+        min_samples = int(min_duration_s * config.FSAMP)
+
+        closed_activations = []
+        open_activations = []
+
+        # CLOSED templates: GT=1 segments after rising edge
+        # These represent the closing movement and hold-closed phase
+        for rise_idx in rising_edges:
+            # Find next falling edge
+            next_falls = falling_edges[falling_edges > rise_idx]
+            if len(next_falls) > 0:
+                end_idx = next_falls[0]
+            else:
+                end_idx = len(gt_binary)
+
+            # Extract segment
+            segment = emg[:, rise_idx:end_idx]
+            if segment.shape[1] >= min_samples:
+                closed_activations.append(segment)
+
+        # OPEN templates: GT=0 segments after falling edge
+        # These represent the opening movement
+        # Note: We look for segments between falling edge and next rising edge
+        for fall_idx in falling_edges:
+            # Find next rising edge (or end of recording)
+            next_rises = rising_edges[rising_edges > fall_idx]
+            if len(next_rises) > 0:
+                end_idx = next_rises[0]
+            else:
+                # Use end of recording, but limit to reasonable duration
+                # (we don't want the "waiting" period between cycles)
+                # Use 2x the min_duration as max
+                max_samples = int(2 * min_duration_s * config.FSAMP)
+                end_idx = min(fall_idx + max_samples, len(gt_binary))
+
+            # Extract segment
+            segment = emg[:, fall_idx:end_idx]
+            if segment.shape[1] >= min_samples:
+                open_activations.append(segment)
+
+        # Store in all_activations
+        self.all_activations["closed"].extend(closed_activations)
+        self.all_activations["open"].extend(open_activations)
+
+        print(f"[BIDIRECTIONAL] Extracted {len(closed_activations)} CLOSED, {len(open_activations)} OPEN activations")
+
+        return {"open": open_activations, "closed": closed_activations}
+
+    def extract_from_guided_recording(
+        self,
+        recording_path: str,
+        min_duration_s: float = 1.5
+    ) -> Dict[str, int]:
+        """
+        Convenience method to extract templates from a guided recording file.
+
+        Args:
+            recording_path: Path to the guided recording .pkl file
+            min_duration_s: Minimum activation duration
+
+        Returns:
+            Dict with counts: {"open": n_open, "closed": n_closed}
+        """
+        with open(recording_path, "rb") as f:
+            recording = pickle.load(f)
+
+        # Verify it's a guided recording
+        if recording.get("gt_mode") != "guided_animation":
+            print(f"Warning: Recording is not guided format (gt_mode: {recording.get('gt_mode')})")
+
+        # Extract bidirectional
+        activations = self.extract_activations_bidirectional(recording, min_duration_s)
+
+        return {
+            "open": len(activations["open"]),
+            "closed": len(activations["closed"])
+        }
