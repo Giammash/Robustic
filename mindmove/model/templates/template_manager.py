@@ -742,6 +742,100 @@ class TemplateManager:
 
         return result
 
+    def extract_complete_cycles(
+        self,
+        recording: dict,
+        pre_close_s: float = 1.0,
+        post_open_s: float = 1.0
+    ) -> List[Dict]:
+        """
+        Extract complete open→close→open cycles from a guided recording.
+
+        Each cycle contains:
+        - Last `pre_close_s` seconds of HOLD OPEN (before closing starts)
+        - The CLOSING transition
+        - The entire HOLD CLOSED period
+        - The OPENING transition
+        - First `post_open_s` seconds after opening completes
+
+        This allows viewing the complete cycle context for template selection.
+
+        Args:
+            recording: Recording dict in any supported format
+            pre_close_s: Seconds before closing transition to include
+            post_open_s: Seconds after opening transition to include
+
+        Returns:
+            List of cycle dicts, each containing:
+            - 'emg': EMG data for the cycle (n_channels, n_samples)
+            - 'gt': Binary GT signal for the cycle
+            - 'close_start_idx': Sample index where GT transitions 0→1 (relative to cycle start)
+            - 'open_start_idx': Sample index where GT transitions 1→0 (relative to cycle start)
+            - 'cycle_number': 1-indexed cycle number
+        """
+        # Normalize recording to standard format
+        normalized = self.normalize_recording(recording)
+
+        emg = normalized["emg"]
+        kinematics = normalized["kinematics"]
+        gt_mode = normalized.get("gt_mode", None)
+
+        # Determine how to process ground truth
+        if gt_mode in ["keyboard", "guided_animation"] or kinematics.shape[0] == 1:
+            gt_binary = kinematics.flatten().astype(int)
+        else:
+            gt_binary = self._convert_kinematics_to_binary(kinematics, emg.shape[1])
+
+        # Find all transitions
+        gt_diff = np.diff(gt_binary, prepend=gt_binary[0])
+        rising_edges = np.where(gt_diff == 1)[0]   # 0→1 = CLOSING starts
+        falling_edges = np.where(gt_diff == -1)[0]  # 1→0 = OPENING starts
+
+        pre_close_samples = int(pre_close_s * config.FSAMP)
+        post_open_samples = int(post_open_s * config.FSAMP)
+
+        cycles = []
+
+        # For each rising edge (closing start), find the corresponding falling edge (opening start)
+        for cycle_num, rise_idx in enumerate(rising_edges, start=1):
+            # Find the next falling edge after this rising edge
+            next_falls = falling_edges[falling_edges > rise_idx]
+            if len(next_falls) == 0:
+                # No falling edge found - incomplete cycle, skip
+                continue
+            fall_idx = next_falls[0]
+
+            # Calculate cycle boundaries
+            # Start: pre_close_s before the rising edge
+            cycle_start = max(0, rise_idx - pre_close_samples)
+            # End: post_open_s after the falling edge
+            cycle_end = min(len(gt_binary), fall_idx + post_open_samples)
+
+            # Extract EMG and GT for this cycle
+            cycle_emg = emg[:, cycle_start:cycle_end]
+            cycle_gt = gt_binary[cycle_start:cycle_end]
+
+            # Calculate relative indices within the cycle
+            close_start_relative = rise_idx - cycle_start
+            open_start_relative = fall_idx - cycle_start
+
+            cycles.append({
+                'emg': cycle_emg,
+                'gt': cycle_gt,
+                'close_start_idx': close_start_relative,  # Where GT goes 0→1
+                'open_start_idx': open_start_relative,    # Where GT goes 1→0
+                'cycle_number': cycle_num,
+                'duration_s': cycle_emg.shape[1] / config.FSAMP,
+            })
+
+        print(f"[CYCLES] Extracted {len(cycles)} complete cycles")
+        for i, c in enumerate(cycles):
+            print(f"  Cycle {i+1}: {c['duration_s']:.2f}s, "
+                  f"close@{c['close_start_idx']/config.FSAMP:.2f}s, "
+                  f"open@{c['open_start_idx']/config.FSAMP:.2f}s")
+
+        return cycles
+
     def extract_from_guided_recording(
         self,
         recording_path: str,

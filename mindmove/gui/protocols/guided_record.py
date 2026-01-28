@@ -628,6 +628,9 @@ class GuidedRecordProtocol(QObject):
         self.audio_checkbox.toggled.connect(self._on_audio_toggled)
         timing_layout.addWidget(self.audio_checkbox, 4, 0, 1, 2)
 
+        # Add timing group to recording layout
+        recording_layout.addWidget(timing_group)
+
         # === Recording Control Group ===
         control_group = QGroupBox("Recording Control")
         control_layout = QVBoxLayout(control_group)

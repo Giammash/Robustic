@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import TYPE_CHECKING, List, Optional, Dict
+from typing import TYPE_CHECKING, List, Optional, Dict, Tuple
 
 from PySide6.QtCore import QObject, Signal, QThread, Qt
 from PySide6.QtWidgets import (
@@ -321,16 +321,384 @@ class ActivationReviewWidget(QWidget):
         self._update_display()
 
 
+class CycleReviewWidget(QWidget):
+    """
+    Widget for reviewing complete cycles and selecting both CLOSED and OPEN templates.
+
+    Shows one complete cycle at a time:
+    - Last 1s of HOLD OPEN (before closing)
+    - CLOSING transition + HOLD CLOSED
+    - OPENING transition
+    - First 1s after OPEN
+
+    User selects CLOSED template first, then OPEN template, then moves to next cycle.
+    """
+
+    # Signal emitted when both templates from a cycle are accepted
+    templates_accepted = Signal(np.ndarray, np.ndarray)  # (closed_template, open_template)
+
+    # Selection states
+    STATE_SELECT_CLOSED = 0
+    STATE_SELECT_OPEN = 1
+    STATE_CYCLE_DONE = 2
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.cycles: List[Dict] = []
+        self.current_cycle_idx: int = 0
+        self.current_channel: int = 0  # 0-indexed
+
+        # Selection state machine
+        self.selection_state = self.STATE_SELECT_CLOSED
+        self.selected_closed_start: Optional[int] = None
+        self.selected_open_start: Optional[int] = None
+
+        # Template duration
+        self.template_duration_samples: int = int(1.0 * config.FSAMP)
+
+        # Accepted templates
+        self.accepted_closed_templates: List[np.ndarray] = []
+        self.accepted_open_templates: List[np.ndarray] = []
+
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 5, 5, 5)
+
+        # Header with cycle info and channel selector
+        header_layout = QHBoxLayout()
+
+        self.cycle_label = QLabel("Cycle 0 / 0")
+        self.cycle_label.setStyleSheet("font-weight: bold; font-size: 14px;")
+        header_layout.addWidget(self.cycle_label)
+
+        header_layout.addStretch()
+
+        # Accepted counts
+        self.accepted_label = QLabel("Accepted: 0 CLOSED, 0 OPEN")
+        self.accepted_label.setStyleSheet("color: green;")
+        header_layout.addWidget(self.accepted_label)
+
+        header_layout.addSpacing(20)
+
+        # Channel selector
+        header_layout.addWidget(QLabel("Channel:"))
+        self.channel_combo = QComboBox()
+        self.channel_combo.setFixedWidth(60)
+        for i in range(1, 33):
+            self.channel_combo.addItem(str(i))
+        self.channel_combo.currentIndexChanged.connect(self._on_channel_changed)
+        header_layout.addWidget(self.channel_combo)
+
+        layout.addLayout(header_layout)
+
+        # Instructions label
+        self.instruction_label = QLabel("Step 1: Click to select 1-second CLOSED template window")
+        self.instruction_label.setStyleSheet(
+            "font-size: 13px; font-weight: bold; color: #E65100; "
+            "background-color: #FFF3E0; padding: 8px; border-radius: 4px;"
+        )
+        self.instruction_label.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.instruction_label)
+
+        # Matplotlib figure
+        self.figure = Figure(figsize=(10, 5), dpi=100)
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumHeight(350)
+        self.ax = self.figure.add_subplot(111)
+        self.figure.tight_layout()
+        self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
+        layout.addWidget(self.canvas)
+
+        # Info label for selection feedback
+        self.info_label = QLabel("")
+        self.info_label.setStyleSheet("color: #666; font-style: italic;")
+        layout.addWidget(self.info_label)
+
+        # Navigation and action buttons
+        button_layout = QHBoxLayout()
+
+        self.prev_button = QPushButton("◀ Prev Cycle")
+        self.prev_button.clicked.connect(self._go_prev)
+        button_layout.addWidget(self.prev_button)
+
+        self.cycle_index_label = QLabel("0 / 0")
+        self.cycle_index_label.setAlignment(Qt.AlignCenter)
+        self.cycle_index_label.setMinimumWidth(80)
+        button_layout.addWidget(self.cycle_index_label)
+
+        self.next_button = QPushButton("Next Cycle ▶")
+        self.next_button.clicked.connect(self._go_next)
+        button_layout.addWidget(self.next_button)
+
+        button_layout.addSpacing(30)
+
+        # Reset selection button
+        self.reset_button = QPushButton("Reset Selection")
+        self.reset_button.clicked.connect(self._reset_selection)
+        button_layout.addWidget(self.reset_button)
+
+        # Accept button
+        self.accept_button = QPushButton("✓ Accept Both Templates")
+        self.accept_button.setStyleSheet(
+            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 16px; }"
+            "QPushButton:disabled { background-color: #cccccc; color: #666666; }"
+        )
+        self.accept_button.clicked.connect(self._accept_templates)
+        self.accept_button.setEnabled(False)
+        button_layout.addWidget(self.accept_button)
+
+        self.skip_button = QPushButton("Skip Cycle")
+        self.skip_button.clicked.connect(self._go_next)
+        button_layout.addWidget(self.skip_button)
+
+        layout.addLayout(button_layout)
+
+    def set_cycles(self, cycles: List[Dict]):
+        """Set the list of cycles to review."""
+        self.cycles = cycles
+        self.current_cycle_idx = 0
+        self._reset_selection()
+        self.accepted_closed_templates = []
+        self.accepted_open_templates = []
+
+        # Update channel combo for actual channel count
+        n_channels = cycles[0]['emg'].shape[0] if cycles else 32
+        self.channel_combo.clear()
+        for i in range(1, n_channels + 1):
+            self.channel_combo.addItem(str(i))
+
+        self._update_display()
+
+    def _on_channel_changed(self, index: int):
+        self.current_channel = index
+        self._update_display()
+
+    def _reset_selection(self):
+        """Reset selection state for current cycle."""
+        self.selection_state = self.STATE_SELECT_CLOSED
+        self.selected_closed_start = None
+        self.selected_open_start = None
+        self.accept_button.setEnabled(False)
+        self._update_display()
+
+    def _update_display(self):
+        """Update the plot and UI elements."""
+        n_cycles = len(self.cycles)
+
+        # Update navigation
+        self.cycle_label.setText(f"Cycle {self.current_cycle_idx + 1} / {n_cycles}" if n_cycles > 0 else "No cycles")
+        self.cycle_index_label.setText(f"{self.current_cycle_idx + 1} / {n_cycles}" if n_cycles > 0 else "0 / 0")
+        self.prev_button.setEnabled(self.current_cycle_idx > 0)
+        self.next_button.setEnabled(self.current_cycle_idx < n_cycles - 1)
+        self.skip_button.setEnabled(self.current_cycle_idx < n_cycles - 1)
+
+        # Update accepted counts
+        self.accepted_label.setText(
+            f"Accepted: {len(self.accepted_closed_templates)} CLOSED, "
+            f"{len(self.accepted_open_templates)} OPEN"
+        )
+
+        # Update instruction based on state
+        if self.selection_state == self.STATE_SELECT_CLOSED:
+            self.instruction_label.setText("Step 1: Click to select 1-second CLOSED template window (during closing/hold)")
+            self.instruction_label.setStyleSheet(
+                "font-size: 13px; font-weight: bold; color: #E65100; "
+                "background-color: #FFF3E0; padding: 8px; border-radius: 4px;"
+            )
+        elif self.selection_state == self.STATE_SELECT_OPEN:
+            self.instruction_label.setText("Step 2: Click to select 1-second OPEN template window (during/after opening)")
+            self.instruction_label.setStyleSheet(
+                "font-size: 13px; font-weight: bold; color: #1565C0; "
+                "background-color: #E3F2FD; padding: 8px; border-radius: 4px;"
+            )
+        else:
+            self.instruction_label.setText("Both templates selected! Click 'Accept Both Templates' or reset.")
+            self.instruction_label.setStyleSheet(
+                "font-size: 13px; font-weight: bold; color: #2E7D32; "
+                "background-color: #E8F5E9; padding: 8px; border-radius: 4px;"
+            )
+
+        # Clear and redraw plot
+        self.ax.clear()
+
+        if n_cycles == 0 or self.current_cycle_idx >= n_cycles:
+            self.ax.text(0.5, 0.5, "No cycles to display",
+                        ha='center', va='center', transform=self.ax.transAxes)
+            self.canvas.draw()
+            return
+
+        cycle = self.cycles[self.current_cycle_idx]
+        emg = cycle['emg']
+        gt = cycle['gt']
+        close_start_idx = cycle['close_start_idx']
+        open_start_idx = cycle['open_start_idx']
+
+        n_samples = emg.shape[1]
+        time_axis = np.arange(n_samples) / config.FSAMP
+
+        # Get selected channel's EMG
+        channel = min(self.current_channel, emg.shape[0] - 1)
+        emg_signal = emg[channel, :]
+        max_val = np.max(np.abs(emg_signal)) if np.max(np.abs(emg_signal)) > 0 else 1
+
+        # Plot GT as background shading
+        gt_scaled = gt * max_val * 0.95
+        self.ax.fill_between(time_axis, -gt_scaled, gt_scaled,
+                            alpha=0.15, color='orange', label='GT=1 (Closed)')
+
+        # Mark key transitions with vertical lines
+        close_time = close_start_idx / config.FSAMP
+        open_time = open_start_idx / config.FSAMP
+
+        self.ax.axvline(close_time, color='red', linestyle='--', linewidth=2,
+                       alpha=0.8, label=f'Close starts ({close_time:.2f}s)')
+        self.ax.axvline(open_time, color='blue', linestyle='--', linewidth=2,
+                       alpha=0.8, label=f'Open starts ({open_time:.2f}s)')
+
+        # Plot EMG signal
+        self.ax.plot(time_axis, emg_signal, 'k-', linewidth=0.5, alpha=0.9)
+
+        # Plot selected CLOSED template region (orange)
+        if self.selected_closed_start is not None:
+            start_s = self.selected_closed_start / config.FSAMP
+            end_s = (self.selected_closed_start + self.template_duration_samples) / config.FSAMP
+            self.ax.axvspan(start_s, end_s, alpha=0.4, color='#FF5722', label='CLOSED template')
+            self.ax.axvline(start_s, color='#FF5722', linestyle='-', linewidth=2)
+            self.ax.axvline(end_s, color='#FF5722', linestyle='-', linewidth=2)
+
+        # Plot selected OPEN template region (blue)
+        if self.selected_open_start is not None:
+            start_s = self.selected_open_start / config.FSAMP
+            end_s = (self.selected_open_start + self.template_duration_samples) / config.FSAMP
+            self.ax.axvspan(start_s, end_s, alpha=0.4, color='#2196F3', label='OPEN template')
+            self.ax.axvline(start_s, color='#2196F3', linestyle='-', linewidth=2)
+            self.ax.axvline(end_s, color='#2196F3', linestyle='-', linewidth=2)
+
+        # Labels and formatting
+        self.ax.set_xlabel('Time (s)')
+        self.ax.set_ylabel(f'Channel {channel + 1} (µV)')
+        self.ax.set_title(f'Cycle {self.current_cycle_idx + 1}: Complete Open→Close→Open Transition')
+        self.ax.set_xlim(0, n_samples / config.FSAMP)
+        self.ax.legend(loc='upper right', fontsize=8)
+        self.ax.grid(True, alpha=0.3)
+
+        self.figure.tight_layout()
+        self.canvas.draw()
+
+        # Update info label
+        self._update_info_label()
+
+    def _update_info_label(self):
+        """Update the info label with selection status."""
+        parts = []
+        if self.selected_closed_start is not None:
+            start_s = self.selected_closed_start / config.FSAMP
+            end_s = (self.selected_closed_start + self.template_duration_samples) / config.FSAMP
+            parts.append(f"CLOSED: {start_s:.2f}s - {end_s:.2f}s")
+        if self.selected_open_start is not None:
+            start_s = self.selected_open_start / config.FSAMP
+            end_s = (self.selected_open_start + self.template_duration_samples) / config.FSAMP
+            parts.append(f"OPEN: {start_s:.2f}s - {end_s:.2f}s")
+
+        if parts:
+            self.info_label.setText("Selected: " + " | ".join(parts))
+        else:
+            self.info_label.setText("Click on the plot to select template window")
+
+    def _on_canvas_click(self, event):
+        """Handle click on canvas to select template start."""
+        if event.inaxes != self.ax:
+            return
+        if len(self.cycles) == 0 or self.current_cycle_idx >= len(self.cycles):
+            return
+        if self.selection_state == self.STATE_CYCLE_DONE:
+            return  # Already selected both
+
+        cycle = self.cycles[self.current_cycle_idx]
+        n_samples = cycle['emg'].shape[1]
+
+        click_time = event.xdata
+        if click_time is None:
+            return
+
+        click_sample = int(click_time * config.FSAMP)
+
+        # Ensure template fits within cycle
+        max_start = n_samples - self.template_duration_samples
+        if max_start < 0:
+            self.info_label.setText("Cycle too short for 1-second template!")
+            return
+
+        selected_start = max(0, min(click_sample, max_start))
+
+        if self.selection_state == self.STATE_SELECT_CLOSED:
+            self.selected_closed_start = selected_start
+            self.selection_state = self.STATE_SELECT_OPEN
+        elif self.selection_state == self.STATE_SELECT_OPEN:
+            self.selected_open_start = selected_start
+            self.selection_state = self.STATE_CYCLE_DONE
+            self.accept_button.setEnabled(True)
+
+        self._update_display()
+
+    def _go_prev(self):
+        if self.current_cycle_idx > 0:
+            self.current_cycle_idx -= 1
+            self._reset_selection()
+
+    def _go_next(self):
+        if self.current_cycle_idx < len(self.cycles) - 1:
+            self.current_cycle_idx += 1
+            self._reset_selection()
+
+    def _accept_templates(self):
+        """Accept both selected templates and move to next cycle."""
+        if self.selected_closed_start is None or self.selected_open_start is None:
+            return
+        if self.current_cycle_idx >= len(self.cycles):
+            return
+
+        cycle = self.cycles[self.current_cycle_idx]
+        emg = cycle['emg']
+
+        # Extract CLOSED template
+        closed_start = self.selected_closed_start
+        closed_end = closed_start + self.template_duration_samples
+        closed_template = emg[:, closed_start:closed_end]
+        self.accepted_closed_templates.append(closed_template)
+
+        # Extract OPEN template
+        open_start = self.selected_open_start
+        open_end = open_start + self.template_duration_samples
+        open_template = emg[:, open_start:open_end]
+        self.accepted_open_templates.append(open_template)
+
+        # Emit signal
+        self.templates_accepted.emit(closed_template, open_template)
+
+        # Move to next cycle
+        if self.current_cycle_idx < len(self.cycles) - 1:
+            self.current_cycle_idx += 1
+            self._reset_selection()
+        else:
+            self.info_label.setText("All cycles reviewed!")
+            self._update_display()
+
+    def get_accepted_templates(self) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """Return (closed_templates, open_templates)."""
+        return self.accepted_closed_templates, self.accepted_open_templates
+
+
 class GuidedRecordingReviewDialog(QDialog):
     """
     Dialog for reviewing and extracting templates from guided recordings.
-    Shows both OPEN and CLOSED activations side by side for manual selection.
-    Supports multiple recordings.
+    Shows complete cycles one at a time for unified template selection.
     """
 
     def __init__(self, recordings: List[dict], template_manager: TemplateManager, parent=None):
         super().__init__(parent)
-        # Support both single recording (dict) and list of recordings
         if isinstance(recordings, dict):
             self.recordings = [recordings]
         else:
@@ -340,7 +708,7 @@ class GuidedRecordingReviewDialog(QDialog):
 
         n_recordings = len(self.recordings)
         self.setWindowTitle(f"Review & Extract Templates ({n_recordings} recording{'s' if n_recordings > 1 else ''})")
-        self.setMinimumSize(1200, 800)
+        self.setMinimumSize(1000, 700)
         self.setModal(True)
 
         self._setup_ui()
@@ -350,37 +718,23 @@ class GuidedRecordingReviewDialog(QDialog):
         layout = QVBoxLayout(self)
 
         # Title
-        title = QLabel("Review & Extract Templates")
+        title = QLabel("Review & Extract Templates - Cycle View")
         title.setStyleSheet("font-size: 18px; font-weight: bold;")
         title.setAlignment(Qt.AlignCenter)
         layout.addWidget(title)
 
-        info = QLabel("Click on each activation to select the 1-second window, then Accept. "
-                     "Review both CLOSED and OPEN activations.")
+        info = QLabel(
+            "Each cycle shows: HOLD OPEN → CLOSING → HOLD CLOSED → OPENING → OPEN\n"
+            "Select a 1-second CLOSED template, then a 1-second OPEN template for each cycle."
+        )
         info.setStyleSheet("color: #666;")
         info.setAlignment(Qt.AlignCenter)
         layout.addWidget(info)
 
-        # Splitter for CLOSED and OPEN viewers
-        splitter = QSplitter(Qt.Vertical)
-
-        # CLOSED viewer
-        closed_group = QGroupBox("CLOSED Templates (from closing movements)")
-        closed_layout = QVBoxLayout(closed_group)
-        self.closed_viewer = ActivationReviewWidget("closed")
-        self.closed_viewer.template_accepted.connect(self._update_status)
-        closed_layout.addWidget(self.closed_viewer)
-        splitter.addWidget(closed_group)
-
-        # OPEN viewer
-        open_group = QGroupBox("OPEN Templates (from opening movements)")
-        open_layout = QVBoxLayout(open_group)
-        self.open_viewer = ActivationReviewWidget("open")
-        self.open_viewer.template_accepted.connect(self._update_status)
-        open_layout.addWidget(self.open_viewer)
-        splitter.addWidget(open_group)
-
-        layout.addWidget(splitter, stretch=1)
+        # Cycle viewer
+        self.cycle_viewer = CycleReviewWidget()
+        self.cycle_viewer.templates_accepted.connect(self._on_templates_accepted)
+        layout.addWidget(self.cycle_viewer, stretch=1)
 
         # Status and buttons
         status_layout = QHBoxLayout()
@@ -405,80 +759,55 @@ class GuidedRecordingReviewDialog(QDialog):
         layout.addLayout(status_layout)
 
     def _extract_and_populate(self):
-        """Extract bidirectional activations from all recordings and populate viewers."""
+        """Extract complete cycles from all recordings."""
         n_recordings = len(self.recordings)
-        print(f"\n[REVIEW] Extracting OPEN and CLOSED activations from {n_recordings} recording(s)...")
+        print(f"\n[REVIEW] Extracting complete cycles from {n_recordings} recording(s)...")
 
-        # Clear previous data
-        self.template_manager.clear_all()
-
-        # Collect all activations and GT signals from all recordings
-        all_closed = []
-        all_closed_gt = []
-        all_open = []
-        all_open_gt = []
+        all_cycles = []
 
         for i, recording in enumerate(self.recordings):
             print(f"  Processing recording {i+1}/{n_recordings}...")
-
-            # Extract bidirectional activations with GT
-            activations = self.template_manager.extract_activations_bidirectional(
+            cycles = self.template_manager.extract_complete_cycles(
                 recording,
-                min_duration_s=config.MIN_ACTIVATION_DURATION_S,
-                pre_context_s=0.5,  # Include 0.5s before transition to see GT change
-                max_duration_s=4.0,  # Limit to 4s max
-                return_gt=True
+                pre_close_s=1.0,  # 1 second before closing starts
+                post_open_s=1.0   # 1 second after opening starts
             )
+            all_cycles.extend(cycles)
 
-            all_closed.extend(activations["closed"])
-            all_open.extend(activations["open"])
+        self.cycle_viewer.set_cycles(all_cycles)
+        print(f"[REVIEW] Total: {len(all_cycles)} complete cycles")
+        self._update_status()
 
-            if "closed_gt" in activations:
-                all_closed_gt.extend(activations["closed_gt"])
-            if "open_gt" in activations:
-                all_open_gt.extend(activations["open_gt"])
-
-        # Populate viewers with GT signals
-        self.closed_viewer.set_activations(all_closed, all_closed_gt)
-        self.open_viewer.set_activations(all_open, all_open_gt)
-
-        print(f"[REVIEW] Total: {len(all_closed)} CLOSED, {len(all_open)} OPEN activations")
-
+    def _on_templates_accepted(self, closed_template, open_template):
+        """Called when templates are accepted from a cycle."""
         self._update_status()
 
     def _update_status(self):
-        n_closed = len(self.closed_viewer.get_accepted_templates())
-        n_open = len(self.open_viewer.get_accepted_templates())
-        self.status_label.setText(f"Ready to save: {n_closed} CLOSED, {n_open} OPEN templates")
+        closed, opened = self.cycle_viewer.get_accepted_templates()
+        self.status_label.setText(f"Ready to save: {len(closed)} CLOSED, {len(opened)} OPEN templates")
 
     def _save_templates(self):
-        closed_templates = self.closed_viewer.get_accepted_templates()
-        open_templates = self.open_viewer.get_accepted_templates()
+        closed_templates, open_templates = self.cycle_viewer.get_accepted_templates()
 
         if not closed_templates and not open_templates:
             QMessageBox.warning(
                 self, "No Templates",
-                "No templates have been accepted. Please review activations and accept templates before saving."
+                "No templates have been accepted. Please review cycles and accept templates before saving."
             )
             return
 
-        # Get label from first recording (optional)
+        # Get label from first recording
         label = self.recordings[0].get("label", "") if self.recordings else ""
 
-        # Create a single timestamped folder for both template types
         now = datetime.now()
         timestamp = now.strftime("%Y%m%d_%H%M%S")
-
-        # Get mode suffix (_mp_ for monopolar, _sd_ for single differential)
         mode_suffix = "sd" if config.ENABLE_DIFFERENTIAL_MODE else "mp"
 
-        # Folder name: always includes timestamp to prevent overwrites
         if label:
             folder_name = f"templates_{mode_suffix}_{timestamp}_{label}"
         else:
             folder_name = f"templates_{mode_suffix}_{timestamp}"
 
-        # Create the folder
         templates_base_dir = "data/templates"
         folder_path = os.path.join(templates_base_dir, folder_name)
         os.makedirs(folder_path, exist_ok=True)
@@ -525,7 +854,6 @@ class GuidedRecordingReviewDialog(QDialog):
 
         self.saved = True
 
-        # Show confirmation
         msg = f"Templates saved successfully!\n\n"
         msg += f"CLOSED templates: {len(closed_templates)}\n"
         msg += f"OPEN templates: {len(open_templates)}\n\n"
