@@ -41,18 +41,24 @@ class HandAnimationSequencer:
     """
     Controls VHI animation for guided template recording.
 
-    Manages phases: HOLD_OPEN → CLOSING → HOLD_CLOSED → OPENING
-    with smooth interpolation during transitions.
+    Manages phases with reaction time delays:
+    HOLD_OPEN → [AUDIO "Close"] → REACTION_CLOSE → CLOSING → HOLD_CLOSED → [AUDIO "Open"] → REACTION_OPEN → OPENING
+
+    Audio cues play at the end of HOLD_OPEN and HOLD_CLOSED.
+    VHI movement and GT transition start after the reaction time delay.
+    GT ramps linearly during CLOSING (0→1) and OPENING (1→0).
     """
 
     # Phase definitions
     PHASE_HOLD_OPEN = "HOLD_OPEN"
+    PHASE_REACTION_CLOSE = "REACTION_CLOSE"  # After close audio cue, before movement
     PHASE_CLOSING = "CLOSING"
     PHASE_HOLD_CLOSED = "HOLD_CLOSED"
+    PHASE_REACTION_OPEN = "REACTION_OPEN"  # After open audio cue, before movement
     PHASE_OPENING = "OPENING"
 
     def __init__(self):
-        self.phases: List[Tuple[str, float, Optional[List[float]]]] = []
+        self.phases: List[Tuple[str, float]] = []
         self.current_phase_idx: int = 0
         self.phase_start_time: float = 0
         self.cycle_start_time: float = 0
@@ -61,34 +67,64 @@ class HandAnimationSequencer:
 
         # Default timings
         self.hold_open_s: float = 2.0
-        self.closing_transition_s: float = 1.0
+        self.reaction_time_s: float = 0.2  # 200ms reaction time
+        self.closing_s: float = 0.35  # Time for hand to close
         self.hold_closed_s: float = 2.0
-        self.opening_transition_s: float = 0.3  # Faster opening by default
+        self.opening_s: float = 0.35  # Time for hand to open
+
+        # Audio cue timestamps (recorded during cycle for later visualization)
+        self.close_cue_time: Optional[float] = None
+        self.open_cue_time: Optional[float] = None
 
     def setup_cycle(
         self,
         hold_open_s: float,
-        closing_transition_s: float,
+        closing_s: float,
         hold_closed_s: float,
-        opening_transition_s: float = 0.3
+        opening_s: float,
+        reaction_time_s: float = 0.2
     ):
-        """Define one open→close→open cycle with specified timings."""
-        self.hold_open_s = hold_open_s
-        self.closing_transition_s = closing_transition_s
-        self.hold_closed_s = hold_closed_s
-        self.opening_transition_s = opening_transition_s
+        """
+        Define one open→close→open cycle with specified timings.
 
-        # Open joints = 0, Closed joints = 1
+        Args:
+            hold_open_s: Time before close audio cue (hand stays open)
+            closing_s: Duration for hand to close (VHI movement + GT ramp)
+            hold_closed_s: Time before open audio cue (hand stays closed)
+            opening_s: Duration for hand to open (VHI movement + GT ramp)
+            reaction_time_s: Delay between audio cue and movement start
+        """
+        self.hold_open_s = hold_open_s
+        self.reaction_time_s = reaction_time_s
+        self.closing_s = closing_s
+        self.hold_closed_s = hold_closed_s
+        self.opening_s = opening_s
+
+        # Phase sequence with durations
         self.phases = [
-            (self.PHASE_HOLD_OPEN, hold_open_s, [0.0] * 10),
-            (self.PHASE_CLOSING, closing_transition_s, None),  # Interpolate 0→1
-            (self.PHASE_HOLD_CLOSED, hold_closed_s, [1.0] * 10),
-            (self.PHASE_OPENING, opening_transition_s, None),  # Interpolate 1→0 (faster)
+            (self.PHASE_HOLD_OPEN, hold_open_s),
+            (self.PHASE_REACTION_CLOSE, reaction_time_s),
+            (self.PHASE_CLOSING, closing_s),
+            (self.PHASE_HOLD_CLOSED, hold_closed_s),
+            (self.PHASE_REACTION_OPEN, reaction_time_s),
+            (self.PHASE_OPENING, opening_s),
         ]
+
+        # Reset audio cue times
+        self.close_cue_time = None
+        self.open_cue_time = None
 
     def get_total_cycle_duration(self) -> float:
         """Get total duration of one cycle in seconds."""
-        return self.hold_open_s + self.closing_transition_s + self.hold_closed_s + self.opening_transition_s
+        return sum(duration for _, duration in self.phases)
+
+    def get_close_cue_time_in_cycle(self) -> float:
+        """Get time within cycle when close audio cue should play."""
+        return self.hold_open_s
+
+    def get_open_cue_time_in_cycle(self) -> float:
+        """Get time within cycle when open audio cue should play."""
+        return self.hold_open_s + self.reaction_time_s + self.closing_s + self.hold_closed_s
 
     def start_cycle(self):
         """Begin a new animation cycle."""
@@ -97,12 +133,22 @@ class HandAnimationSequencer:
         self.phase_start_time = time.time()
         self.is_running = True
         self._previous_phase = None
+        self.close_cue_time = None
+        self.open_cue_time = None
 
     def stop(self):
         """Stop the animation."""
         self.is_running = False
 
-    def get_current_state(self, current_time: float) -> Tuple[List[float], int, str, bool]:
+    def record_close_cue_time(self, timestamp: float):
+        """Record when close audio cue was played."""
+        self.close_cue_time = timestamp
+
+    def record_open_cue_time(self, timestamp: float):
+        """Record when open audio cue was played."""
+        self.open_cue_time = timestamp
+
+    def get_current_state(self, current_time: float) -> Tuple[List[float], float, str, bool]:
         """
         Get current animation state.
 
@@ -112,18 +158,18 @@ class HandAnimationSequencer:
         Returns:
             Tuple of (joints[10], gt_value, phase_name, phase_changed)
             - joints: 10 joint values (0.0 = open, 1.0 = closed)
-            - gt_value: Ground truth (0 = open state, 1 = closed state)
+            - gt_value: Ground truth (0.0-1.0, with linear ramps during transitions)
             - phase_name: Current phase name
             - phase_changed: True if phase just changed
         """
         if not self.is_running or not self.phases:
-            return [0.0] * 10, 0, "IDLE", False
+            return [0.0] * 10, 0.0, "IDLE", False
 
         elapsed_in_cycle = current_time - self.cycle_start_time
 
         # Find current phase based on elapsed time
         cumulative_time = 0.0
-        for idx, (phase_name, duration, target_joints) in enumerate(self.phases):
+        for idx, (phase_name, duration) in enumerate(self.phases):
             if elapsed_in_cycle < cumulative_time + duration:
                 self.current_phase_idx = idx
                 time_in_phase = elapsed_in_cycle - cumulative_time
@@ -133,16 +179,8 @@ class HandAnimationSequencer:
                 phase_changed = (self._previous_phase != phase_name)
                 self._previous_phase = phase_name
 
-                # Calculate joint positions
-                joints = self._interpolate_joints(phase_name, progress)
-
-                # Determine GT value
-                # GT=1 during CLOSING and HOLD_CLOSED (hand is closing/closed)
-                # GT=0 during HOLD_OPEN and OPENING (hand is opening/open)
-                if phase_name in [self.PHASE_CLOSING, self.PHASE_HOLD_CLOSED]:
-                    gt_value = 1
-                else:
-                    gt_value = 0
+                # Calculate joint positions and GT value based on phase
+                joints, gt_value = self._get_phase_state(phase_name, progress)
 
                 return joints, gt_value, phase_name, phase_changed
 
@@ -150,35 +188,45 @@ class HandAnimationSequencer:
 
         # Cycle complete
         self.is_running = False
-        return [0.0] * 10, 0, "CYCLE_COMPLETE", True
+        return [0.0] * 10, 0.0, "CYCLE_COMPLETE", True
 
-    def _interpolate_joints(self, phase_name: str, progress: float) -> List[float]:
-        """Interpolate joint positions for smooth transitions."""
-        # Use smooth easing function (ease in-out)
-        smooth_progress = self._ease_in_out(progress)
+    def _get_phase_state(self, phase_name: str, progress: float) -> Tuple[List[float], float]:
+        """
+        Get joint positions and GT value for a given phase.
 
+        Returns:
+            Tuple of (joints[10], gt_value)
+        """
         if phase_name == self.PHASE_HOLD_OPEN:
-            return [0.0] * 10
-        elif phase_name == self.PHASE_CLOSING:
-            # Interpolate from 0 to 1
-            value = smooth_progress
-            return [value] * 10
-        elif phase_name == self.PHASE_HOLD_CLOSED:
-            return [1.0] * 10
-        elif phase_name == self.PHASE_OPENING:
-            # Interpolate from 1 to 0
-            value = 1.0 - smooth_progress
-            return [value] * 10
-        else:
-            return [0.0] * 10
+            # Hand open, GT = 0
+            return [0.0] * 10, 0.0
 
-    @staticmethod
-    def _ease_in_out(t: float) -> float:
-        """Smooth ease-in-out function for natural animation."""
-        if t < 0.5:
-            return 2 * t * t
+        elif phase_name == self.PHASE_REACTION_CLOSE:
+            # After close cue, waiting for reaction time
+            # Hand still open, GT still 0
+            return [0.0] * 10, 0.0
+
+        elif phase_name == self.PHASE_CLOSING:
+            # Hand closing, GT ramps 0 → 1 linearly
+            value = progress  # Linear 0 to 1
+            return [value] * 10, value
+
+        elif phase_name == self.PHASE_HOLD_CLOSED:
+            # Hand closed, GT = 1
+            return [1.0] * 10, 1.0
+
+        elif phase_name == self.PHASE_REACTION_OPEN:
+            # After open cue, waiting for reaction time
+            # Hand still closed, GT still 1
+            return [1.0] * 10, 1.0
+
+        elif phase_name == self.PHASE_OPENING:
+            # Hand opening, GT ramps 1 → 0 linearly
+            value = 1.0 - progress  # Linear 1 to 0
+            return [value] * 10, value
+
         else:
-            return 1 - pow(-2 * t + 2, 2) / 2
+            return [0.0] * 10, 0.0
 
     def is_cycle_complete(self) -> bool:
         """Check if current cycle has finished."""
@@ -195,13 +243,28 @@ class HandAnimationSequencer:
         elapsed_in_cycle = current_time - self.cycle_start_time
         cumulative_time = 0.0
 
-        for phase_name, duration, _ in self.phases:
+        for phase_name, duration in self.phases:
             if elapsed_in_cycle < cumulative_time + duration:
                 time_in_phase = elapsed_in_cycle - cumulative_time
                 return duration - time_in_phase
             cumulative_time += duration
 
         return 0.0
+
+    def should_play_close_cue(self, current_time: float) -> bool:
+        """Check if close audio cue should play now."""
+        if not self.is_running or self.close_cue_time is not None:
+            return False
+        elapsed = current_time - self.cycle_start_time
+        return elapsed >= self.hold_open_s and elapsed < self.hold_open_s + 0.05
+
+    def should_play_open_cue(self, current_time: float) -> bool:
+        """Check if open audio cue should play now."""
+        if not self.is_running or self.open_cue_time is not None:
+            return False
+        elapsed = current_time - self.cycle_start_time
+        open_cue_time = self.get_open_cue_time_in_cycle()
+        return elapsed >= open_cue_time and elapsed < open_cue_time + 0.05
 
 
 class AudioCueManager:
@@ -226,7 +289,14 @@ class AudioCueManager:
             print("[AUDIO] winsound not available, using print fallback")
 
     def play(self, cue_name: str):
-        """Play an audio cue."""
+        """
+        Play an audio cue.
+
+        Cue names:
+        - CLOSE_CUE: Signal to start closing (low pitch)
+        - OPEN_CUE: Signal to start opening (high pitch)
+        - CYCLE_COMPLETE: Success chime at end of cycle
+        """
         if not self.enabled:
             return
 
@@ -237,18 +307,12 @@ class AudioCueManager:
 
         if self._has_audio:
             try:
-                if cue_name == "CLOSING":
-                    # Low-pitched beep for closing
-                    self._winsound.Beep(400, 200)
-                elif cue_name == "OPENING":
-                    # High-pitched beep for opening
-                    self._winsound.Beep(800, 200)
-                elif cue_name == "HOLD_OPEN":
-                    # Short beep for hold start
-                    self._winsound.Beep(600, 100)
-                elif cue_name == "HOLD_CLOSED":
-                    # Short beep for hold start
-                    self._winsound.Beep(500, 100)
+                if cue_name == "CLOSE_CUE":
+                    # Low-pitched beep for "start closing"
+                    self._winsound.Beep(400, 300)
+                elif cue_name == "OPEN_CUE":
+                    # High-pitched beep for "start opening"
+                    self._winsound.Beep(800, 300)
                 elif cue_name == "CYCLE_COMPLETE":
                     # Success chime
                     self._winsound.Beep(600, 100)
@@ -586,47 +650,61 @@ class GuidedRecordProtocol(QObject):
         timing_group = QGroupBox("Timing Configuration")
         timing_layout = QGridLayout(timing_group)
 
-        # Hold Open duration
+        # Hold Open duration (time before close audio cue)
         timing_layout.addWidget(QLabel("Hold Open:"), 0, 0)
         self.hold_open_spinbox = QDoubleSpinBox()
         self.hold_open_spinbox.setRange(0.5, 10.0)
         self.hold_open_spinbox.setSingleStep(0.5)
         self.hold_open_spinbox.setValue(2.0)
         self.hold_open_spinbox.setSuffix(" s")
+        self.hold_open_spinbox.setToolTip("Time before 'Close' audio cue plays")
         timing_layout.addWidget(self.hold_open_spinbox, 0, 1)
 
-        # Closing transition duration
+        # Closing transition duration (VHI hand closing time)
         timing_layout.addWidget(QLabel("Closing:"), 1, 0)
         self.closing_transition_spinbox = QDoubleSpinBox()
-        self.closing_transition_spinbox.setRange(0.2, 5.0)
-        self.closing_transition_spinbox.setSingleStep(0.1)
-        self.closing_transition_spinbox.setValue(1.0)
+        self.closing_transition_spinbox.setRange(0.1, 2.0)
+        self.closing_transition_spinbox.setSingleStep(0.05)
+        self.closing_transition_spinbox.setValue(0.35)  # 350ms for onset capture
         self.closing_transition_spinbox.setSuffix(" s")
+        self.closing_transition_spinbox.setToolTip("Duration for VHI hand to close (GT ramps 0→1)")
         timing_layout.addWidget(self.closing_transition_spinbox, 1, 1)
 
-        # Hold Closed duration
+        # Hold Closed duration (time before open audio cue)
         timing_layout.addWidget(QLabel("Hold Closed:"), 2, 0)
         self.hold_closed_spinbox = QDoubleSpinBox()
         self.hold_closed_spinbox.setRange(0.5, 10.0)
         self.hold_closed_spinbox.setSingleStep(0.5)
         self.hold_closed_spinbox.setValue(2.0)
         self.hold_closed_spinbox.setSuffix(" s")
+        self.hold_closed_spinbox.setToolTip("Time before 'Open' audio cue plays")
         timing_layout.addWidget(self.hold_closed_spinbox, 2, 1)
 
-        # Opening transition duration (faster by default)
+        # Opening transition duration (VHI hand opening time)
         timing_layout.addWidget(QLabel("Opening:"), 3, 0)
         self.opening_transition_spinbox = QDoubleSpinBox()
-        self.opening_transition_spinbox.setRange(0.1, 5.0)
-        self.opening_transition_spinbox.setSingleStep(0.1)
-        self.opening_transition_spinbox.setValue(0.3)  # Fast opening
+        self.opening_transition_spinbox.setRange(0.1, 2.0)
+        self.opening_transition_spinbox.setSingleStep(0.05)
+        self.opening_transition_spinbox.setValue(0.35)  # 350ms for onset capture
         self.opening_transition_spinbox.setSuffix(" s")
+        self.opening_transition_spinbox.setToolTip("Duration for VHI hand to open (GT ramps 1→0)")
         timing_layout.addWidget(self.opening_transition_spinbox, 3, 1)
 
+        # Reaction time (delay between audio cue and VHI movement)
+        timing_layout.addWidget(QLabel("Reaction Time:"), 4, 0)
+        self.reaction_time_combo = QComboBox()
+        self.reaction_time_combo.addItems([
+            "100 ms", "150 ms", "200 ms", "250 ms", "300 ms", "350 ms", "400 ms"
+        ])
+        self.reaction_time_combo.setCurrentText("200 ms")  # Default 200ms
+        self.reaction_time_combo.setToolTip("Delay between audio cue and VHI hand movement start")
+        timing_layout.addWidget(self.reaction_time_combo, 4, 1)
+
         # Audio cues checkbox
-        self.audio_checkbox = QCheckBox("Audio cues enabled")
+        self.audio_checkbox = QCheckBox("Audio cues enabled (Close / Open)")
         self.audio_checkbox.setChecked(True)
         self.audio_checkbox.toggled.connect(self._on_audio_toggled)
-        timing_layout.addWidget(self.audio_checkbox, 4, 0, 1, 2)
+        timing_layout.addWidget(self.audio_checkbox, 5, 0, 1, 2)
 
         # Add timing group to recording layout
         recording_layout.addWidget(timing_group)
@@ -816,9 +894,10 @@ class GuidedRecordProtocol(QObject):
         # Setup sequencer with current timing settings
         self.sequencer.setup_cycle(
             hold_open_s=self.hold_open_spinbox.value(),
-            closing_transition_s=self.closing_transition_spinbox.value(),
+            closing_s=self.closing_transition_spinbox.value(),
             hold_closed_s=self.hold_closed_spinbox.value(),
-            opening_transition_s=self.opening_transition_spinbox.value()
+            opening_s=self.opening_transition_spinbox.value(),
+            reaction_time_s=self._get_reaction_time_s()
         )
 
         # Reset state
@@ -900,10 +979,14 @@ class GuidedRecordProtocol(QObject):
         # Send open hand to VHI
         self._send_joints_to_vhi([0.0] * 10)
 
-        # Extract activations and switch to review view
-        if self.last_recording is not None:
-            self._populate_review_ui()
-            self._switch_to_review_view()
+        # Note: Template extraction is done in the separate "Bidirectional Training" tab
+        # Recording saved - user can now load it in the training protocol
+
+    def _get_reaction_time_s(self) -> float:
+        """Get reaction time in seconds from the combo box."""
+        text = self.reaction_time_combo.currentText()  # e.g., "200 ms"
+        ms_value = int(text.split()[0])  # Extract number
+        return ms_value / 1000.0
 
     def _on_start_next_cycle(self):
         """Start the next animation cycle."""
@@ -913,9 +996,10 @@ class GuidedRecordProtocol(QObject):
         # Update sequencer timings in case they changed
         self.sequencer.setup_cycle(
             hold_open_s=self.hold_open_spinbox.value(),
-            closing_transition_s=self.closing_transition_spinbox.value(),
+            closing_s=self.closing_transition_spinbox.value(),
             hold_closed_s=self.hold_closed_spinbox.value(),
-            opening_transition_s=self.opening_transition_spinbox.value()
+            opening_s=self.opening_transition_spinbox.value(),
+            reaction_time_s=self._get_reaction_time_s()
         )
 
         # Start new cycle
@@ -924,11 +1008,20 @@ class GuidedRecordProtocol(QObject):
         self.is_cycle_running = True
         self.waiting_for_next_cycle = False
 
-        # Record cycle boundary
+        # Record cycle boundary with timing config
         self.cycle_boundaries.append({
             "start_time": self.cycle_start_time,
             "end_time": None,
-            "cycle_number": self.cycles_completed + 1
+            "cycle_number": self.cycles_completed + 1,
+            "close_cue_time": None,  # Will be filled when cue plays
+            "open_cue_time": None,   # Will be filled when cue plays
+            "timing_config": {
+                "hold_open_s": self.hold_open_spinbox.value(),
+                "closing_s": self.closing_transition_spinbox.value(),
+                "hold_closed_s": self.hold_closed_spinbox.value(),
+                "opening_s": self.opening_transition_spinbox.value(),
+                "reaction_time_s": self._get_reaction_time_s(),
+            }
         })
 
         # Update UI
@@ -951,13 +1044,28 @@ class GuidedRecordProtocol(QObject):
             # Send joints to VHI
             self._send_joints_to_vhi(joints)
 
-            # Record GT
+            # Record GT (now a float 0.0-1.0 with linear transitions)
             self.gt_buffer.append((current_time, gt_value))
 
-            # Handle phase change
+            # Handle phase change - play audio cues at the right moments
             if phase_changed:
+                if phase_name == self.sequencer.PHASE_REACTION_CLOSE:
+                    # Play CLOSE audio cue and record timestamp
+                    self.audio_manager.play("CLOSE_CUE")
+                    self.sequencer.record_close_cue_time(current_time)
+                    if self.cycle_boundaries:
+                        self.cycle_boundaries[-1]["close_cue_time"] = current_time
+                    print(f"[GUIDED] AUDIO: Close cue played")
+
+                elif phase_name == self.sequencer.PHASE_REACTION_OPEN:
+                    # Play OPEN audio cue and record timestamp
+                    self.audio_manager.play("OPEN_CUE")
+                    self.sequencer.record_open_cue_time(current_time)
+                    if self.cycle_boundaries:
+                        self.cycle_boundaries[-1]["open_cue_time"] = current_time
+                    print(f"[GUIDED] AUDIO: Open cue played")
+
                 if phase_name != "CYCLE_COMPLETE":
-                    self.audio_manager.play(phase_name)
                     print(f"[GUIDED] Phase: {phase_name}")
 
             # Update UI
@@ -971,7 +1079,7 @@ class GuidedRecordProtocol(QObject):
             # Keep VHI at open position while waiting
             self._send_joints_to_vhi([0.0] * 10)
             # Still record GT=0 while waiting
-            self.gt_buffer.append((current_time, 0))
+            self.gt_buffer.append((current_time, 0.0))
 
     def _on_cycle_complete(self):
         """Handle cycle completion."""
@@ -1000,14 +1108,27 @@ class GuidedRecordProtocol(QObject):
 
     def _update_phase_ui(self, phase_name: str, current_time: float):
         """Update UI to show current phase."""
-        self.phase_label.setText(f"Phase: {phase_name}")
+        # User-friendly phase names
+        display_names = {
+            "HOLD_OPEN": "Hold Open (waiting for close cue)",
+            "REACTION_CLOSE": "Reaction Time (close cue played)",
+            "CLOSING": "Closing (VHI hand closing)",
+            "HOLD_CLOSED": "Hold Closed (waiting for open cue)",
+            "REACTION_OPEN": "Reaction Time (open cue played)",
+            "OPENING": "Opening (VHI hand opening)",
+        }
+        display_name = display_names.get(phase_name, phase_name)
+        self.phase_label.setText(f"Phase: {display_name}")
 
         # Calculate progress within current phase
         time_remaining = self.sequencer.get_time_remaining_in_phase(current_time)
+        reaction_time = self._get_reaction_time_s()
         phase_durations = {
             "HOLD_OPEN": self.hold_open_spinbox.value(),
+            "REACTION_CLOSE": reaction_time,
             "CLOSING": self.closing_transition_spinbox.value(),
             "HOLD_CLOSED": self.hold_closed_spinbox.value(),
+            "REACTION_OPEN": reaction_time,
             "OPENING": self.opening_transition_spinbox.value(),
         }
         phase_duration = phase_durations.get(phase_name, 1.0)
@@ -1037,6 +1158,7 @@ class GuidedRecordProtocol(QObject):
         self.closing_transition_spinbox.setEnabled(enabled)
         self.hold_closed_spinbox.setEnabled(enabled)
         self.opening_transition_spinbox.setEnabled(enabled)
+        self.reaction_time_combo.setEnabled(enabled)
 
     def _save_recording(self) -> Optional[str]:
         """Save the recording to file."""
@@ -1066,16 +1188,17 @@ class GuidedRecordProtocol(QObject):
         save_dict = {
             "emg": emg_signal,
             "gt": gt_signal,
-            "gt_raw": self.gt_buffer,  # Raw (timestamp, value) pairs
+            "gt_raw": self.gt_buffer,  # Raw (timestamp, gt_value) pairs - gt_value is float 0.0-1.0
             "timings_emg": emg_timestamps,
             "gt_mode": "guided_animation",
             "animation_config": {
                 "hold_open_s": self.hold_open_spinbox.value(),
-                "closing_transition_s": self.closing_transition_spinbox.value(),
+                "closing_s": self.closing_transition_spinbox.value(),
                 "hold_closed_s": self.hold_closed_spinbox.value(),
-                "opening_transition_s": self.opening_transition_spinbox.value(),
+                "opening_s": self.opening_transition_spinbox.value(),
+                "reaction_time_s": self._get_reaction_time_s(),
             },
-            "cycles": self.cycle_boundaries,
+            "cycles": self.cycle_boundaries,  # Includes close_cue_time and open_cue_time per cycle
             "cycles_completed": self.cycles_completed,
             "label": label,
             "task": "guided_open_close",
@@ -1205,12 +1328,13 @@ class GuidedRecordProtocol(QObject):
         Build GT signal at EMG sample rate from recorded GT buffer.
 
         The GT buffer contains (timestamp, gt_value) pairs at ~30Hz.
-        This interpolates to EMG rate (2000Hz).
+        GT values are floats (0.0-1.0) with linear ramps during transitions.
+        This uses linear interpolation to upsample to EMG rate (2000Hz).
         """
         if not self.gt_buffer or not self.emg_buffer:
             return np.zeros(n_emg_samples)
 
-        gt_signal = np.zeros(n_emg_samples)
+        gt_signal = np.zeros(n_emg_samples, dtype=np.float32)
 
         # Get EMG time range
         emg_start_time = self.emg_buffer[0][0]
@@ -1220,24 +1344,14 @@ class GuidedRecordProtocol(QObject):
         if emg_duration <= 0:
             return gt_signal
 
-        # Convert GT timestamps to sample indices and fill
-        current_gt = 0
-        last_sample_idx = 0
+        # Convert GT buffer to arrays for interpolation
+        gt_times = np.array([t for t, _ in self.gt_buffer])
+        gt_values = np.array([v for _, v in self.gt_buffer], dtype=np.float32)
 
-        for gt_time, gt_value in self.gt_buffer:
-            # Calculate sample index
-            relative_time = gt_time - emg_start_time
-            sample_idx = int((relative_time / emg_duration) * n_emg_samples)
-            sample_idx = max(0, min(sample_idx, n_emg_samples - 1))
+        # Create EMG time axis
+        emg_times = np.linspace(emg_start_time, emg_end_time, n_emg_samples)
 
-            # Fill from last sample to current with previous GT value
-            if sample_idx > last_sample_idx:
-                gt_signal[last_sample_idx:sample_idx] = current_gt
-
-            current_gt = gt_value
-            last_sample_idx = sample_idx
-
-        # Fill remaining with final GT value
-        gt_signal[last_sample_idx:] = current_gt
+        # Linearly interpolate GT values to EMG sample rate
+        gt_signal = np.interp(emg_times, gt_times, gt_values)
 
         return gt_signal
