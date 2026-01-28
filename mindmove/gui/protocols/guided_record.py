@@ -16,7 +16,8 @@ from PySide6.QtCore import QObject, QTimer, Signal, Qt
 from PySide6.QtWidgets import (
     QWidget, QGroupBox, QVBoxLayout, QHBoxLayout, QGridLayout,
     QPushButton, QLabel, QDoubleSpinBox, QCheckBox, QProgressBar,
-    QFrame, QStackedWidget, QScrollArea, QSplitter, QMessageBox
+    QFrame, QStackedWidget, QScrollArea, QSplitter, QMessageBox,
+    QComboBox
 )
 import time
 import numpy as np
