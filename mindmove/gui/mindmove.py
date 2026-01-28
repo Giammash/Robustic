@@ -4,6 +4,7 @@ from PySide6.QtGui import QCloseEvent
 from PySide6.QtWidgets import QMainWindow, QCheckBox
 from mindmove.gui.protocol import Protocol
 from mindmove.gui.ui_compiled.main_window import Ui_MindMove
+from mindmove.config import config
 import numpy as np
 import time
 from mindmove.gui.virtual_hand_interface import VirtualHandInterface
@@ -19,6 +20,10 @@ class MindMove(QMainWindow):
 
         self.ui = Ui_MindMove()
         self.ui.setupUi(self)
+
+        # Set column stretch factors for 30/70 layout (controls / plot)
+        self.ui.gridLayout.setColumnStretch(0, 3)  # Tab widget (controls) - 30%
+        self.ui.gridLayout.setColumnStretch(1, 7)  # Plot widget - 70%
 
         # Tab Widget
         self.tab_widget = self.ui.mindMoveTabWidget
@@ -37,6 +42,7 @@ class MindMove(QMainWindow):
         # Device Setup
         self.device: MuoviWidget = self.ui.muoviWidget
         self.device.ready_read_signal.connect(self.update)
+        self.device.differential_mode_changed.connect(self._on_differential_mode_changed)
 
         # Procotol Setup
         self.protocol: Protocol = Protocol(self)
@@ -55,7 +61,7 @@ class MindMove(QMainWindow):
 
     def _prepare_plot(self):
         sampling_frequency = 2000
-        lines = 32
+        lines = 16 if config.ENABLE_DIFFERENTIAL_MODE else 32
         if sampling_frequency and lines:
             self.plot.refresh_plot()
             self.plot.configure_lines_plot(
@@ -63,6 +69,10 @@ class MindMove(QMainWindow):
                 fs=sampling_frequency,
                 lines=lines,
             )
+
+    def _on_differential_mode_changed(self, is_differential: bool) -> None:
+        """Reconfigure plot when differential mode changes."""
+        self._prepare_plot()
 
     def closeEvent(self, event: QCloseEvent) -> None:
         self.device.closeEvent(event)

@@ -7,6 +7,7 @@ import numpy as np
 import pickle
 import os
 from datetime import datetime
+from mindmove.config import config
 
 if TYPE_CHECKING:
     from mindmove.gui.mindmove import MindMove
@@ -295,6 +296,10 @@ class RecordProtocol(QObject):
             np.hstack([data for _, data in self.emg_buffer])
         )[:, : self.emg_recording_time]
 
+        # Get mode suffix from device
+        mode_suffix = self.main_window.device.get_mode_suffix()
+        differential_mode = config.ENABLE_DIFFERENTIAL_MODE
+
         # Build save dict based on GT mode
         if self.gt_mode == "virtual_hand":
             save_pickle_dict = {
@@ -307,6 +312,7 @@ class RecordProtocol(QObject):
                 "label": label,
                 "task": self.current_task,
                 "gt_mode": "virtual_hand",
+                "differential_mode": differential_mode,
             }
         else:
             # Keyboard mode: save GT signal directly
@@ -319,11 +325,12 @@ class RecordProtocol(QObject):
                 "label": label,
                 "task": self.current_task,
                 "gt_mode": "keyboard",
+                "differential_mode": differential_mode,
             }
 
         now = datetime.now()
         formatted_now = now.strftime("%Y%m%d_%H%M%S%f")
-        file_name = f"MindMove_Recording_{formatted_now}_{self.current_task.lower()}_{label.lower()}.pkl"
+        file_name = f"MindMove_Recording{mode_suffix}{formatted_now}_{self.current_task.lower()}_{label.lower()}.pkl"
 
         if not os.path.exists(self.recording_dir_path):
             os.makedirs(self.recording_dir_path)

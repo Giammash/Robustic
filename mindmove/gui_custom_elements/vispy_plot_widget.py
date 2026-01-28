@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QWidget, QSizePolicy
 from vispy import scene
-from vispy.scene.visuals import Axis
+from vispy.scene.visuals import Axis, Text
 from vispy.scene import Line
 import numpy as np
 from vispy import gloo
@@ -41,6 +41,7 @@ class VispyPlotWidget(QWidget):
         self.sampling_frequency = None
         self.fread = None
         self.frame_len = None
+        self.channel_labels = []  # List to store channel number labels
 
         self.scene = scene.SceneCanvas(
             parent=self, bgcolor="gray", resizable=True, show=True
@@ -73,7 +74,7 @@ class VispyPlotWidget(QWidget):
         self.define_connect()
 
         self.camera.set_range(
-            x=[-0.01, self.plot_data[-1, 0]],
+            x=[-0.3, self.plot_data[-1, 0]],  # Extra left margin for channel labels
             y=[-0.1, 1.1],
         )
 
@@ -85,6 +86,22 @@ class VispyPlotWidget(QWidget):
             width=1,
             # method="agg",
         )
+
+        # Add channel number labels (1-indexed) on the left side of each line
+        self.channel_labels = []
+        for i in range(self.lines):
+            y_pos = i * 1 / self.lines + 0.5 / self.lines  # Center of each line's vertical range
+            label = Text(
+                text=str(i + 1),  # 1-indexed
+                pos=(-0.15, y_pos),  # Position to the left of the plot
+                color='white',
+                font_size=8,
+                anchor_x='right',
+                anchor_y='center',
+                parent=self.view.scene,
+            )
+            self.channel_labels.append(label)
+
         self.configured = True
 
     def reset_data(self):
@@ -155,6 +172,11 @@ class VispyPlotWidget(QWidget):
         self.scene.update()
 
     def refresh_plot(self):
+        # Clear existing channel labels
+        for label in self.channel_labels:
+            label.parent = None
+        self.channel_labels = []
+
         self.scene.central_widget.remove_widget(self.grid)
         self.grid = self.scene.central_widget.add_grid(spacing=0, margin=10)
 

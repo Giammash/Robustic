@@ -19,6 +19,7 @@ class MuoviWidget(QWidget):
     ready_read_signal = Signal(np.ndarray)
     device_connected_signal = Signal(bool)
     device_configured_signal = Signal(bool)
+    differential_mode_changed = Signal(bool)  # Emits True for differential, False for monopolar
 
     def __init__(self, parent=None):
         super().__init__(parent=parent)
@@ -82,6 +83,7 @@ class MuoviWidget(QWidget):
         # Signal Processing - Real-time filter
         self.rt_filter = RealTimeEMGFilter(n_channels=config.num_channels)
         self.filtering_enabled = config.ENABLE_FILTERING
+        self.differential_mode_enabled = config.ENABLE_DIFFERENTIAL_MODE
         self._current_raw_data = None  # Cache for current packet
         self._current_filtered_emg = None  # Cache for filtered result
         self._setup_signal_processing_group()
@@ -207,11 +209,41 @@ class MuoviWidget(QWidget):
         if self.filtering_enabled and emg_data.size > 0:
             emg_data = self.rt_filter.filter(emg_data)
 
+        # Apply differential transform if enabled
+        if self.differential_mode_enabled and emg_data.size > 0:
+            emg_data = self.apply_differential_transform(emg_data)
+
         # Cache the result for this packet
         if is_same_packet:
             self._current_filtered_emg = emg_data
 
         return emg_data
+
+    def apply_differential_transform(self, emg_data: np.ndarray) -> np.ndarray:
+        """
+        Compute single differential from 32 monopolar channels.
+
+        The Muovi bracelet has 2 rows of 16 electrodes:
+        - Row 1: channels 0-15 (1-16 in 1-indexed)
+        - Row 2: channels 16-31 (17-32 in 1-indexed)
+
+        Single differential is computed as the longitudinal difference:
+        diff[i] = emg[i + 16] - emg[i] for i in 0..15
+
+        Args:
+            emg_data: (32, N) monopolar EMG data
+
+        Returns:
+            (16, N) single differential EMG data
+        """
+        if emg_data.shape[0] != 32:
+            # If already 16 channels or different shape, return as-is
+            return emg_data
+
+        # Row 1: channels 0-15, Row 2: channels 16-31
+        row1 = emg_data[:16, :]   # Channels 1-16
+        row2 = emg_data[16:, :]   # Channels 17-32
+        return row2 - row1  # Longitudinal difference
 
     def extract_aux_data(self, data: np.ndarray, index: int = 0) -> np.ndarray:
         """
@@ -252,7 +284,7 @@ class MuoviWidget(QWidget):
         }
 
     def _setup_signal_processing_group(self) -> None:
-        """Create Signal Processing group box with filter toggle."""
+        """Create Signal Processing group box with filter and differential mode toggles."""
         # Create group box
         self.signal_processing_group_box = QGroupBox("Signal Processing")
         self.signal_processing_group_box.setObjectName("signalProcessingGroupBox")
@@ -269,12 +301,26 @@ class MuoviWidget(QWidget):
         # Create filter description label
         self.filter_description_label = QLabel(self.rt_filter.get_filter_description())
 
-        # Add widgets to layout
+        # Add filter widgets to layout (row 0)
         layout.addWidget(self.filter_toggle_button, 0, 0)
         layout.addWidget(self.filter_description_label, 0, 1)
 
-        # Update button appearance based on initial state
+        # Create differential mode toggle button
+        self.differential_mode_button = QPushButton("Mode: Monopolar")
+        self.differential_mode_button.setCheckable(True)
+        self.differential_mode_button.setChecked(self.differential_mode_enabled)
+        self.differential_mode_button.toggled.connect(self._on_differential_mode_toggled)
+
+        # Create differential mode description label
+        self.differential_mode_label = QLabel("32 channels")
+
+        # Add differential mode widgets to layout (row 1)
+        layout.addWidget(self.differential_mode_button, 1, 0)
+        layout.addWidget(self.differential_mode_label, 1, 1)
+
+        # Update button appearances based on initial state
         self._update_filter_button_style()
+        self._update_differential_button_style()
 
         # Add group box to main layout (after Commands group box, row 4)
         self.ui.gridLayout.addWidget(self.signal_processing_group_box, 4, 0, 1, 2)
@@ -306,3 +352,44 @@ class MuoviWidget(QWidget):
         else:
             self.filter_toggle_button.setText("Filter: OFF")
             self.filter_toggle_button.setStyleSheet("")
+
+    def _on_differential_mode_toggled(self, checked: bool) -> None:
+        """Handle differential mode toggle button state change."""
+        self.differential_mode_enabled = checked
+        config.ENABLE_DIFFERENTIAL_MODE = checked  # Update global config for consistency
+        self._update_differential_button_style()
+
+        # Reset filter state when changing modes to avoid transients
+        self.rt_filter.reset()
+        # Clear cached data
+        self._current_filtered_emg = None
+
+        if checked:
+            self.device.log_info("Mode: Single Differential (16 channels)")
+        else:
+            self.device.log_info("Mode: Monopolar (32 channels)")
+
+        # Notify listeners (e.g., plot widget) that mode changed
+        self.differential_mode_changed.emit(checked)
+
+    def _update_differential_button_style(self) -> None:
+        """Update differential mode button appearance based on state."""
+        if self.differential_mode_enabled:
+            self.differential_mode_button.setText("Mode: Differential")
+            self.differential_mode_label.setText("16 channels (row2 - row1)")
+            self.differential_mode_button.setStyleSheet(
+                "QPushButton { background-color: #2196F3; color: white; font-weight: bold; }"
+                "QPushButton:checked { background-color: #2196F3; }"
+            )
+        else:
+            self.differential_mode_button.setText("Mode: Monopolar")
+            self.differential_mode_label.setText("32 channels")
+            self.differential_mode_button.setStyleSheet("")
+
+    def get_current_channel_count(self) -> int:
+        """Return the current number of output channels based on mode."""
+        return 16 if self.differential_mode_enabled else 32
+
+    def get_mode_suffix(self) -> str:
+        """Return the mode suffix for filenames (_mp_ or _sd_)."""
+        return "_sd_" if self.differential_mode_enabled else "_mp_"

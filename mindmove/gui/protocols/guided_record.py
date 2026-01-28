@@ -573,7 +573,6 @@ class GuidedRecordProtocol(QObject):
         # Create main widget container with stacked widget for recording/review views
         self.main_widget = QWidget()
         main_layout = QVBoxLayout(self.main_widget)
-        main_layout.setContentsMargins(0, 0, 0, 0)
 
         # Stacked widget to switch between recording and review views
         self.stacked_widget = QStackedWidget()
@@ -1056,6 +1055,10 @@ class GuidedRecordProtocol(QObject):
         if not label:
             label = f"guided_{self.cycles_completed}cycles"
 
+        # Get mode suffix from device
+        mode_suffix = self.main_window.device.get_mode_suffix()
+        differential_mode = config.ENABLE_DIFFERENTIAL_MODE
+
         # Build save dictionary
         save_dict = {
             "emg": emg_signal,
@@ -1074,6 +1077,7 @@ class GuidedRecordProtocol(QObject):
             "label": label,
             "task": "guided_open_close",
             "recording_duration_s": time.time() - self.recording_start_time,
+            "differential_mode": differential_mode,
         }
 
         # Save file
@@ -1082,7 +1086,7 @@ class GuidedRecordProtocol(QObject):
 
         now = datetime.now()
         formatted_now = now.strftime("%Y%m%d_%H%M%S%f")
-        file_name = f"MindMove_GuidedRecording_{formatted_now}_{label}.pkl"
+        file_name = f"MindMove_GuidedRecording{mode_suffix}{formatted_now}_{label}.pkl"
         file_path = os.path.join(self.recording_dir_path, file_name)
 
         with open(file_path, "wb") as f:

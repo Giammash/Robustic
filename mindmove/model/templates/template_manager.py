@@ -553,10 +553,13 @@ class TemplateManager:
         Returns:
             Path where templates were saved
         """
+        # Get mode suffix (_mp_ for monopolar, _sd_ for single differential)
+        mode_suffix = "sd" if config.ENABLE_DIFFERENTIAL_MODE else "mp"
+
         if template_set_name:
-            folder_name = f"templates_{class_label}_{template_set_name}"
+            folder_name = f"templates_{mode_suffix}_{class_label}_{template_set_name}"
         else:
-            folder_name = f"templates_{class_label}"
+            folder_name = f"templates_{mode_suffix}_{class_label}"
         base_folder = os.path.join(self.templates_base_path, folder_name)
         os.makedirs(base_folder, exist_ok=True)
 
@@ -576,6 +579,7 @@ class TemplateManager:
                 "n_samples": self.templates[class_label][0].shape[1] if self.templates[class_label] else 0,
                 "fsamp": config.FSAMP,
                 "created_at": datetime.now().isoformat(),
+                "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
             }
         }
 
@@ -585,6 +589,7 @@ class TemplateManager:
         print(f"Saved {len(self.templates[class_label])} raw templates to {raw_filepath}")
         print(f"  Template duration: {self._template_duration_s}s")
         print(f"  Template type: {self.template_type}")
+        print(f"  Differential mode: {config.ENABLE_DIFFERENTIAL_MODE}")
 
         return base_folder
 
@@ -625,7 +630,10 @@ class TemplateManager:
     def extract_activations_bidirectional(
         self,
         recording: dict,
-        min_duration_s: float = 1.5
+        min_duration_s: float = 1.5,
+        pre_context_s: float = 0.5,
+        max_duration_s: float = 4.0,
+        return_gt: bool = False
     ) -> Dict[str, List[np.ndarray]]:
         """
         Extract both OPEN and CLOSED activations from the same recording.
@@ -639,10 +647,15 @@ class TemplateManager:
         Args:
             recording: Recording dict in any supported format
             min_duration_s: Minimum activation duration to keep
+            pre_context_s: Seconds of context to include before the transition
+            max_duration_s: Maximum duration for each activation segment
+            return_gt: If True, also return GT signal for each activation
 
         Returns:
             Dict with "open" and "closed" keys, each containing list of
-            EMG segments (n_channels, n_samples)
+            EMG segments (n_channels, n_samples).
+            If return_gt=True, also includes "open_gt" and "closed_gt" keys
+            with corresponding GT signals.
         """
         # Normalize recording to standard format
         normalized = self.normalize_recording(recording)
@@ -665,12 +678,16 @@ class TemplateManager:
         falling_edges = np.where(gt_diff == -1)[0]  # 1→0 = OPENING starts
 
         min_samples = int(min_duration_s * config.FSAMP)
+        pre_context_samples = int(pre_context_s * config.FSAMP)
+        max_samples = int(max_duration_s * config.FSAMP)
 
         closed_activations = []
+        closed_gt = []
         open_activations = []
+        open_gt = []
 
         # CLOSED templates: GT=1 segments after rising edge
-        # These represent the closing movement and hold-closed phase
+        # Include pre-context to show the 0→1 transition
         for rise_idx in rising_edges:
             # Find next falling edge
             next_falls = falling_edges[falling_edges > rise_idx]
@@ -679,39 +696,51 @@ class TemplateManager:
             else:
                 end_idx = len(gt_binary)
 
+            # Include pre-context and limit max duration
+            start_idx = max(0, rise_idx - pre_context_samples)
+            end_idx = min(end_idx, start_idx + max_samples)
+
             # Extract segment
-            segment = emg[:, rise_idx:end_idx]
+            segment = emg[:, start_idx:end_idx]
             if segment.shape[1] >= min_samples:
                 closed_activations.append(segment)
+                if return_gt:
+                    closed_gt.append(gt_binary[start_idx:end_idx])
 
         # OPEN templates: GT=0 segments after falling edge
-        # These represent the opening movement
-        # Note: We limit duration to avoid capturing pause/rest periods
-        # The opening movement itself is typically short (transition_s duration)
-        max_open_samples = int(2 * min_duration_s * config.FSAMP)  # Limit to 2x min duration
-
+        # Include pre-context to show the 1→0 transition
         for fall_idx in falling_edges:
             # Find next rising edge (or end of recording)
             next_rises = rising_edges[rising_edges > fall_idx]
             if len(next_rises) > 0:
-                # Limit to max duration even if next rising edge is further
-                end_idx = min(next_rises[0], fall_idx + max_open_samples)
+                end_idx = next_rises[0]
             else:
-                # Last segment - limit to reasonable duration
-                end_idx = min(fall_idx + max_open_samples, len(gt_binary))
+                end_idx = len(gt_binary)
+
+            # Include pre-context and limit max duration
+            start_idx = max(0, fall_idx - pre_context_samples)
+            end_idx = min(end_idx, start_idx + max_samples)
 
             # Extract segment
-            segment = emg[:, fall_idx:end_idx]
+            segment = emg[:, start_idx:end_idx]
             if segment.shape[1] >= min_samples:
                 open_activations.append(segment)
+                if return_gt:
+                    open_gt.append(gt_binary[start_idx:end_idx])
 
         # Store in all_activations
         self.all_activations["closed"].extend(closed_activations)
         self.all_activations["open"].extend(open_activations)
 
         print(f"[BIDIRECTIONAL] Extracted {len(closed_activations)} CLOSED, {len(open_activations)} OPEN activations")
+        print(f"  Pre-context: {pre_context_s}s, Max duration: {max_duration_s}s")
 
-        return {"open": open_activations, "closed": closed_activations}
+        result = {"open": open_activations, "closed": closed_activations}
+        if return_gt:
+            result["open_gt"] = open_gt
+            result["closed_gt"] = closed_gt
+
+        return result
 
     def extract_from_guided_recording(
         self,

@@ -20,6 +20,7 @@ class config:
 
         # Processing options
         self.ENABLE_FILTERING = True  # Default state of filter toggle in device interface
+        self.ENABLE_DIFFERENTIAL_MODE = False  # Default: monopolar (32 ch), True: single differential (16 ch)
 
         # === FILTERING CONFIGURATION ===
         # Bandpass filter settings

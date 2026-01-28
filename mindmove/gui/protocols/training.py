@@ -58,10 +58,13 @@ class ActivationReviewWidget(QWidget):
         super().__init__(parent)
         self.class_label = class_label
         self.activations: List[np.ndarray] = []
+        self.gt_signals: List[np.ndarray] = []  # GT for each activation
         self.current_index: int = 0
         self.selected_start_sample: Optional[int] = None
         self.template_duration_samples: int = int(1.0 * config.FSAMP)
         self.accepted_templates: List[np.ndarray] = []
+        self.accepted_indices: set = set()  # Track which activations have been accepted
+        self.current_channel: int = 0  # 0-indexed internally
 
         self._setup_ui()
 
@@ -69,7 +72,7 @@ class ActivationReviewWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
 
-        # Header
+        # Header with channel selector
         header_layout = QHBoxLayout()
         self.header_label = QLabel(f"{self.class_label.upper()} Activations: 0")
         self.header_label.setStyleSheet("font-weight: bold; font-size: 12px;")
@@ -78,7 +81,18 @@ class ActivationReviewWidget(QWidget):
         self.accepted_label = QLabel("Accepted: 0")
         self.accepted_label.setStyleSheet("color: green;")
         header_layout.addWidget(self.accepted_label)
+
         header_layout.addStretch()
+
+        # Channel selector (1-indexed for display)
+        header_layout.addWidget(QLabel("Channel:"))
+        self.channel_combo = QComboBox()
+        self.channel_combo.setFixedWidth(60)
+        for i in range(1, 33):  # 1-32 for user
+            self.channel_combo.addItem(str(i))
+        self.channel_combo.currentIndexChanged.connect(self._on_channel_changed)
+        header_layout.addWidget(self.channel_combo)
+
         layout.addLayout(header_layout)
 
         # Matplotlib figure
@@ -128,11 +142,19 @@ class ActivationReviewWidget(QWidget):
 
         layout.addLayout(button_layout)
 
-    def set_activations(self, activations: List[np.ndarray]):
+    def _on_channel_changed(self, index: int):
+        """Handle channel selection change."""
+        self.current_channel = index  # combo index is 0-based, matches our internal 0-indexed channel
+        self._update_display()
+
+    def set_activations(self, activations: List[np.ndarray], gt_signals: Optional[List[np.ndarray]] = None):
+        """Set activations and optionally their GT signals."""
         self.activations = activations
+        self.gt_signals = gt_signals if gt_signals else []
         self.current_index = 0
         self.selected_start_sample = None
         self.accepted_templates = []
+        self.accepted_indices = set()
         self.header_label.setText(f"{self.class_label.upper()} Activations: {len(activations)}")
         self._update_display()
 
@@ -159,9 +181,37 @@ class ActivationReviewWidget(QWidget):
         duration_s = n_samples / config.FSAMP
         time_axis = np.arange(n_samples) / config.FSAMP
 
-        # Plot mean envelope
-        envelope = np.mean(np.abs(activation), axis=0)
-        self.ax.plot(time_axis, envelope, 'b-', linewidth=0.8, alpha=0.8, label='Mean |EMG|')
+        # Get raw EMG for selected channel
+        channel = min(self.current_channel, activation.shape[0] - 1)
+        emg_signal = activation[channel, :]
+        max_val = np.max(np.abs(emg_signal)) if np.max(np.abs(emg_signal)) > 0 else 1
+
+        # Plot GT overlay if available
+        if self.current_index < len(self.gt_signals) and len(self.gt_signals[self.current_index]) > 0:
+            gt = self.gt_signals[self.current_index]
+            gt_time = np.arange(len(gt)) / config.FSAMP
+
+            # Scale GT to match EMG amplitude for visibility
+            gt_scaled = gt * max_val * 0.9
+
+            # Fill where GT=1 (orange shading) - use both positive and negative
+            self.ax.fill_between(gt_time, -gt_scaled, gt_scaled,
+                                alpha=0.2, color='orange', label='GT=1')
+
+            # Mark GT transitions with vertical lines
+            gt_diff = np.diff(gt.astype(int), prepend=int(gt[0]))
+            rising = np.where(gt_diff == 1)[0]  # 0→1 transition
+            falling = np.where(gt_diff == -1)[0]  # 1→0 transition
+
+            for idx in rising:
+                if idx < len(gt_time):
+                    self.ax.axvline(gt_time[idx], color='red', linestyle=':', linewidth=2, alpha=0.8)
+            for idx in falling:
+                if idx < len(gt_time):
+                    self.ax.axvline(gt_time[idx], color='blue', linestyle=':', linewidth=2, alpha=0.8)
+
+        # Plot raw EMG signal for selected channel
+        self.ax.plot(time_axis, emg_signal, 'b-', linewidth=0.5, alpha=0.9, label=f'EMG Ch{channel + 1}')
 
         # Mark selected region
         if self.selected_start_sample is not None:
@@ -171,13 +221,19 @@ class ActivationReviewWidget(QWidget):
             self.ax.axvline(start_s, color='green', linestyle='--', linewidth=2)
             self.ax.axvline(end_s, color='green', linestyle='--', linewidth=2)
             self.info_label.setText(f"Selected: {start_s:.2f}s - {end_s:.2f}s (click to change)")
-            self.accept_button.setEnabled(True)
+            # Only enable accept if this activation hasn't been accepted yet
+            self.accept_button.setEnabled(self.current_index not in self.accepted_indices)
         else:
             self.info_label.setText("Click on plot to select 1-second template start point")
             self.accept_button.setEnabled(False)
 
+        # Show if already accepted
+        if self.current_index in self.accepted_indices:
+            self.info_label.setText(f"Already accepted! Use Prev/Next to navigate.")
+            self.accept_button.setEnabled(False)
+
         self.ax.set_xlabel('Time (s)')
-        self.ax.set_ylabel('Amplitude')
+        self.ax.set_ylabel('Amplitude (µV)')
         self.ax.set_title(f'{self.class_label.upper()} Activation {self.current_index + 1} ({duration_s:.2f}s)')
         self.ax.set_xlim(0, duration_s)
         self.ax.legend(loc='upper right', fontsize=8)
@@ -189,6 +245,9 @@ class ActivationReviewWidget(QWidget):
         if event.inaxes != self.ax:
             return
         if len(self.activations) == 0 or self.current_index >= len(self.activations):
+            return
+        # Don't allow selection if already accepted
+        if self.current_index in self.accepted_indices:
             return
 
         activation = self.activations[self.current_index]
@@ -222,6 +281,9 @@ class ActivationReviewWidget(QWidget):
     def _accept_current(self):
         if self.selected_start_sample is None or self.current_index >= len(self.activations):
             return
+        # Prevent duplicate acceptance
+        if self.current_index in self.accepted_indices:
+            return
 
         activation = self.activations[self.current_index]
         start = self.selected_start_sample
@@ -232,8 +294,12 @@ class ActivationReviewWidget(QWidget):
 
         template = activation[:, start:end]
         self.accepted_templates.append(template)
+        self.accepted_indices.add(self.current_index)  # Mark as accepted
         self.template_accepted.emit(template)
         self.accepted_label.setText(f"Accepted: {len(self.accepted_templates)}")
+
+        # Disable accept button for this activation
+        self.accept_button.setEnabled(False)
 
         if self.current_index < len(self.activations) - 1:
             self.current_index += 1
@@ -247,9 +313,11 @@ class ActivationReviewWidget(QWidget):
 
     def clear(self):
         self.activations = []
+        self.gt_signals = []
         self.current_index = 0
         self.selected_start_sample = None
         self.accepted_templates = []
+        self.accepted_indices = set()
         self._update_display()
 
 
@@ -257,15 +325,21 @@ class GuidedRecordingReviewDialog(QDialog):
     """
     Dialog for reviewing and extracting templates from guided recordings.
     Shows both OPEN and CLOSED activations side by side for manual selection.
+    Supports multiple recordings.
     """
 
-    def __init__(self, recording: dict, template_manager: TemplateManager, parent=None):
+    def __init__(self, recordings: List[dict], template_manager: TemplateManager, parent=None):
         super().__init__(parent)
-        self.recording = recording
+        # Support both single recording (dict) and list of recordings
+        if isinstance(recordings, dict):
+            self.recordings = [recordings]
+        else:
+            self.recordings = recordings
         self.template_manager = template_manager
         self.saved = False
 
-        self.setWindowTitle("Review & Extract Templates from Guided Recording")
+        n_recordings = len(self.recordings)
+        self.setWindowTitle(f"Review & Extract Templates ({n_recordings} recording{'s' if n_recordings > 1 else ''})")
         self.setMinimumSize(1200, 800)
         self.setModal(True)
 
@@ -331,23 +405,44 @@ class GuidedRecordingReviewDialog(QDialog):
         layout.addLayout(status_layout)
 
     def _extract_and_populate(self):
-        """Extract bidirectional activations and populate viewers."""
-        print("\n[REVIEW] Extracting OPEN and CLOSED activations from guided recording...")
+        """Extract bidirectional activations from all recordings and populate viewers."""
+        n_recordings = len(self.recordings)
+        print(f"\n[REVIEW] Extracting OPEN and CLOSED activations from {n_recordings} recording(s)...")
 
         # Clear previous data
         self.template_manager.clear_all()
 
-        # Extract bidirectional activations
-        activations = self.template_manager.extract_activations_bidirectional(
-            self.recording,
-            min_duration_s=config.MIN_ACTIVATION_DURATION_S
-        )
+        # Collect all activations and GT signals from all recordings
+        all_closed = []
+        all_closed_gt = []
+        all_open = []
+        all_open_gt = []
 
-        # Populate viewers
-        self.closed_viewer.set_activations(activations["closed"])
-        self.open_viewer.set_activations(activations["open"])
+        for i, recording in enumerate(self.recordings):
+            print(f"  Processing recording {i+1}/{n_recordings}...")
 
-        print(f"[REVIEW] Found {len(activations['closed'])} CLOSED, {len(activations['open'])} OPEN activations")
+            # Extract bidirectional activations with GT
+            activations = self.template_manager.extract_activations_bidirectional(
+                recording,
+                min_duration_s=config.MIN_ACTIVATION_DURATION_S,
+                pre_context_s=0.5,  # Include 0.5s before transition to see GT change
+                max_duration_s=4.0,  # Limit to 4s max
+                return_gt=True
+            )
+
+            all_closed.extend(activations["closed"])
+            all_open.extend(activations["open"])
+
+            if "closed_gt" in activations:
+                all_closed_gt.extend(activations["closed_gt"])
+            if "open_gt" in activations:
+                all_open_gt.extend(activations["open_gt"])
+
+        # Populate viewers with GT signals
+        self.closed_viewer.set_activations(all_closed, all_closed_gt)
+        self.open_viewer.set_activations(all_open, all_open_gt)
+
+        print(f"[REVIEW] Total: {len(all_closed)} CLOSED, {len(all_open)} OPEN activations")
 
         self._update_status()
 
@@ -367,27 +462,66 @@ class GuidedRecordingReviewDialog(QDialog):
             )
             return
 
-        # Set templates in template manager
-        self.template_manager.templates["closed"] = closed_templates
-        self.template_manager.templates["open"] = open_templates
+        # Get label from first recording (optional)
+        label = self.recordings[0].get("label", "") if self.recordings else ""
 
-        # Get label from recording
-        label = self.recording.get("label", "")
-        template_set_name = label if label else None
+        # Create a single timestamped folder for both template types
+        now = datetime.now()
+        timestamp = now.strftime("%Y%m%d_%H%M%S")
 
-        saved_paths = []
+        # Get mode suffix (_mp_ for monopolar, _sd_ for single differential)
+        mode_suffix = "sd" if config.ENABLE_DIFFERENTIAL_MODE else "mp"
+
+        # Folder name: always includes timestamp to prevent overwrites
+        if label:
+            folder_name = f"templates_{mode_suffix}_{timestamp}_{label}"
+        else:
+            folder_name = f"templates_{mode_suffix}_{timestamp}"
+
+        # Create the folder
+        templates_base_dir = "data/templates"
+        folder_path = os.path.join(templates_base_dir, folder_name)
+        os.makedirs(folder_path, exist_ok=True)
+
+        saved_files = []
 
         # Save CLOSED templates
         if closed_templates:
-            path = self.template_manager.save_templates("closed", template_set_name)
-            saved_paths.append(path)
-            print(f"[REVIEW] Saved {len(closed_templates)} CLOSED templates to {path}")
+            closed_data = {
+                "templates": closed_templates,
+                "metadata": {
+                    "class_label": "closed",
+                    "n_templates": len(closed_templates),
+                    "template_duration_s": self.template_manager.template_duration_s,
+                    "created_at": now.isoformat(),
+                    "label": label,
+                    "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
+                }
+            }
+            closed_path = os.path.join(folder_path, "templates_closed.pkl")
+            with open(closed_path, "wb") as f:
+                pickle.dump(closed_data, f)
+            saved_files.append(closed_path)
+            print(f"[REVIEW] Saved {len(closed_templates)} CLOSED templates to {closed_path}")
 
         # Save OPEN templates
         if open_templates:
-            path = self.template_manager.save_templates("open", template_set_name)
-            saved_paths.append(path)
-            print(f"[REVIEW] Saved {len(open_templates)} OPEN templates to {path}")
+            open_data = {
+                "templates": open_templates,
+                "metadata": {
+                    "class_label": "open",
+                    "n_templates": len(open_templates),
+                    "template_duration_s": self.template_manager.template_duration_s,
+                    "created_at": now.isoformat(),
+                    "label": label,
+                    "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
+                }
+            }
+            open_path = os.path.join(folder_path, "templates_open.pkl")
+            with open(open_path, "wb") as f:
+                pickle.dump(open_data, f)
+            saved_files.append(open_path)
+            print(f"[REVIEW] Saved {len(open_templates)} OPEN templates to {open_path}")
 
         self.saved = True
 
@@ -395,7 +529,7 @@ class GuidedRecordingReviewDialog(QDialog):
         msg = f"Templates saved successfully!\n\n"
         msg += f"CLOSED templates: {len(closed_templates)}\n"
         msg += f"OPEN templates: {len(open_templates)}\n\n"
-        msg += "Saved to:\n" + "\n".join(saved_paths)
+        msg += f"Saved to folder:\n{folder_path}"
 
         QMessageBox.information(self, "Templates Saved", msg)
         self.accept()
@@ -1163,56 +1297,65 @@ class TrainingProtocol(QObject):
             self._select_recording_files()
 
     def _select_guided_recording(self) -> None:
-        """Select a guided recording file and open the review dialog."""
+        """Select one or more guided recording files and open the review dialog."""
         if not os.path.exists(self.recordings_dir_path):
             os.makedirs(self.recordings_dir_path)
 
         dialog = QFileDialog(self.main_window)
-        dialog.setFileMode(QFileDialog.ExistingFile)
+        dialog.setFileMode(QFileDialog.ExistingFiles)  # Allow multiple selection
         dialog.setNameFilter("Pickle files (*.pkl)")
         dialog.setDirectory(self.recordings_dir_path)
 
-        filename, _ = dialog.getOpenFileName()
+        filenames, _ = dialog.getOpenFileNames()
 
-        if not filename:
+        if not filenames:
             return
 
-        # Load and validate the recording
+        # Load and validate all recordings
+        valid_recordings = []
         try:
-            with open(filename, "rb") as f:
-                recording = pickle.load(f)
+            for filename in filenames:
+                with open(filename, "rb") as f:
+                    recording = pickle.load(f)
 
-            # Check if it's a guided recording
-            gt_mode = recording.get("gt_mode", "")
-            if gt_mode != "guided_animation":
-                # Also accept keyboard recordings with GT
-                if "emg" not in recording or "gt" not in recording:
-                    QMessageBox.warning(
-                        self.main_window,
-                        "Invalid Recording",
-                        f"Selected file is not a guided recording or doesn't have GT data.\n"
-                        f"gt_mode: {gt_mode}\n"
-                        f"Keys: {list(recording.keys())}",
-                        QMessageBox.Ok,
-                    )
-                    return
+                # Check if it's a guided recording or has GT data
+                gt_mode = recording.get("gt_mode", "")
+                if gt_mode != "guided_animation":
+                    # Also accept keyboard recordings with GT
+                    if "emg" not in recording or "gt" not in recording:
+                        print(f"[TRAINING] Skipping invalid recording: {os.path.basename(filename)}")
+                        print(f"  gt_mode: {gt_mode}, Keys: {list(recording.keys())}")
+                        continue
 
-            print(f"\n[TRAINING] Loaded guided recording: {os.path.basename(filename)}")
-            print(f"  gt_mode: {gt_mode}")
-            print(f"  EMG shape: {recording.get('emg', np.array([])).shape}")
-            if "cycles_completed" in recording:
-                print(f"  Cycles: {recording['cycles_completed']}")
+                print(f"\n[TRAINING] Loaded recording: {os.path.basename(filename)}")
+                print(f"  gt_mode: {gt_mode}")
+                print(f"  EMG shape: {recording.get('emg', np.array([])).shape}")
+                if "cycles_completed" in recording:
+                    print(f"  Cycles: {recording['cycles_completed']}")
 
-            # Open the review dialog
+                valid_recordings.append(recording)
+
+            if not valid_recordings:
+                QMessageBox.warning(
+                    self.main_window,
+                    "Invalid Recordings",
+                    "None of the selected files contain valid guided recordings with GT data.",
+                    QMessageBox.Ok,
+                )
+                return
+
+            print(f"\n[TRAINING] Opening review dialog with {len(valid_recordings)} recording(s)")
+
+            # Open the review dialog with all recordings
             review_dialog = GuidedRecordingReviewDialog(
-                recording, self.template_manager, self.main_window
+                valid_recordings, self.template_manager, self.main_window
             )
             result = review_dialog.exec()
 
             if review_dialog.saved:
                 # Update UI to show templates were saved
                 self.selected_recordings_for_extraction_label.setText(
-                    f"Templates saved from guided recording"
+                    f"Templates saved from {len(valid_recordings)} recording(s)"
                 )
                 # Update template counts
                 n_closed = len(self.template_manager.templates.get("closed", []))
@@ -1223,7 +1366,7 @@ class TrainingProtocol(QObject):
             QMessageBox.critical(
                 self.main_window,
                 "Error",
-                f"Failed to load guided recording: {e}",
+                f"Failed to load guided recording(s): {e}",
                 QMessageBox.Ok,
             )
             import traceback
@@ -2204,6 +2347,9 @@ class TrainingProtocol(QObject):
         now = datetime.now()
         formatted_now = now.strftime("%Y%m%d_%H%M%S")
 
+        # Get mode suffix (_mp_ for monopolar, _sd_ for single differential)
+        mode_suffix = "sd" if config.ENABLE_DIFFERENTIAL_MODE else "mp"
+
         model_data = {
             "open_templates": open_templates_features,
             "closed_templates": closed_templates_features,
@@ -2220,6 +2366,8 @@ class TrainingProtocol(QObject):
             "distance_aggregation": distance_aggregation,
             # New: post-prediction smoothing method
             "smoothing_method": smoothing_method,
+            # New: differential mode flag
+            "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
             "parameters": {
                 "window_samples": window_samples,
                 "overlap_samples": overlap_samples,
@@ -2235,12 +2383,13 @@ class TrainingProtocol(QObject):
                 "n_open_templates": len(open_templates_features),
                 "n_closed_templates": len(closed_templates_features),
                 "dead_channels_display": dead_channels_display,  # 1-indexed for display
+                "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
             }
         }
 
         models_dir = "data/models"
         os.makedirs(models_dir, exist_ok=True)
-        model_path = os.path.join(models_dir, f"MindMove_Model_{formatted_now}_{model_name}.pkl")
+        model_path = os.path.join(models_dir, f"MindMove_Model_{mode_suffix}_{formatted_now}_{model_name}.pkl")
 
         with open(model_path, "wb") as f:
             pickle.dump(model_data, f)
