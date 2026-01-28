@@ -8,7 +8,6 @@ from mindmove.gui.protocols.record import RecordProtocol
 from mindmove.gui.protocols.training import TrainingProtocol
 from mindmove.gui.protocols.online import OnlineProtocol
 from mindmove.gui.protocols.guided_record import GuidedRecordProtocol
-from mindmove.gui.protocols.bidirectional_training import BidirectionalTrainingProtocol
 
 if TYPE_CHECKING:
     from mindmove.gui.mindmove import MindMove
@@ -25,17 +24,16 @@ class Protocol(QObject):
 
         # Initialize Protocol
         self.current_protocol: Optional[
-            Union[RecordProtocol, TrainingProtocol, OnlineProtocol, GuidedRecordProtocol, BidirectionalTrainingProtocol]
+            Union[RecordProtocol, TrainingProtocol, OnlineProtocol, GuidedRecordProtocol]
         ] = None
 
         self.available_protocols: list[
-            Union[RecordProtocol, TrainingProtocol, OnlineProtocol, GuidedRecordProtocol, BidirectionalTrainingProtocol]
+            Union[RecordProtocol, TrainingProtocol, OnlineProtocol, GuidedRecordProtocol]
         ] = [
             RecordProtocol(self.main_window),
             TrainingProtocol(self.main_window),
             OnlineProtocol(self.main_window),
             GuidedRecordProtocol(self.main_window),
-            BidirectionalTrainingProtocol(self.main_window),
         ]
 
         # Add custom protocol widgets to stacked widget
@@ -69,24 +67,12 @@ class Protocol(QObject):
 
             print("Guided Record Protocol toggled")
 
-    def _protocol_bidirectional_toggled(self, checked: bool) -> None:
-        if checked:
-            self.protocol_mode_stacked_widget.setCurrentIndex(4)
-            self.current_protocol = self.available_protocols[4]
-
-            print("Bidirectional Training Protocol toggled")
-
     def _add_custom_protocol_widgets(self) -> None:
         """Add custom protocol widgets to the stacked widget."""
         # Add Guided Record widget (index 3)
         guided_protocol = self.available_protocols[3]
         guided_widget = guided_protocol.get_widget()
         self.protocol_mode_stacked_widget.addWidget(guided_widget)
-
-        # Add Bidirectional Training widget (index 4)
-        bidir_protocol = self.available_protocols[4]
-        bidir_widget = bidir_protocol.get_widget()
-        self.protocol_mode_stacked_widget.addWidget(bidir_widget)
 
     def _setup_procotol_ui(self):
         self.protocol_mode_stacked_widget = (
@@ -113,7 +99,7 @@ class Protocol(QObject):
         self._add_guided_radio_button()
 
     def _add_guided_radio_button(self) -> None:
-        """Add the Guided Record and Bidirectional Training radio buttons to the protocol selection."""
+        """Add the Guided Record radio button to the protocol selection."""
         # Find the layout containing the other radio buttons
         parent_layout = self.protocol_online_radio_button.parent().layout()
 
@@ -122,9 +108,3 @@ class Protocol(QObject):
         self.protocol_guided_radio_button.toggled.connect(self._protocol_guided_toggled)
         if parent_layout:
             parent_layout.addWidget(self.protocol_guided_radio_button)
-
-        # Create Bidirectional Training radio button
-        self.protocol_bidirectional_radio_button = QRadioButton("Bidir. Training")
-        self.protocol_bidirectional_radio_button.toggled.connect(self._protocol_bidirectional_toggled)
-        if parent_layout:
-            parent_layout.addWidget(self.protocol_bidirectional_radio_button)

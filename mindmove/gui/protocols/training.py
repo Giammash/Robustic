@@ -19,6 +19,7 @@ import matplotlib
 matplotlib.use('QtAgg')
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
+from matplotlib.patches import Rectangle
 
 # MindMove imports
 from mindmove.model.interface import MindMoveInterface
@@ -321,26 +322,69 @@ class ActivationReviewWidget(QWidget):
         self._update_display()
 
 
+class DraggableWindow:
+    """A draggable rectangle representing a 1-second template window."""
+
+    def __init__(self, ax, start_sample: int, duration_samples: int, color: str, label: str, fsamp: float):
+        self.ax = ax
+        self.start_sample = start_sample
+        self.duration_samples = duration_samples
+        self.color = color
+        self.label = label
+        self.fsamp = fsamp
+
+        # Convert to time for display
+        start_time = start_sample / fsamp
+        duration_time = duration_samples / fsamp
+
+        # Create rectangle patch (will be drawn in time coordinates)
+        self.rect = Rectangle(
+            (start_time, -1e6), duration_time, 2e6,
+            alpha=0.3, facecolor=color, edgecolor=color, linewidth=2
+        )
+        ax.add_patch(self.rect)
+
+        # Create start/end line markers
+        self.start_line = ax.axvline(start_time, color=color, linewidth=2, linestyle='-')
+        self.end_line = ax.axvline(start_time + duration_time, color=color, linewidth=2, linestyle='-')
+
+        # Dragging state
+        self.dragging = False
+
+    def set_position(self, start_sample: int):
+        """Set the position of the template window (in samples)."""
+        self.start_sample = start_sample
+        start_time = start_sample / self.fsamp
+        duration_time = self.duration_samples / self.fsamp
+        self.rect.set_x(start_time)
+        self.start_line.set_xdata([start_time, start_time])
+        self.end_line.set_xdata([start_time + duration_time, start_time + duration_time])
+
+    def contains(self, time_s: float) -> bool:
+        """Check if time coordinate is within the window."""
+        start_time = self.start_sample / self.fsamp
+        end_time = (self.start_sample + self.duration_samples) / self.fsamp
+        return start_time <= time_s <= end_time
+
+    def get_sample_range(self) -> Tuple[int, int]:
+        """Return (start_sample, end_sample)."""
+        return self.start_sample, self.start_sample + self.duration_samples
+
+
 class CycleReviewWidget(QWidget):
     """
     Widget for reviewing complete cycles and selecting both CLOSED and OPEN templates.
 
-    Shows one complete cycle at a time:
-    - Last 1s of HOLD OPEN (before closing)
-    - CLOSING transition + HOLD CLOSED
-    - OPENING transition
-    - First 1s after OPEN
+    Shows one complete cycle at a time with:
+    - Audio cue markers (blue vertical lines)
+    - GT signal as background shading
+    - Draggable template windows for CLOSED (orange) and OPEN (blue)
 
-    User selects CLOSED template first, then OPEN template, then moves to next cycle.
+    User drags the windows to desired positions, then accepts both templates.
     """
 
     # Signal emitted when both templates from a cycle are accepted
     templates_accepted = Signal(np.ndarray, np.ndarray)  # (closed_template, open_template)
-
-    # Selection states
-    STATE_SELECT_CLOSED = 0
-    STATE_SELECT_OPEN = 1
-    STATE_CYCLE_DONE = 2
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -348,13 +392,16 @@ class CycleReviewWidget(QWidget):
         self.current_cycle_idx: int = 0
         self.current_channel: int = 0  # 0-indexed
 
-        # Selection state machine
-        self.selection_state = self.STATE_SELECT_CLOSED
-        self.selected_closed_start: Optional[int] = None
-        self.selected_open_start: Optional[int] = None
-
         # Template duration
         self.template_duration_samples: int = int(1.0 * config.FSAMP)
+
+        # Draggable windows
+        self.closed_window: Optional[DraggableWindow] = None
+        self.open_window: Optional[DraggableWindow] = None
+
+        # Mouse dragging state
+        self._dragging_window: Optional[DraggableWindow] = None
+        self._drag_offset: float = 0
 
         # Accepted templates
         self.accepted_closed_templates: List[np.ndarray] = []
@@ -394,12 +441,14 @@ class CycleReviewWidget(QWidget):
         layout.addLayout(header_layout)
 
         # Instructions label
-        self.instruction_label = QLabel("Step 1: Click to select 1-second CLOSED template window")
-        self.instruction_label.setStyleSheet(
-            "font-size: 13px; font-weight: bold; color: #E65100; "
-            "background-color: #FFF3E0; padding: 8px; border-radius: 4px;"
+        self.instruction_label = QLabel(
+            "Drag the orange (CLOSED) and blue (OPEN) windows to select 1-second templates. "
+            "Click 'Accept' when satisfied."
         )
-        self.instruction_label.setAlignment(Qt.AlignCenter)
+        self.instruction_label.setStyleSheet(
+            "color: #666; background-color: #f5f5f5; padding: 8px; border-radius: 4px;"
+        )
+        self.instruction_label.setWordWrap(True)
         layout.addWidget(self.instruction_label)
 
         # Matplotlib figure
@@ -408,7 +457,12 @@ class CycleReviewWidget(QWidget):
         self.canvas.setMinimumHeight(350)
         self.ax = self.figure.add_subplot(111)
         self.figure.tight_layout()
-        self.canvas.mpl_connect('button_press_event', self._on_canvas_click)
+
+        # Connect mouse events for dragging
+        self.canvas.mpl_connect('button_press_event', self._on_mouse_press)
+        self.canvas.mpl_connect('button_release_event', self._on_mouse_release)
+        self.canvas.mpl_connect('motion_notify_event', self._on_mouse_move)
+
         layout.addWidget(self.canvas)
 
         # Info label for selection feedback
@@ -434,19 +488,18 @@ class CycleReviewWidget(QWidget):
 
         button_layout.addSpacing(30)
 
-        # Reset selection button
-        self.reset_button = QPushButton("Reset Selection")
-        self.reset_button.clicked.connect(self._reset_selection)
+        # Reset windows button
+        self.reset_button = QPushButton("Reset Windows")
+        self.reset_button.clicked.connect(self._reset_windows)
         button_layout.addWidget(self.reset_button)
 
-        # Accept button
+        # Accept button - always enabled with draggable windows
         self.accept_button = QPushButton("✓ Accept Both Templates")
         self.accept_button.setStyleSheet(
             "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 16px; }"
             "QPushButton:disabled { background-color: #cccccc; color: #666666; }"
         )
         self.accept_button.clicked.connect(self._accept_templates)
-        self.accept_button.setEnabled(False)
         button_layout.addWidget(self.accept_button)
 
         self.skip_button = QPushButton("Skip Cycle")
@@ -459,7 +512,6 @@ class CycleReviewWidget(QWidget):
         """Set the list of cycles to review."""
         self.cycles = cycles
         self.current_cycle_idx = 0
-        self._reset_selection()
         self.accepted_closed_templates = []
         self.accepted_open_templates = []
 
@@ -475,12 +527,8 @@ class CycleReviewWidget(QWidget):
         self.current_channel = index
         self._update_display()
 
-    def _reset_selection(self):
-        """Reset selection state for current cycle."""
-        self.selection_state = self.STATE_SELECT_CLOSED
-        self.selected_closed_start = None
-        self.selected_open_start = None
-        self.accept_button.setEnabled(False)
+    def _reset_windows(self):
+        """Reset window positions to defaults for current cycle."""
         self._update_display()
 
     def _update_display(self):
@@ -500,40 +548,27 @@ class CycleReviewWidget(QWidget):
             f"{len(self.accepted_open_templates)} OPEN"
         )
 
-        # Update instruction based on state
-        if self.selection_state == self.STATE_SELECT_CLOSED:
-            self.instruction_label.setText("Step 1: Click to select 1-second CLOSED template window (during closing/hold)")
-            self.instruction_label.setStyleSheet(
-                "font-size: 13px; font-weight: bold; color: #E65100; "
-                "background-color: #FFF3E0; padding: 8px; border-radius: 4px;"
-            )
-        elif self.selection_state == self.STATE_SELECT_OPEN:
-            self.instruction_label.setText("Step 2: Click to select 1-second OPEN template window (during/after opening)")
-            self.instruction_label.setStyleSheet(
-                "font-size: 13px; font-weight: bold; color: #1565C0; "
-                "background-color: #E3F2FD; padding: 8px; border-radius: 4px;"
-            )
-        else:
-            self.instruction_label.setText("Both templates selected! Click 'Accept Both Templates' or reset.")
-            self.instruction_label.setStyleSheet(
-                "font-size: 13px; font-weight: bold; color: #2E7D32; "
-                "background-color: #E8F5E9; padding: 8px; border-radius: 4px;"
-            )
-
         # Clear and redraw plot
         self.ax.clear()
+        self.closed_window = None
+        self.open_window = None
 
         if n_cycles == 0 or self.current_cycle_idx >= n_cycles:
             self.ax.text(0.5, 0.5, "No cycles to display",
                         ha='center', va='center', transform=self.ax.transAxes)
             self.canvas.draw()
+            self.accept_button.setEnabled(False)
             return
 
         cycle = self.cycles[self.current_cycle_idx]
         emg = cycle['emg']
         gt = cycle['gt']
-        close_start_idx = cycle['close_start_idx']
-        open_start_idx = cycle['open_start_idx']
+        close_start_idx = cycle.get('close_start_idx', 0)
+        open_start_idx = cycle.get('open_start_idx', 0)
+
+        # Audio cue times (if available from guided recording)
+        close_cue_idx = cycle.get('close_cue_idx')
+        open_cue_idx = cycle.get('open_cue_idx')
 
         n_samples = emg.shape[1]
         time_axis = np.arange(n_samples) / config.FSAMP
@@ -543,43 +578,66 @@ class CycleReviewWidget(QWidget):
         emg_signal = emg[channel, :]
         max_val = np.max(np.abs(emg_signal)) if np.max(np.abs(emg_signal)) > 0 else 1
 
-        # Plot GT as background shading
+        # Plot GT as background shading (orange where GT=1)
         gt_scaled = gt * max_val * 0.95
         self.ax.fill_between(time_axis, -gt_scaled, gt_scaled,
-                            alpha=0.15, color='orange', label='GT=1 (Closed)')
+                            alpha=0.15, color='orange', label='GT (0=open, 1=closed)')
 
-        # Mark key transitions with vertical lines
-        close_time = close_start_idx / config.FSAMP
-        open_time = open_start_idx / config.FSAMP
+        # Mark audio cue times with blue dashed lines (if available)
+        if close_cue_idx is not None:
+            close_cue_time = close_cue_idx / config.FSAMP
+            self.ax.axvline(close_cue_time, color='blue', linestyle='--', linewidth=2,
+                           alpha=0.8, label=f'Close cue ({close_cue_time:.2f}s)')
 
-        self.ax.axvline(close_time, color='red', linestyle='--', linewidth=2,
-                       alpha=0.8, label=f'Close starts ({close_time:.2f}s)')
-        self.ax.axvline(open_time, color='blue', linestyle='--', linewidth=2,
-                       alpha=0.8, label=f'Open starts ({open_time:.2f}s)')
+        if open_cue_idx is not None:
+            open_cue_time = open_cue_idx / config.FSAMP
+            self.ax.axvline(open_cue_time, color='blue', linestyle='--', linewidth=2,
+                           alpha=0.8, label=f'Open cue ({open_cue_time:.2f}s)')
+
+        # Fallback: mark transition starts if no audio cues
+        if close_cue_idx is None and close_start_idx > 0:
+            close_time = close_start_idx / config.FSAMP
+            self.ax.axvline(close_time, color='red', linestyle=':', linewidth=2,
+                           alpha=0.6, label=f'Close starts ({close_time:.2f}s)')
+
+        if open_cue_idx is None and open_start_idx > 0:
+            open_time = open_start_idx / config.FSAMP
+            self.ax.axvline(open_time, color='green', linestyle=':', linewidth=2,
+                           alpha=0.6, label=f'Open starts ({open_time:.2f}s)')
 
         # Plot EMG signal
-        self.ax.plot(time_axis, emg_signal, 'k-', linewidth=0.5, alpha=0.9)
+        self.ax.plot(time_axis, emg_signal, 'k-', linewidth=0.5, alpha=0.9, label=f'EMG Ch{channel + 1}')
 
-        # Plot selected CLOSED template region (orange)
-        if self.selected_closed_start is not None:
-            start_s = self.selected_closed_start / config.FSAMP
-            end_s = (self.selected_closed_start + self.template_duration_samples) / config.FSAMP
-            self.ax.axvspan(start_s, end_s, alpha=0.4, color='#FF5722', label='CLOSED template')
-            self.ax.axvline(start_s, color='#FF5722', linestyle='-', linewidth=2)
-            self.ax.axvline(end_s, color='#FF5722', linestyle='-', linewidth=2)
+        # Calculate default window positions
+        # CLOSED window: centered around closing phase (after close cue or close_start)
+        closed_default_idx = close_cue_idx if close_cue_idx is not None else close_start_idx
+        if closed_default_idx is None or closed_default_idx == 0:
+            closed_default_idx = n_samples // 4  # Fallback
 
-        # Plot selected OPEN template region (blue)
-        if self.selected_open_start is not None:
-            start_s = self.selected_open_start / config.FSAMP
-            end_s = (self.selected_open_start + self.template_duration_samples) / config.FSAMP
-            self.ax.axvspan(start_s, end_s, alpha=0.4, color='#2196F3', label='OPEN template')
-            self.ax.axvline(start_s, color='#2196F3', linestyle='-', linewidth=2)
-            self.ax.axvline(end_s, color='#2196F3', linestyle='-', linewidth=2)
+        # OPEN window: centered around opening phase (after open cue or open_start)
+        open_default_idx = open_cue_idx if open_cue_idx is not None else open_start_idx
+        if open_default_idx is None or open_default_idx == 0:
+            open_default_idx = 3 * n_samples // 4  # Fallback
+
+        # Clamp to valid range
+        max_start = n_samples - self.template_duration_samples
+        closed_default_idx = max(0, min(closed_default_idx, max_start))
+        open_default_idx = max(0, min(open_default_idx, max_start))
+
+        # Create draggable windows
+        self.closed_window = DraggableWindow(
+            self.ax, closed_default_idx, self.template_duration_samples,
+            '#FF5722', 'CLOSED', config.FSAMP
+        )
+        self.open_window = DraggableWindow(
+            self.ax, open_default_idx, self.template_duration_samples,
+            '#2196F3', 'OPEN', config.FSAMP
+        )
 
         # Labels and formatting
         self.ax.set_xlabel('Time (s)')
         self.ax.set_ylabel(f'Channel {channel + 1} (µV)')
-        self.ax.set_title(f'Cycle {self.current_cycle_idx + 1}: Complete Open→Close→Open Transition')
+        self.ax.set_title(f'Cycle {self.current_cycle_idx + 1}: Drag windows to select templates')
         self.ax.set_xlim(0, n_samples / config.FSAMP)
         self.ax.legend(loc='upper right', fontsize=8)
         self.ax.grid(True, alpha=0.3)
@@ -587,75 +645,87 @@ class CycleReviewWidget(QWidget):
         self.figure.tight_layout()
         self.canvas.draw()
 
+        # Enable accept button
+        self.accept_button.setEnabled(True)
+
         # Update info label
         self._update_info_label()
 
     def _update_info_label(self):
         """Update the info label with selection status."""
         parts = []
-        if self.selected_closed_start is not None:
-            start_s = self.selected_closed_start / config.FSAMP
-            end_s = (self.selected_closed_start + self.template_duration_samples) / config.FSAMP
+        if self.closed_window is not None:
+            start_s = self.closed_window.start_sample / config.FSAMP
+            end_s = (self.closed_window.start_sample + self.template_duration_samples) / config.FSAMP
             parts.append(f"CLOSED: {start_s:.2f}s - {end_s:.2f}s")
-        if self.selected_open_start is not None:
-            start_s = self.selected_open_start / config.FSAMP
-            end_s = (self.selected_open_start + self.template_duration_samples) / config.FSAMP
+        if self.open_window is not None:
+            start_s = self.open_window.start_sample / config.FSAMP
+            end_s = (self.open_window.start_sample + self.template_duration_samples) / config.FSAMP
             parts.append(f"OPEN: {start_s:.2f}s - {end_s:.2f}s")
 
         if parts:
             self.info_label.setText("Selected: " + " | ".join(parts))
         else:
-            self.info_label.setText("Click on the plot to select template window")
+            self.info_label.setText("Drag windows to select template regions")
 
-    def _on_canvas_click(self, event):
-        """Handle click on canvas to select template start."""
-        if event.inaxes != self.ax:
+    def _on_mouse_press(self, event):
+        """Handle mouse press for dragging."""
+        if event.inaxes != self.ax or event.xdata is None:
             return
-        if len(self.cycles) == 0 or self.current_cycle_idx >= len(self.cycles):
+
+        click_time = event.xdata
+
+        # Check if clicking on a window (check closed first, then open)
+        if self.closed_window and self.closed_window.contains(click_time):
+            self._dragging_window = self.closed_window
+            start_time = self.closed_window.start_sample / config.FSAMP
+            self._drag_offset = click_time - start_time
+        elif self.open_window and self.open_window.contains(click_time):
+            self._dragging_window = self.open_window
+            start_time = self.open_window.start_sample / config.FSAMP
+            self._drag_offset = click_time - start_time
+
+    def _on_mouse_release(self, event):
+        """Handle mouse release."""
+        if self._dragging_window is not None:
+            self._update_info_label()
+        self._dragging_window = None
+
+    def _on_mouse_move(self, event):
+        """Handle mouse move for dragging."""
+        if self._dragging_window is None or event.xdata is None:
             return
-        if self.selection_state == self.STATE_CYCLE_DONE:
-            return  # Already selected both
+
+        if self.current_cycle_idx >= len(self.cycles):
+            return
 
         cycle = self.cycles[self.current_cycle_idx]
         n_samples = cycle['emg'].shape[1]
+        max_start_sample = n_samples - self.template_duration_samples
 
-        click_time = event.xdata
-        if click_time is None:
-            return
+        # Calculate new position in time, then convert to samples
+        new_start_time = event.xdata - self._drag_offset
+        new_start_sample = int(new_start_time * config.FSAMP)
 
-        click_sample = int(click_time * config.FSAMP)
+        # Clamp to valid range
+        new_start_sample = max(0, min(new_start_sample, max_start_sample))
 
-        # Ensure template fits within cycle
-        max_start = n_samples - self.template_duration_samples
-        if max_start < 0:
-            self.info_label.setText("Cycle too short for 1-second template!")
-            return
-
-        selected_start = max(0, min(click_sample, max_start))
-
-        if self.selection_state == self.STATE_SELECT_CLOSED:
-            self.selected_closed_start = selected_start
-            self.selection_state = self.STATE_SELECT_OPEN
-        elif self.selection_state == self.STATE_SELECT_OPEN:
-            self.selected_open_start = selected_start
-            self.selection_state = self.STATE_CYCLE_DONE
-            self.accept_button.setEnabled(True)
-
-        self._update_display()
+        self._dragging_window.set_position(new_start_sample)
+        self.canvas.draw()
 
     def _go_prev(self):
         if self.current_cycle_idx > 0:
             self.current_cycle_idx -= 1
-            self._reset_selection()
+            self._update_display()
 
     def _go_next(self):
         if self.current_cycle_idx < len(self.cycles) - 1:
             self.current_cycle_idx += 1
-            self._reset_selection()
+            self._update_display()
 
     def _accept_templates(self):
         """Accept both selected templates and move to next cycle."""
-        if self.selected_closed_start is None or self.selected_open_start is None:
+        if self.closed_window is None or self.open_window is None:
             return
         if self.current_cycle_idx >= len(self.cycles):
             return
@@ -664,24 +734,30 @@ class CycleReviewWidget(QWidget):
         emg = cycle['emg']
 
         # Extract CLOSED template
-        closed_start = self.selected_closed_start
-        closed_end = closed_start + self.template_duration_samples
-        closed_template = emg[:, closed_start:closed_end]
-        self.accepted_closed_templates.append(closed_template)
+        closed_start, closed_end = self.closed_window.get_sample_range()
+        closed_end = min(closed_end, emg.shape[1])
+        if closed_end > closed_start:
+            closed_template = emg[:, closed_start:closed_end]
+            self.accepted_closed_templates.append(closed_template)
 
         # Extract OPEN template
-        open_start = self.selected_open_start
-        open_end = open_start + self.template_duration_samples
-        open_template = emg[:, open_start:open_end]
-        self.accepted_open_templates.append(open_template)
+        open_start, open_end = self.open_window.get_sample_range()
+        open_end = min(open_end, emg.shape[1])
+        if open_end > open_start:
+            open_template = emg[:, open_start:open_end]
+            self.accepted_open_templates.append(open_template)
 
         # Emit signal
-        self.templates_accepted.emit(closed_template, open_template)
+        if closed_end > closed_start and open_end > open_start:
+            self.templates_accepted.emit(
+                self.accepted_closed_templates[-1],
+                self.accepted_open_templates[-1]
+            )
 
         # Move to next cycle
         if self.current_cycle_idx < len(self.cycles) - 1:
             self.current_cycle_idx += 1
-            self._reset_selection()
+            self._update_display()
         else:
             self.info_label.setText("All cycles reviewed!")
             self._update_display()

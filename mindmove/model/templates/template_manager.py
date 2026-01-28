@@ -768,9 +768,11 @@ class TemplateManager:
         Returns:
             List of cycle dicts, each containing:
             - 'emg': EMG data for the cycle (n_channels, n_samples)
-            - 'gt': Binary GT signal for the cycle
+            - 'gt': GT signal for the cycle (float 0.0-1.0 for linear transitions)
             - 'close_start_idx': Sample index where GT transitions 0→1 (relative to cycle start)
             - 'open_start_idx': Sample index where GT transitions 1→0 (relative to cycle start)
+            - 'close_cue_idx': Sample index of close audio cue (if available)
+            - 'open_cue_idx': Sample index of open audio cue (if available)
             - 'cycle_number': 1-indexed cycle number
         """
         # Normalize recording to standard format
@@ -780,13 +782,21 @@ class TemplateManager:
         kinematics = normalized["kinematics"]
         gt_mode = normalized.get("gt_mode", None)
 
-        # Determine how to process ground truth
+        # Get the GT signal (may be float 0.0-1.0 for guided recordings with linear transitions)
         if gt_mode in ["keyboard", "guided_animation"] or kinematics.shape[0] == 1:
-            gt_binary = kinematics.flatten().astype(int)
+            gt_signal = kinematics.flatten()
+            # For cycle detection, binarize (threshold at 0.5)
+            gt_binary = (gt_signal > 0.5).astype(int)
         else:
             gt_binary = self._convert_kinematics_to_binary(kinematics, emg.shape[1])
+            gt_signal = gt_binary.astype(float)
 
-        # Find all transitions
+        # Get audio cue times from guided recording metadata (if available)
+        cycle_boundaries = recording.get('cycles', [])
+        timings_emg = recording.get('timings_emg')
+        recording_start_time = timings_emg[0] if timings_emg is not None and len(timings_emg) > 0 else None
+
+        # Find all transitions from the binarized GT
         gt_diff = np.diff(gt_binary, prepend=gt_binary[0])
         rising_edges = np.where(gt_diff == 1)[0]   # 0→1 = CLOSING starts
         falling_edges = np.where(gt_diff == -1)[0]  # 1→0 = OPENING starts
@@ -813,26 +823,56 @@ class TemplateManager:
 
             # Extract EMG and GT for this cycle
             cycle_emg = emg[:, cycle_start:cycle_end]
-            cycle_gt = gt_binary[cycle_start:cycle_end]
+            cycle_gt = gt_signal[cycle_start:cycle_end]
 
             # Calculate relative indices within the cycle
             close_start_relative = rise_idx - cycle_start
             open_start_relative = fall_idx - cycle_start
+
+            # Try to get audio cue times from cycle metadata
+            close_cue_idx = None
+            open_cue_idx = None
+
+            if cycle_num <= len(cycle_boundaries) and recording_start_time is not None:
+                cycle_meta = cycle_boundaries[cycle_num - 1]
+                close_cue_time = cycle_meta.get('close_cue_time')
+                open_cue_time = cycle_meta.get('open_cue_time')
+
+                if close_cue_time is not None:
+                    # Convert absolute timestamp to sample index relative to recording start
+                    close_cue_abs_idx = int((close_cue_time - recording_start_time) * config.FSAMP)
+                    # Convert to relative index within this cycle view
+                    close_cue_idx = close_cue_abs_idx - cycle_start
+                    if close_cue_idx < 0 or close_cue_idx >= cycle_emg.shape[1]:
+                        close_cue_idx = None  # Out of bounds
+
+                if open_cue_time is not None:
+                    open_cue_abs_idx = int((open_cue_time - recording_start_time) * config.FSAMP)
+                    open_cue_idx = open_cue_abs_idx - cycle_start
+                    if open_cue_idx < 0 or open_cue_idx >= cycle_emg.shape[1]:
+                        open_cue_idx = None  # Out of bounds
 
             cycles.append({
                 'emg': cycle_emg,
                 'gt': cycle_gt,
                 'close_start_idx': close_start_relative,  # Where GT goes 0→1
                 'open_start_idx': open_start_relative,    # Where GT goes 1→0
+                'close_cue_idx': close_cue_idx,           # Audio cue time (if available)
+                'open_cue_idx': open_cue_idx,             # Audio cue time (if available)
                 'cycle_number': cycle_num,
                 'duration_s': cycle_emg.shape[1] / config.FSAMP,
             })
 
         print(f"[CYCLES] Extracted {len(cycles)} complete cycles")
         for i, c in enumerate(cycles):
+            cue_info = ""
+            if c['close_cue_idx'] is not None:
+                cue_info += f", close_cue@{c['close_cue_idx']/config.FSAMP:.2f}s"
+            if c['open_cue_idx'] is not None:
+                cue_info += f", open_cue@{c['open_cue_idx']/config.FSAMP:.2f}s"
             print(f"  Cycle {i+1}: {c['duration_s']:.2f}s, "
                   f"close@{c['close_start_idx']/config.FSAMP:.2f}s, "
-                  f"open@{c['open_start_idx']/config.FSAMP:.2f}s")
+                  f"open@{c['open_start_idx']/config.FSAMP:.2f}s{cue_info}")
 
         return cycles
 
