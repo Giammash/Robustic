@@ -108,19 +108,22 @@ class TemplateManager:
             return recording
 
         elif fmt == TemplateManager.FORMAT_MINDMOVE_KB:
-            # Keyboard format - gt is already binary at EMG sample rate
+            # Keyboard format - gt is already at EMG sample rate
             gt = recording["gt"]
             # Reshape to (1, n_samples) to match expected kinematics shape
             kinematics = gt.reshape(1, -1) if gt.ndim == 1 else gt
 
+            # Preserve the original gt_mode (could be "keyboard" or "guided_animation")
+            original_gt_mode = recording.get("gt_mode", "keyboard")
+
             return {
                 "emg": recording["emg"],
-                "kinematics": kinematics,  # Binary GT as "kinematics"
+                "kinematics": kinematics,  # GT as "kinematics"
                 "timings_emg": recording.get("timings_emg"),
                 "timings_kinematics": recording.get("timings_emg"),  # Same as EMG
                 "label": recording.get("label", "default"),
                 "task": recording.get("task", "unknown"),
-                "gt_mode": "keyboard",
+                "gt_mode": original_gt_mode,  # Preserve original mode
             }
 
         elif fmt == TemplateManager.FORMAT_VHI:
@@ -791,6 +794,7 @@ class TemplateManager:
             gt_binary = self._convert_kinematics_to_binary(kinematics, emg.shape[1])
             gt_signal = gt_binary.astype(float)
 
+
         # Get audio cue times from guided recording metadata (if available)
         cycle_boundaries = recording.get('cycles', [])
         timings_emg = recording.get('timings_emg')
@@ -800,6 +804,7 @@ class TemplateManager:
         gt_diff = np.diff(gt_binary, prepend=gt_binary[0])
         rising_edges = np.where(gt_diff == 1)[0]   # 0→1 = CLOSING starts
         falling_edges = np.where(gt_diff == -1)[0]  # 1→0 = OPENING starts
+
 
         pre_close_samples = int(pre_close_s * config.FSAMP)
         post_open_samples = int(post_open_s * config.FSAMP)
@@ -863,16 +868,9 @@ class TemplateManager:
                 'duration_s': cycle_emg.shape[1] / config.FSAMP,
             })
 
-        print(f"[CYCLES] Extracted {len(cycles)} complete cycles")
-        for i, c in enumerate(cycles):
-            cue_info = ""
-            if c['close_cue_idx'] is not None:
-                cue_info += f", close_cue@{c['close_cue_idx']/config.FSAMP:.2f}s"
-            if c['open_cue_idx'] is not None:
-                cue_info += f", open_cue@{c['open_cue_idx']/config.FSAMP:.2f}s"
-            print(f"  Cycle {i+1}: {c['duration_s']:.2f}s, "
-                  f"close@{c['close_start_idx']/config.FSAMP:.2f}s, "
-                  f"open@{c['open_start_idx']/config.FSAMP:.2f}s{cue_info}")
+        # Simple summary output
+        if cycles:
+            print(f"Extracted {len(cycles)} cycles ({cycles[0]['duration_s']:.1f}s each)")
 
         return cycles
 

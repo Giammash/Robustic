@@ -43,7 +43,7 @@ class HandAnimationSequencer:
     Controls VHI animation for guided template recording.
 
     Manages phases with reaction time delays:
-    HOLD_OPEN → [AUDIO "Close"] → REACTION_CLOSE → CLOSING → HOLD_CLOSED → [AUDIO "Open"] → REACTION_OPEN → OPENING
+    HOLD_OPEN → [AUDIO "Close"] → REACTION_CLOSE → CLOSING → HOLD_CLOSED → [AUDIO "Open"] → REACTION_OPEN → OPENING → HOLD_OPEN_END
 
     Audio cues play at the end of HOLD_OPEN and HOLD_CLOSED.
     VHI movement and GT transition start after the reaction time delay.
@@ -57,6 +57,7 @@ class HandAnimationSequencer:
     PHASE_HOLD_CLOSED = "HOLD_CLOSED"
     PHASE_REACTION_OPEN = "REACTION_OPEN"  # After open audio cue, before movement
     PHASE_OPENING = "OPENING"
+    PHASE_HOLD_OPEN_END = "HOLD_OPEN_END"  # Final hold open (same duration as first)
 
     def __init__(self):
         self.phases: List[Tuple[str, float]] = []
@@ -101,7 +102,7 @@ class HandAnimationSequencer:
         self.hold_closed_s = hold_closed_s
         self.opening_s = opening_s
 
-        # Phase sequence with durations
+        # Phase sequence with durations (includes final HOLD_OPEN_END)
         self.phases = [
             (self.PHASE_HOLD_OPEN, hold_open_s),
             (self.PHASE_REACTION_CLOSE, reaction_time_s),
@@ -109,6 +110,7 @@ class HandAnimationSequencer:
             (self.PHASE_HOLD_CLOSED, hold_closed_s),
             (self.PHASE_REACTION_OPEN, reaction_time_s),
             (self.PHASE_OPENING, opening_s),
+            (self.PHASE_HOLD_OPEN_END, hold_open_s),  # Same duration as first hold open
         ]
 
         # Reset audio cue times
@@ -225,6 +227,10 @@ class HandAnimationSequencer:
             # Hand opening, GT ramps 1 → 0 linearly
             value = 1.0 - progress  # Linear 1 to 0
             return [value] * 10, value
+
+        elif phase_name == self.PHASE_HOLD_OPEN_END:
+            # Final hold open, GT = 0
+            return [0.0] * 10, 0.0
 
         else:
             return [0.0] * 10, 0.0
@@ -599,7 +605,7 @@ class GuidedRecordProtocol(QObject):
         # Animation control
         self.sequencer = HandAnimationSequencer()
         self.animation_timer = QTimer(self)
-        self.animation_timer.setInterval(33)  # ~30 Hz updates
+        self.animation_timer.setInterval(10)  # ~100 Hz updates for smooth VHI movement
         self.animation_timer.timeout.connect(self._update_animation)
 
         # Audio feedback
@@ -1117,6 +1123,7 @@ class GuidedRecordProtocol(QObject):
             "HOLD_CLOSED": "Hold Closed (waiting for open cue)",
             "REACTION_OPEN": "Reaction Time (open cue played)",
             "OPENING": "Opening (VHI hand opening)",
+            "HOLD_OPEN_END": "Hold Open (cycle ending)",
         }
         display_name = display_names.get(phase_name, phase_name)
         self.phase_label.setText(f"Phase: {display_name}")
@@ -1131,6 +1138,7 @@ class GuidedRecordProtocol(QObject):
             "HOLD_CLOSED": self.hold_closed_spinbox.value(),
             "REACTION_OPEN": reaction_time,
             "OPENING": self.opening_transition_spinbox.value(),
+            "HOLD_OPEN_END": self.hold_open_spinbox.value(),  # Same as first hold open
         }
         phase_duration = phase_durations.get(phase_name, 1.0)
         if phase_duration > 0:

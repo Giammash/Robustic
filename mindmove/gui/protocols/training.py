@@ -187,29 +187,14 @@ class ActivationReviewWidget(QWidget):
         emg_signal = activation[channel, :]
         max_val = np.max(np.abs(emg_signal)) if np.max(np.abs(emg_signal)) > 0 else 1
 
-        # Plot GT overlay if available
+        # Plot GT overlay if available (as overlapping line scaled to EMG amplitude)
         if self.current_index < len(self.gt_signals) and len(self.gt_signals[self.current_index]) > 0:
             gt = self.gt_signals[self.current_index]
             gt_time = np.arange(len(gt)) / config.FSAMP
 
             # Scale GT to match EMG amplitude for visibility
             gt_scaled = gt * max_val * 0.9
-
-            # Fill where GT=1 (orange shading) - use both positive and negative
-            self.ax.fill_between(gt_time, -gt_scaled, gt_scaled,
-                                alpha=0.2, color='orange', label='GT=1')
-
-            # Mark GT transitions with vertical lines
-            gt_diff = np.diff(gt.astype(int), prepend=int(gt[0]))
-            rising = np.where(gt_diff == 1)[0]  # 0→1 transition
-            falling = np.where(gt_diff == -1)[0]  # 1→0 transition
-
-            for idx in rising:
-                if idx < len(gt_time):
-                    self.ax.axvline(gt_time[idx], color='red', linestyle=':', linewidth=2, alpha=0.8)
-            for idx in falling:
-                if idx < len(gt_time):
-                    self.ax.axvline(gt_time[idx], color='blue', linestyle=':', linewidth=2, alpha=0.8)
+            self.ax.plot(gt_time, gt_scaled, 'r-', linewidth=1.5, alpha=0.7, label='GT')
 
         # Plot raw EMG signal for selected channel
         self.ax.plot(time_axis, emg_signal, 'b-', linewidth=0.5, alpha=0.9, label=f'EMG Ch{channel + 1}')
@@ -451,10 +436,10 @@ class CycleReviewWidget(QWidget):
         self.instruction_label.setWordWrap(True)
         layout.addWidget(self.instruction_label)
 
-        # Matplotlib figure
-        self.figure = Figure(figsize=(10, 5), dpi=100)
+        # Matplotlib figure - wider for better signal visibility
+        self.figure = Figure(figsize=(14, 5), dpi=100)
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumHeight(350)
+        self.canvas.setMinimumHeight(400)
         self.ax = self.figure.add_subplot(111)
         self.figure.tight_layout()
 
@@ -524,6 +509,8 @@ class CycleReviewWidget(QWidget):
         self._update_display()
 
     def _on_channel_changed(self, index: int):
+        if index < 0:
+            return  # Ignore invalid index (happens when combo is cleared)
         self.current_channel = index
         self._update_display()
 
@@ -548,8 +535,9 @@ class CycleReviewWidget(QWidget):
             f"{len(self.accepted_open_templates)} OPEN"
         )
 
-        # Clear and redraw plot
-        self.ax.clear()
+        # Clear and redraw plot - recreate axes to avoid stale state
+        self.figure.clear()
+        self.ax = self.figure.add_subplot(111)
         self.closed_window = None
         self.open_window = None
 
@@ -574,36 +562,24 @@ class CycleReviewWidget(QWidget):
         time_axis = np.arange(n_samples) / config.FSAMP
 
         # Get selected channel's EMG
-        channel = min(self.current_channel, emg.shape[0] - 1)
+        channel = max(0, min(self.current_channel, emg.shape[0] - 1))
         emg_signal = emg[channel, :]
         max_val = np.max(np.abs(emg_signal)) if np.max(np.abs(emg_signal)) > 0 else 1
 
-        # Plot GT as background shading (orange where GT=1)
+        # Plot GT as overlapping line scaled to EMG amplitude
         gt_scaled = gt * max_val * 0.95
-        self.ax.fill_between(time_axis, -gt_scaled, gt_scaled,
-                            alpha=0.15, color='orange', label='GT (0=open, 1=closed)')
+        self.ax.plot(time_axis, gt_scaled, 'r-', linewidth=1.5, alpha=0.7, label='GT')
 
         # Mark audio cue times with blue dashed lines (if available)
         if close_cue_idx is not None:
             close_cue_time = close_cue_idx / config.FSAMP
-            self.ax.axvline(close_cue_time, color='blue', linestyle='--', linewidth=2,
-                           alpha=0.8, label=f'Close cue ({close_cue_time:.2f}s)')
+            self.ax.axvline(close_cue_time, color='blue', linestyle='--', linewidth=1.5,
+                           alpha=0.7, label='Close cue')
 
         if open_cue_idx is not None:
             open_cue_time = open_cue_idx / config.FSAMP
-            self.ax.axvline(open_cue_time, color='blue', linestyle='--', linewidth=2,
-                           alpha=0.8, label=f'Open cue ({open_cue_time:.2f}s)')
-
-        # Fallback: mark transition starts if no audio cues
-        if close_cue_idx is None and close_start_idx > 0:
-            close_time = close_start_idx / config.FSAMP
-            self.ax.axvline(close_time, color='red', linestyle=':', linewidth=2,
-                           alpha=0.6, label=f'Close starts ({close_time:.2f}s)')
-
-        if open_cue_idx is None and open_start_idx > 0:
-            open_time = open_start_idx / config.FSAMP
-            self.ax.axvline(open_time, color='green', linestyle=':', linewidth=2,
-                           alpha=0.6, label=f'Open starts ({open_time:.2f}s)')
+            self.ax.axvline(open_cue_time, color='blue', linestyle='--', linewidth=1.5,
+                           alpha=0.7, label='Open cue')
 
         # Plot EMG signal
         self.ax.plot(time_axis, emg_signal, 'k-', linewidth=0.5, alpha=0.9, label=f'EMG Ch{channel + 1}')
@@ -639,11 +615,18 @@ class CycleReviewWidget(QWidget):
         self.ax.set_ylabel(f'Channel {channel + 1} (µV)')
         self.ax.set_title(f'Cycle {self.current_cycle_idx + 1}: Drag windows to select templates')
         self.ax.set_xlim(0, n_samples / config.FSAMP)
-        self.ax.legend(loc='upper right', fontsize=8)
+
+        # Set explicit y-axis limits based on EMG amplitude
+        y_margin = max_val * 1.3
+        self.ax.set_ylim(-y_margin, y_margin)
+
+        # Legend outside the plot area to avoid overlap
+        self.ax.legend(loc='upper left', fontsize=7, framealpha=0.8)
         self.ax.grid(True, alpha=0.3)
 
         self.figure.tight_layout()
-        self.canvas.draw()
+        self.canvas.draw_idle()
+        self.canvas.update()
 
         # Enable accept button
         self.accept_button.setEnabled(True)
@@ -784,7 +767,8 @@ class GuidedRecordingReviewDialog(QDialog):
 
         n_recordings = len(self.recordings)
         self.setWindowTitle(f"Review & Extract Templates ({n_recordings} recording{'s' if n_recordings > 1 else ''})")
-        self.setMinimumSize(1000, 700)
+        self.setMinimumSize(1400, 800)
+        self.resize(1500, 850)  # Start with a larger size
         self.setModal(True)
 
         self._setup_ui()
@@ -846,7 +830,7 @@ class GuidedRecordingReviewDialog(QDialog):
             cycles = self.template_manager.extract_complete_cycles(
                 recording,
                 pre_close_s=1.0,  # 1 second before closing starts
-                post_open_s=1.0   # 1 second after opening starts
+                post_open_s=2.5   # 2.5 seconds after opening to include HOLD_OPEN_END
             )
             all_cycles.extend(cycles)
 
