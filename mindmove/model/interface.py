@@ -228,3 +228,37 @@ class MindMoveInterface(QObject):
         if self.model and hasattr(self.model, 'get_refractory_period'):
             return self.model.get_refractory_period()
         return 1.0  # Default
+
+    def apply_threshold_preset(self, preset_key: str) -> bool:
+        """
+        Apply a threshold preset by key.
+
+        Presets are computed during training based on intra-class and cross-class
+        distance statistics.
+
+        Args:
+            preset_key: The key of the preset to apply (e.g., "conservative").
+
+        Returns:
+            True if the preset was applied successfully, False otherwise.
+        """
+        if self.model and hasattr(self.model, 'apply_threshold_preset'):
+            return self.model.apply_threshold_preset(preset_key)
+        return False
+
+    def get_available_presets(self) -> dict:
+        """
+        Return available threshold presets.
+
+        Returns:
+            Dictionary of preset_key -> preset_info, or None if no presets available.
+        """
+        if self.model and hasattr(self.model, 'get_available_presets'):
+            return self.model.get_available_presets()
+        return None
+
+    def has_threshold_presets(self) -> bool:
+        """Check if the loaded model has threshold presets available."""
+        if self.model and hasattr(self.model, 'has_threshold_presets'):
+            return self.model.has_threshold_presets()
+        return False

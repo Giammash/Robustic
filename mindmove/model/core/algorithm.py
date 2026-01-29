@@ -299,6 +299,132 @@ def tune_thresholds(mean_distance, std_distance, s=1):
     return threshold
 
 
+def compute_cross_class_distances(templates_class_a, templates_class_b, active_channels=None):
+    """
+    Compute DTW distances between templates of two different classes.
+
+    This is used for intelligent threshold preset computation. By computing
+    the distances between OPEN and CLOSED templates, we can determine
+    how separable the classes are and set thresholds accordingly.
+
+    Parameters
+    ----------
+    templates_class_a : list of np.ndarray
+        List of templates from first class (e.g., OPEN).
+        Each element has shape (n_windows, n_channels).
+    templates_class_b : list of np.ndarray
+        List of templates from second class (e.g., CLOSED).
+        Each element has shape (n_windows, n_channels).
+    active_channels : list or None
+        List of active channel indices (0-indexed). If None, uses config.active_channels.
+
+    Returns
+    -------
+    mean_distance : float
+        Mean of all cross-class distances.
+    std_distance : float
+        Standard deviation of all cross-class distances.
+    distances : np.ndarray
+        Array of all pairwise cross-class distances.
+    """
+    distances = []
+
+    for t_a in templates_class_a:
+        for t_b in templates_class_b:
+            dist = compute_dtw(t_a, t_b, active_channels=active_channels)
+            distances.append(dist)
+
+    distances = np.array(distances)
+    return np.mean(distances), np.std(distances), distances
+
+
+def compute_threshold_presets(mean_intra, std_intra, mean_cross, std_cross):
+    """
+    Compute threshold presets based on intra-class and cross-class statistics.
+
+    Returns 4 presets optimized for different use cases:
+    1. Current (Intra-class): Standard method, s=1
+    2. Cross-class Validation: Midpoint between intra and cross-class means
+    3. Conservative (No False Opens): Strict threshold to prevent unwanted state changes
+    4. Safety Margin (50%): Threshold at 50% between intra and cross-class means
+
+    Parameters
+    ----------
+    mean_intra : float
+        Mean distance within the class (from compute_threshold).
+    std_intra : float
+        Standard deviation of distances within the class.
+    mean_cross : float
+        Mean distance to templates of the opposite class.
+    std_cross : float
+        Standard deviation of cross-class distances.
+
+    Returns
+    -------
+    dict
+        Dictionary mapping preset names to their computed threshold values and
+        corresponding s values (for UI display).
+
+    Notes
+    -----
+    For GraspAgain project, the primary goal is minimizing false positives
+    (unwanted hand openings during grasp). The "conservative" preset is
+    designed specifically for this use case.
+    """
+    presets = {}
+
+    # 1. Current (Intra-class): Standard method, s=1
+    # threshold = mean_intra + 1 * std_intra
+    threshold_current = mean_intra + 1.0 * std_intra
+    s_current = 1.0
+    presets["current"] = {
+        "threshold": threshold_current,
+        "s": s_current,
+        "name": "Current (Intra-class)",
+        "description": "Standard method: mean + 1*std within class"
+    }
+
+    # 2. Cross-class Validation: Midpoint between intra and cross-class means
+    # This gives equal weight to both within-class consistency and between-class separation
+    threshold_cross = (mean_intra + mean_cross) / 2
+    # Compute equivalent s value: threshold = mean_intra + s*std_intra
+    # s = (threshold - mean_intra) / std_intra
+    s_cross = (threshold_cross - mean_intra) / std_intra if std_intra > 0 else 1.0
+    presets["cross_class"] = {
+        "threshold": threshold_cross,
+        "s": s_cross,
+        "name": "Cross-class Midpoint",
+        "description": "Midpoint between intra-class and cross-class means"
+    }
+
+    # 3. Conservative (No False Opens): Strict threshold
+    # Set threshold close to the cross-class mean minus one standard deviation
+    # This makes it harder to trigger a state change (requires very close match)
+    threshold_conservative = mean_cross - 1.0 * std_cross
+    # Ensure it's at least as strict as the current threshold
+    threshold_conservative = max(threshold_conservative, threshold_current)
+    s_conservative = (threshold_conservative - mean_intra) / std_intra if std_intra > 0 else 1.0
+    presets["conservative"] = {
+        "threshold": threshold_conservative,
+        "s": s_conservative,
+        "name": "Conservative (No False Triggers)",
+        "description": "Strict threshold to prevent unwanted state changes"
+    }
+
+    # 4. Safety Margin (50%): Threshold at 50% between intra and cross-class means
+    # More conservative than cross-class midpoint, but not as strict as conservative
+    threshold_safety = mean_intra + 0.5 * (mean_cross - mean_intra)
+    s_safety = (threshold_safety - mean_intra) / std_intra if std_intra > 0 else 1.0
+    presets["safety_margin"] = {
+        "threshold": threshold_safety,
+        "s": s_safety,
+        "name": "Safety Margin (50%)",
+        "description": "50% between intra-class mean and cross-class mean"
+    }
+
+    return presets
+
+
 def compute_per_template_statistics(templates, active_channels=None, n_worst=3):
     """
     Compute per-template distance statistics to identify outliers.

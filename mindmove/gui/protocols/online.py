@@ -6,7 +6,7 @@ from datetime import datetime
 import pickle
 import os
 import time
-from PySide6.QtWidgets import QFileDialog, QSlider, QLabel, QHBoxLayout, QVBoxLayout, QGroupBox, QDoubleSpinBox
+from PySide6.QtWidgets import QFileDialog, QSlider, QLabel, QHBoxLayout, QVBoxLayout, QGroupBox, QDoubleSpinBox, QComboBox
 from PySide6.QtCore import Qt
 import matplotlib.pyplot as plt
 
@@ -439,6 +439,49 @@ class OnlineProtocol(QObject):
             print(f"[THRESHOLD UI] OPEN range: 0 - {self._max_threshold_open:.4f}, current: {threshold_open:.4f}")
             print(f"[THRESHOLD UI] CLOSED range: 0 - {self._max_threshold_closed:.4f}, current: {threshold_closed:.4f}")
 
+        # Update preset dropdown
+        self._update_preset_dropdown()
+
+    def _update_preset_dropdown(self) -> None:
+        """Update the preset dropdown based on loaded model's presets."""
+        # Block signals while updating combo box
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+
+        if self.model_interface.has_threshold_presets():
+            presets = self.model_interface.get_available_presets()
+
+            # Add placeholder
+            self.preset_combo.addItem("-- Select Preset --", None)
+
+            # Add presets in a logical order
+            preset_order = ["current", "cross_class", "safety_margin", "conservative"]
+            for key in preset_order:
+                if key in presets:
+                    preset = presets[key]
+                    name = preset.get("name", key)
+                    self.preset_combo.addItem(name, key)
+
+            # Add any other presets not in the standard order
+            for key, preset in presets.items():
+                if key not in preset_order:
+                    name = preset.get("name", key)
+                    self.preset_combo.addItem(name, key)
+
+            self.preset_combo.setEnabled(True)
+            self.preset_description_label.setText("Select a preset to auto-configure thresholds")
+            self.preset_description_label.setVisible(True)
+            print(f"[PRESET UI] Loaded {len(presets)} presets: {list(presets.keys())}")
+        else:
+            # Legacy model without presets
+            self.preset_combo.addItem("No presets (legacy model)", None)
+            self.preset_combo.setEnabled(False)
+            self.preset_description_label.setText("This model was created without threshold presets. Use sliders for manual tuning.")
+            self.preset_description_label.setVisible(True)
+            print("[PRESET UI] Legacy model - no presets available")
+
+        self.preset_combo.blockSignals(False)
+
     def _setup_protocol_ui(self) -> None:
         self.online_load_model_group_box = self.main_window.ui.onlineLoadModelGroupBox
 
@@ -472,6 +515,32 @@ class OnlineProtocol(QObject):
         self._slider_resolution = 1000  # Slider units per threshold range
 
         main_layout = QVBoxLayout()
+
+        # --- Threshold Preset Dropdown ---
+        preset_layout = QHBoxLayout()
+        preset_label = QLabel("Threshold Preset:")
+        preset_layout.addWidget(preset_label)
+
+        self.preset_combo = QComboBox()
+        self.preset_combo.setMinimumWidth(200)
+        self.preset_combo.addItem("-- Select Preset --", None)
+        self.preset_combo.setEnabled(False)  # Disabled until model with presets is loaded
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_selected)
+        preset_layout.addWidget(self.preset_combo)
+
+        preset_layout.addStretch()
+        main_layout.addLayout(preset_layout)
+
+        # Preset description label
+        self.preset_description_label = QLabel("")
+        self.preset_description_label.setStyleSheet(
+            "color: #666; background-color: #f5f5f5; padding: 6px; border-radius: 4px; font-style: italic;"
+        )
+        self.preset_description_label.setWordWrap(True)
+        self.preset_description_label.setVisible(False)  # Hidden until preset is selected
+        main_layout.addWidget(self.preset_description_label)
+
+        main_layout.addSpacing(10)
 
         # --- OPEN threshold slider ---
         open_label = QLabel("OPEN threshold (distance to open templates):")
@@ -594,6 +663,33 @@ class OnlineProtocol(QObject):
             )
         else:
             self.threshold_closed_label.setText(f"Threshold CLOSED: {threshold:.4f}")
+
+    def _on_preset_selected(self, index: int) -> None:
+        """Called when a preset is selected from the dropdown."""
+        preset_key = self.preset_combo.currentData()
+
+        if preset_key is None:
+            # "Select Preset" placeholder selected
+            self.preset_description_label.setVisible(False)
+            return
+
+        # Apply the preset
+        success = self.model_interface.apply_threshold_preset(preset_key)
+
+        if success:
+            # Update sliders to reflect the new threshold values
+            self._update_threshold_display()
+
+            # Show preset description
+            presets = self.model_interface.get_available_presets()
+            if presets and preset_key in presets:
+                preset = presets[preset_key]
+                description = preset.get("description", "")
+                self.preset_description_label.setText(description)
+                self.preset_description_label.setVisible(True)
+        else:
+            self.preset_description_label.setText("Failed to apply preset")
+            self.preset_description_label.setVisible(True)
 
 
 ######################################

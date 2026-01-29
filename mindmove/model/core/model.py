@@ -118,6 +118,11 @@ class Model:
         self._last_distance = 0.0
         self._last_threshold = 0.0
 
+        # Cross-class statistics and threshold presets (loaded from model)
+        self.mean_cross = None
+        self.std_cross = None
+        self.threshold_presets = None  # dict of preset_key -> {s_open, s_closed, threshold_open, threshold_closed, name, description}
+
 
 
     def _update_buffer(self, new_samples: np.ndarray) -> bool:
@@ -238,6 +243,11 @@ class Model:
 
         self.current_state = "CLOSED"
 
+        # Load cross-class statistics and threshold presets (for intelligent threshold tuning)
+        self.mean_cross = data.get("mean_cross", None)
+        self.std_cross = data.get("std_cross", None)
+        self.threshold_presets = data.get("threshold_presets", None)
+
         # pass
         print(f"Model loaded from: {model_path}")
         print(f"  - OPEN templates: {len(self.templates_open)}")
@@ -249,6 +259,12 @@ class Model:
         print(f"  - Active channels: {len(self.active_channels)}")
         print(f"  - Distance aggregation: {self.distance_aggregation}")
         print(f"  - Smoothing method: {self.smoothing_method}")
+
+        # Print cross-class statistics if available
+        if self.mean_cross is not None:
+            print(f"  - Cross-class distance: mean={self.mean_cross:.4f}, std={self.std_cross:.4f}")
+        if self.threshold_presets is not None:
+            print(f"  - Threshold presets available: {list(self.threshold_presets.keys())}")
 
     def update_threshold_open(self, s_open: float) -> None:
         """
@@ -334,6 +350,64 @@ class Model:
             self.update_threshold_open(s_open)
         if s_closed is not None:
             self.update_threshold_closed(s_closed)
+
+    def apply_threshold_preset(self, preset_key: str) -> bool:
+        """
+        Apply a threshold preset by key.
+
+        Presets are computed during training based on intra-class and cross-class
+        distance statistics. Available presets:
+        - "current": Standard method (mean + 1*std within class)
+        - "cross_class": Midpoint between intra-class and cross-class means
+        - "conservative": Strict threshold to prevent unwanted state changes
+        - "safety_margin": 50% between intra-class mean and cross-class mean
+
+        Args:
+            preset_key: The key of the preset to apply (e.g., "conservative").
+
+        Returns:
+            True if the preset was applied successfully, False otherwise.
+        """
+        if self.threshold_presets is None:
+            print(f"[THRESHOLD] No presets available (legacy model)")
+            return False
+
+        if preset_key not in self.threshold_presets:
+            print(f"[THRESHOLD] Unknown preset: {preset_key}")
+            print(f"[THRESHOLD] Available presets: {list(self.threshold_presets.keys())}")
+            return False
+
+        preset = self.threshold_presets[preset_key]
+        s_open = preset["s_open"]
+        s_closed = preset["s_closed"]
+        preset_name = preset.get("name", preset_key)
+
+        # Apply using s values to ensure consistency with slider UI
+        self.update_threshold_open(s_open)
+        self.update_threshold_closed(s_closed)
+
+        print(f"\n{'='*50}")
+        print(f"  Applied preset: {preset_name}")
+        print(f"  OPEN:   s={s_open:.2f} → threshold={self.THRESHOLD_OPEN:.4f}")
+        print(f"  CLOSED: s={s_closed:.2f} → threshold={self.THRESHOLD_CLOSED:.4f}")
+        print(f"{'='*50}\n")
+
+        return True
+
+    def get_available_presets(self) -> dict:
+        """
+        Return available threshold presets.
+
+        Returns:
+            Dictionary of preset_key -> preset_info, or None if no presets available.
+            Each preset_info contains: s_open, s_closed, threshold_open, threshold_closed,
+            name, and description.
+        """
+        return self.threshold_presets
+
+    def has_threshold_presets(self) -> bool:
+        """Check if this model has threshold presets available."""
+        return self.threshold_presets is not None and len(self.threshold_presets) > 0
 
     def reset_history(self) -> None:
         """Reset all history buffers for a new acquisition session."""

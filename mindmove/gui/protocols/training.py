@@ -388,9 +388,13 @@ class CycleReviewWidget(QWidget):
         self._dragging_window: Optional[DraggableWindow] = None
         self._drag_offset: float = 0
 
-        # Accepted templates
-        self.accepted_closed_templates: List[np.ndarray] = []
-        self.accepted_open_templates: List[np.ndarray] = []
+        # Accepted templates - keyed by cycle index to prevent duplicates
+        self.accepted_closed_templates: Dict[int, np.ndarray] = {}
+        self.accepted_open_templates: Dict[int, np.ndarray] = {}
+
+        # Saved window positions per cycle - preserves positions when changing channels
+        self._saved_closed_positions: Dict[int, int] = {}  # cycle_idx -> start_sample
+        self._saved_open_positions: Dict[int, int] = {}    # cycle_idx -> start_sample
 
         self._setup_ui()
 
@@ -497,8 +501,10 @@ class CycleReviewWidget(QWidget):
         """Set the list of cycles to review."""
         self.cycles = cycles
         self.current_cycle_idx = 0
-        self.accepted_closed_templates = []
-        self.accepted_open_templates = []
+        self.accepted_closed_templates = {}  # Keyed by cycle index
+        self.accepted_open_templates = {}    # Keyed by cycle index
+        self._saved_closed_positions = {}    # Clear saved positions for new data
+        self._saved_open_positions = {}      # Clear saved positions for new data
 
         # Update channel combo for actual channel count
         n_channels = cycles[0]['emg'].shape[0] if cycles else 32
@@ -511,11 +517,23 @@ class CycleReviewWidget(QWidget):
     def _on_channel_changed(self, index: int):
         if index < 0:
             return  # Ignore invalid index (happens when combo is cleared)
+        # Save current window positions before changing channel
+        self._save_window_positions()
         self.current_channel = index
         self._update_display()
 
+    def _save_window_positions(self):
+        """Save current window positions for the current cycle."""
+        if self.closed_window is not None:
+            self._saved_closed_positions[self.current_cycle_idx] = self.closed_window.start_sample
+        if self.open_window is not None:
+            self._saved_open_positions[self.current_cycle_idx] = self.open_window.start_sample
+
     def _reset_windows(self):
         """Reset window positions to defaults for current cycle."""
+        # Clear saved positions for current cycle to force defaults
+        self._saved_closed_positions.pop(self.current_cycle_idx, None)
+        self._saved_open_positions.pop(self.current_cycle_idx, None)
         self._update_display()
 
     def _update_display(self):
@@ -529,11 +547,23 @@ class CycleReviewWidget(QWidget):
         self.next_button.setEnabled(self.current_cycle_idx < n_cycles - 1)
         self.skip_button.setEnabled(self.current_cycle_idx < n_cycles - 1)
 
-        # Update accepted counts
-        self.accepted_label.setText(
-            f"Accepted: {len(self.accepted_closed_templates)} CLOSED, "
-            f"{len(self.accepted_open_templates)} OPEN"
-        )
+        # Update accepted counts (show as "X / Y cycles")
+        n_accepted = len(self.accepted_closed_templates)
+        self.accepted_label.setText(f"Accepted: {n_accepted} / {n_cycles} cycles")
+
+        # Update button text based on whether current cycle is already accepted
+        is_already_accepted = self.current_cycle_idx in self.accepted_closed_templates
+        if is_already_accepted:
+            self.accept_button.setText("✓ Update Templates")
+            self.accept_button.setStyleSheet(
+                "QPushButton { background-color: #FF9800; color: white; font-weight: bold; padding: 8px 16px; }"
+            )
+        else:
+            self.accept_button.setText("✓ Accept Both Templates")
+            self.accept_button.setStyleSheet(
+                "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 16px; }"
+                "QPushButton:disabled { background-color: #cccccc; color: #666666; }"
+            )
 
         # Clear and redraw plot - recreate axes to avoid stale state
         self.figure.clear()
@@ -584,36 +614,44 @@ class CycleReviewWidget(QWidget):
         # Plot EMG signal
         self.ax.plot(time_axis, emg_signal, 'k-', linewidth=0.5, alpha=0.9, label=f'EMG Ch{channel + 1}')
 
-        # Calculate default window positions
-        # CLOSED window: centered around closing phase (after close cue or close_start)
-        closed_default_idx = close_cue_idx if close_cue_idx is not None else close_start_idx
-        if closed_default_idx is None or closed_default_idx == 0:
-            closed_default_idx = n_samples // 4  # Fallback
-
-        # OPEN window: centered around opening phase (after open cue or open_start)
-        open_default_idx = open_cue_idx if open_cue_idx is not None else open_start_idx
-        if open_default_idx is None or open_default_idx == 0:
-            open_default_idx = 3 * n_samples // 4  # Fallback
-
-        # Clamp to valid range
+        # Calculate window positions (use saved positions if available, otherwise defaults)
         max_start = n_samples - self.template_duration_samples
-        closed_default_idx = max(0, min(closed_default_idx, max_start))
-        open_default_idx = max(0, min(open_default_idx, max_start))
 
-        # Create draggable windows
+        # CLOSED window position
+        if self.current_cycle_idx in self._saved_closed_positions:
+            closed_idx = self._saved_closed_positions[self.current_cycle_idx]
+        else:
+            # Default: centered around closing phase (after close cue or close_start)
+            closed_idx = close_cue_idx if close_cue_idx is not None else close_start_idx
+            if closed_idx is None or closed_idx == 0:
+                closed_idx = n_samples // 4  # Fallback
+        closed_idx = max(0, min(closed_idx, max_start))
+
+        # OPEN window position
+        if self.current_cycle_idx in self._saved_open_positions:
+            open_idx = self._saved_open_positions[self.current_cycle_idx]
+        else:
+            # Default: centered around opening phase (after open cue or open_start)
+            open_idx = open_cue_idx if open_cue_idx is not None else open_start_idx
+            if open_idx is None or open_idx == 0:
+                open_idx = 3 * n_samples // 4  # Fallback
+        open_idx = max(0, min(open_idx, max_start))
+
+        # Create draggable windows at calculated positions
         self.closed_window = DraggableWindow(
-            self.ax, closed_default_idx, self.template_duration_samples,
+            self.ax, closed_idx, self.template_duration_samples,
             '#FF5722', 'CLOSED', config.FSAMP
         )
         self.open_window = DraggableWindow(
-            self.ax, open_default_idx, self.template_duration_samples,
+            self.ax, open_idx, self.template_duration_samples,
             '#2196F3', 'OPEN', config.FSAMP
         )
 
         # Labels and formatting
         self.ax.set_xlabel('Time (s)')
         self.ax.set_ylabel(f'Channel {channel + 1} (µV)')
-        self.ax.set_title(f'Cycle {self.current_cycle_idx + 1}: Drag windows to select templates')
+        status = " [ACCEPTED]" if is_already_accepted else ""
+        self.ax.set_title(f'Cycle {self.current_cycle_idx + 1}{status}: Drag windows to select templates')
         self.ax.set_xlim(0, n_samples / config.FSAMP)
 
         # Set explicit y-axis limits based on EMG amplitude
@@ -698,16 +736,18 @@ class CycleReviewWidget(QWidget):
 
     def _go_prev(self):
         if self.current_cycle_idx > 0:
+            self._save_window_positions()  # Preserve positions when navigating
             self.current_cycle_idx -= 1
             self._update_display()
 
     def _go_next(self):
         if self.current_cycle_idx < len(self.cycles) - 1:
+            self._save_window_positions()  # Preserve positions when navigating
             self.current_cycle_idx += 1
             self._update_display()
 
     def _accept_templates(self):
-        """Accept both selected templates and move to next cycle."""
+        """Accept both selected templates (overwrites if cycle already accepted)."""
         if self.closed_window is None or self.open_window is None:
             return
         if self.current_cycle_idx >= len(self.cycles):
@@ -715,39 +755,54 @@ class CycleReviewWidget(QWidget):
 
         cycle = self.cycles[self.current_cycle_idx]
         emg = cycle['emg']
+        cycle_idx = self.current_cycle_idx
 
-        # Extract CLOSED template
+        # Check if this is an overwrite
+        is_overwrite = cycle_idx in self.accepted_closed_templates
+
+        # Extract CLOSED template - store by cycle index (overwrites if exists)
         closed_start, closed_end = self.closed_window.get_sample_range()
         closed_end = min(closed_end, emg.shape[1])
         if closed_end > closed_start:
             closed_template = emg[:, closed_start:closed_end]
-            self.accepted_closed_templates.append(closed_template)
+            self.accepted_closed_templates[cycle_idx] = closed_template
 
-        # Extract OPEN template
+        # Extract OPEN template - store by cycle index (overwrites if exists)
         open_start, open_end = self.open_window.get_sample_range()
         open_end = min(open_end, emg.shape[1])
         if open_end > open_start:
             open_template = emg[:, open_start:open_end]
-            self.accepted_open_templates.append(open_template)
+            self.accepted_open_templates[cycle_idx] = open_template
 
         # Emit signal
         if closed_end > closed_start and open_end > open_start:
             self.templates_accepted.emit(
-                self.accepted_closed_templates[-1],
-                self.accepted_open_templates[-1]
+                self.accepted_closed_templates[cycle_idx],
+                self.accepted_open_templates[cycle_idx]
             )
 
-        # Move to next cycle
-        if self.current_cycle_idx < len(self.cycles) - 1:
-            self.current_cycle_idx += 1
-            self._update_display()
-        else:
-            self.info_label.setText("All cycles reviewed!")
-            self._update_display()
+        # Update display to show accepted status
+        action = "Updated" if is_overwrite else "Accepted"
+        self.info_label.setText(f"{action} templates from cycle {cycle_idx + 1}")
+        self._update_display()
+
+        # Auto-advance to next unaccepted cycle if available
+        if not is_overwrite:
+            for next_idx in range(self.current_cycle_idx + 1, len(self.cycles)):
+                if next_idx not in self.accepted_closed_templates:
+                    self.current_cycle_idx = next_idx
+                    self._update_display()
+                    return
+            # All cycles reviewed
+            if len(self.accepted_closed_templates) == len(self.cycles):
+                self.info_label.setText("All cycles accepted! Click 'Save All' when ready.")
 
     def get_accepted_templates(self) -> Tuple[List[np.ndarray], List[np.ndarray]]:
-        """Return (closed_templates, open_templates)."""
-        return self.accepted_closed_templates, self.accepted_open_templates
+        """Return (closed_templates, open_templates) as lists."""
+        # Convert dicts to lists (sorted by cycle index for consistency)
+        closed_list = [self.accepted_closed_templates[k] for k in sorted(self.accepted_closed_templates.keys())]
+        open_list = [self.accepted_open_templates[k] for k in sorted(self.accepted_open_templates.keys())]
+        return closed_list, open_list
 
 
 class GuidedRecordingReviewDialog(QDialog):
@@ -2617,7 +2672,12 @@ class TrainingProtocol(QObject):
         """Thread function to create DTW model."""
         from mindmove.model.core.features.features_registry import FEATURES
         from mindmove.model.core.windowing import sliding_window
-        from mindmove.model.core.algorithm import compute_threshold, compute_per_template_statistics
+        from mindmove.model.core.algorithm import (
+            compute_threshold,
+            compute_per_template_statistics,
+            compute_cross_class_distances,
+            compute_threshold_presets
+        )
 
         # Get parameters
         window_samples, overlap_samples = self._get_window_overlap_samples()
@@ -2719,6 +2779,40 @@ class TrainingProtocol(QObject):
         print(f"  Open threshold: {threshold_open:.4f} (mean: {mean_open:.4f}, std: {std_open:.4f})")
         print(f"  Closed threshold: {threshold_closed:.4f} (mean: {mean_closed:.4f}, std: {std_closed:.4f})")
 
+        # Compute cross-class distances for intelligent threshold presets
+        print("\nComputing cross-class distances for threshold presets...")
+        mean_cross, std_cross, cross_distances = compute_cross_class_distances(
+            open_templates_features,
+            closed_templates_features,
+            active_channels=None  # Will use config.active_channels
+        )
+        print(f"  Cross-class distance: mean={mean_cross:.4f}, std={std_cross:.4f}")
+        print(f"  Number of cross-class comparisons: {len(cross_distances)}")
+
+        # Compute threshold presets for OPEN class
+        print("\nComputing threshold presets for OPEN...")
+        open_presets = compute_threshold_presets(mean_open, std_open, mean_cross, std_cross)
+        for key, preset in open_presets.items():
+            print(f"  {preset['name']}: threshold={preset['threshold']:.4f} (s={preset['s']:.2f})")
+
+        # Compute threshold presets for CLOSED class
+        print("\nComputing threshold presets for CLOSED...")
+        closed_presets = compute_threshold_presets(mean_closed, std_closed, mean_cross, std_cross)
+        for key, preset in closed_presets.items():
+            print(f"  {preset['name']}: threshold={preset['threshold']:.4f} (s={preset['s']:.2f})")
+
+        # Build combined presets dictionary for model storage
+        threshold_presets = {}
+        for key in open_presets.keys():
+            threshold_presets[key] = {
+                "s_open": open_presets[key]["s"],
+                "s_closed": closed_presets[key]["s"],
+                "threshold_open": open_presets[key]["threshold"],
+                "threshold_closed": closed_presets[key]["threshold"],
+                "name": open_presets[key]["name"],
+                "description": open_presets[key]["description"]
+            }
+
         # Compute per-template statistics
         print("\nAnalyzing template quality...")
 
@@ -2756,6 +2850,11 @@ class TrainingProtocol(QObject):
             "smoothing_method": smoothing_method,
             # New: differential mode flag
             "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
+            # Cross-class statistics for intelligent threshold presets
+            "mean_cross": mean_cross,
+            "std_cross": std_cross,
+            # Threshold presets (computed from intra-class and cross-class statistics)
+            "threshold_presets": threshold_presets,
             "parameters": {
                 "window_samples": window_samples,
                 "overlap_samples": overlap_samples,
