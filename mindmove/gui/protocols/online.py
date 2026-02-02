@@ -6,7 +6,10 @@ from datetime import datetime
 import pickle
 import os
 import time
-from PySide6.QtWidgets import QFileDialog, QSlider, QLabel, QHBoxLayout, QVBoxLayout, QGroupBox, QDoubleSpinBox, QComboBox
+from PySide6.QtWidgets import (
+    QFileDialog, QSlider, QLabel, QHBoxLayout, QVBoxLayout, QGroupBox,
+    QDoubleSpinBox, QComboBox, QCheckBox, QPushButton, QMessageBox
+)
 from PySide6.QtCore import Qt
 import matplotlib.pyplot as plt
 
@@ -34,6 +37,11 @@ class OnlineProtocol(QObject):
             use_diagnostic=config.DIAGNOSTIC_MODE
             )
         self.model_label: str = None
+
+        # Calibration state
+        self.calibration_recording = None
+        self.calibration_result = None
+        self.calibration_thresholds = None
 
         # Buffers
         self.emg_buffer: list[np.ndarray] = []
@@ -124,8 +132,9 @@ class OnlineProtocol(QObject):
                 print("="*70)
                 self.model_interface.print_summary()
 
-            # Plot distance history
-            self._plot_distance_history()
+            # Plot distance history (if enabled)
+            if self.plot_at_end_checkbox.isChecked():
+                self._plot_distance_history()
 
             self._save_data()
 
@@ -365,6 +374,8 @@ class OnlineProtocol(QObject):
             self.model_interface.load_model(None)  # Loads DiagnosticModel
             self.online_model_label.setText("DIAGNOSTIC MODE (no model file)")
             self._update_threshold_display()
+            # Calibration not available in diagnostic mode
+            self.run_calibration_button.setEnabled(False)
             return
 
         # Normal model loading code
@@ -389,6 +400,10 @@ class OnlineProtocol(QObject):
 
         # Update threshold display after loading
         self._update_threshold_display()
+
+        # Enable calibration button if recording is also loaded
+        if self.calibration_recording is not None:
+            self.run_calibration_button.setEnabled(True)
 
     def _update_threshold_display(self) -> None:
         """Update the threshold sliders and labels after model load."""
@@ -498,11 +513,374 @@ class OnlineProtocol(QObject):
         )
         self.online_record_toggle_push_button.clicked.connect(self._toggle_recording)
 
+        # Add offline calibration UI (programmatically)
+        self._setup_calibration_ui()
+
         # Add threshold tuning slider (programmatically)
         self._setup_threshold_slider()
 
         # Add refractory period control (programmatically)
         self._setup_refractory_control()
+
+        # Add plot options checkbox
+        self._setup_plot_options()
+
+    def _setup_calibration_ui(self) -> None:
+        """Setup offline threshold calibration UI."""
+        self.calibration_group_box = QGroupBox("Threshold Offline Calibration")
+        layout = QVBoxLayout()
+
+        # Recording selection row
+        rec_layout = QHBoxLayout()
+        self.calibration_load_button = QPushButton("Load Recording")
+        self.calibration_load_button.clicked.connect(self._load_calibration_recording)
+        rec_layout.addWidget(self.calibration_load_button)
+
+        self.calibration_recording_label = QLabel("No recording loaded")
+        self.calibration_recording_label.setStyleSheet("color: #666;")
+        rec_layout.addWidget(self.calibration_recording_label)
+        rec_layout.addStretch()
+        layout.addLayout(rec_layout)
+
+        # Run calibration button
+        self.run_calibration_button = QPushButton("Run Calibration")
+        self.run_calibration_button.setEnabled(False)
+        self.run_calibration_button.clicked.connect(self._run_calibration)
+        layout.addWidget(self.run_calibration_button)
+
+        # Results display
+        self.calibration_results_label = QLabel("")
+        self.calibration_results_label.setStyleSheet(
+            "font-family: monospace; color: #333333; background-color: #f5f5f5; padding: 8px; border-radius: 4px;"
+        )
+        self.calibration_results_label.setWordWrap(True)
+        self.calibration_results_label.setVisible(False)
+        layout.addWidget(self.calibration_results_label)
+
+        # Apply button
+        self.apply_calibration_button = QPushButton("Apply to Sliders")
+        self.apply_calibration_button.setEnabled(False)
+        self.apply_calibration_button.clicked.connect(self._apply_calibration)
+        layout.addWidget(self.apply_calibration_button)
+
+        self.calibration_group_box.setLayout(layout)
+
+        # Add to the online commands group box layout (after Load Model)
+        if self.online_commands_group_box.layout():
+            self.online_commands_group_box.layout().addWidget(self.calibration_group_box)
+
+    def _load_calibration_recording(self) -> None:
+        """Load a recording file for calibration."""
+        recording_dir = "data/recordings/"
+        if not os.path.exists(recording_dir):
+            recording_dir = "."
+
+        file_path, _ = QFileDialog.getOpenFileName(
+            self.main_window,
+            "Select Recording for Calibration",
+            recording_dir,
+            "Pickle Files (*.pkl)"
+        )
+
+        if not file_path:
+            return
+
+        try:
+            with open(file_path, 'rb') as f:
+                recording = pickle.load(f)
+
+            # Verify it has required data
+            if 'emg' not in recording:
+                QMessageBox.warning(
+                    self.main_window,
+                    "Invalid Recording",
+                    "Recording must contain 'emg' data."
+                )
+                return
+
+            if 'gt' not in recording:
+                QMessageBox.warning(
+                    self.main_window,
+                    "Missing Ground Truth",
+                    "Recording must have 'gt' (ground truth) signal for calibration.\n\n"
+                    "Use a recording from guided_record protocol that includes GT."
+                )
+                return
+
+            self.calibration_recording = recording
+            self.calibration_recording_path = file_path
+
+            # Update UI
+            filename = os.path.basename(file_path)
+            emg_shape = recording['emg'].shape
+            gt_shape = recording['gt'].shape if hasattr(recording['gt'], 'shape') else len(recording['gt'])
+            duration = emg_shape[1] / config.FSAMP
+
+            self.calibration_recording_label.setText(
+                f"{filename} ({duration:.1f}s)"
+            )
+            self.calibration_recording_label.setStyleSheet("color: green;")
+
+            # Enable run button only if model is also loaded
+            if self.model_interface.model_is_loaded:
+                self.run_calibration_button.setEnabled(True)
+
+            print(f"[CALIBRATION] Loaded recording: {filename}")
+            print(f"  EMG shape: {emg_shape}")
+            print(f"  GT shape: {gt_shape}")
+            print(f"  Duration: {duration:.1f}s")
+
+        except Exception as e:
+            QMessageBox.critical(
+                self.main_window,
+                "Error Loading Recording",
+                f"Failed to load recording:\n{str(e)}"
+            )
+
+    def _run_calibration(self) -> None:
+        """Run offline calibration to find plateau thresholds."""
+        if not self.calibration_recording or not self.model_interface.model_is_loaded:
+            return
+
+        print("\n" + "=" * 70)
+        print("RUNNING OFFLINE THRESHOLD CALIBRATION")
+        print("=" * 70)
+
+        # Get data
+        emg = self.calibration_recording['emg']
+        gt = self.calibration_recording['gt']
+
+        # Ensure gt is 1D array
+        if hasattr(gt, 'flatten'):
+            gt = gt.flatten()
+        gt = np.array(gt)
+
+        # Get model parameters
+        model = self.model_interface.model
+        templates_open = model.templates_open
+        templates_closed = model.templates_closed
+        feature_name = model.feature_name
+        window_length = model.window_length
+        increment = model.increment
+        active_channels = model.active_channels
+        distance_aggregation = model.distance_aggregation
+
+        print(f"  Feature: {feature_name}")
+        print(f"  Window/increment: {window_length}/{increment} samples")
+        print(f"  Active channels: {len(active_channels)}")
+        print(f"  Distance aggregation: {distance_aggregation}")
+
+        # Compute continuous distances
+        from mindmove.model.core.algorithm import compute_calibration_distances, find_plateau_thresholds
+
+        print("\nComputing DTW distances over recording...")
+        self.calibration_result = compute_calibration_distances(
+            emg, gt,
+            templates_open, templates_closed,
+            feature_name=feature_name,
+            window_length=window_length,
+            increment=increment,
+            active_channels=active_channels,
+            distance_aggregation=distance_aggregation,
+        )
+
+        n_dtw = len(self.calibration_result['timestamps'])
+        print(f"  Computed {n_dtw} DTW distances")
+
+        # Find plateau thresholds
+        print("\nFinding plateau thresholds...")
+        self.calibration_thresholds = find_plateau_thresholds(
+            self.calibration_result['D_open'],
+            self.calibration_result['D_closed'],
+            self.calibration_result['gt_at_dtw'],
+            confidence_k=1.0,
+        )
+
+        # Display results
+        open_plateau = self.calibration_thresholds['open_plateau']
+        closed_plateau = self.calibration_thresholds['closed_plateau']
+        threshold_open = self.calibration_thresholds['threshold_open']
+        threshold_closed = self.calibration_thresholds['threshold_closed']
+        open_std = self.calibration_thresholds['open_std']
+        closed_std = self.calibration_thresholds['closed_std']
+
+        print(f"\n  OPEN plateau:   {open_plateau:.4f} (std={open_std:.4f})")
+        print(f"  OPEN threshold: {threshold_open:.4f}")
+        print(f"\n  CLOSED plateau: {closed_plateau:.4f} (std={closed_std:.4f})")
+        print(f"  CLOSED threshold: {threshold_closed:.4f}")
+        print("=" * 70 + "\n")
+
+        # Update UI
+        self.calibration_results_label.setText(
+            f"OPEN plateau:     {open_plateau:.4f}\n"
+            f"OPEN threshold:   {threshold_open:.4f} (plateau + 1.0 × std)\n\n"
+            f"CLOSED plateau:   {closed_plateau:.4f}\n"
+            f"CLOSED threshold: {threshold_closed:.4f} (plateau + 1.0 × std)"
+        )
+        self.calibration_results_label.setVisible(True)
+        self.apply_calibration_button.setEnabled(True)
+
+        # Plot calibration results
+        self._plot_calibration_results()
+
+    def _plot_calibration_results(self) -> None:
+        """Plot calibration results showing distances and computed thresholds.
+
+        For guided bidirectional recordings, also shows:
+        - Audio cue markers (blue dashed vertical lines)
+        - GT ramps (linear transitions 0→1 and 1→0)
+        - Reaction time periods (cyan shaded regions)
+        """
+        if not self.calibration_result or not self.calibration_thresholds:
+            return
+
+        emg = self.calibration_recording['emg']
+        gt = self.calibration_recording['gt']
+        if hasattr(gt, 'flatten'):
+            gt = gt.flatten()
+
+        # Get calibration data
+        timestamps = self.calibration_result['timestamps']
+        D_open = self.calibration_result['D_open']
+        D_closed = self.calibration_result['D_closed']
+        gt_at_dtw = self.calibration_result['gt_at_dtw']
+
+        # Thresholds
+        threshold_open = self.calibration_thresholds['threshold_open']
+        threshold_closed = self.calibration_thresholds['threshold_closed']
+        plateau_open = self.calibration_thresholds['open_plateau']
+        plateau_closed = self.calibration_thresholds['closed_plateau']
+
+        # Time axis for EMG
+        time_emg = np.arange(emg.shape[1]) / config.FSAMP
+
+        # Check if this is a guided bidirectional recording
+        is_guided = self.calibration_recording.get('gt_mode') == 'guided_animation'
+        cycles = self.calibration_recording.get('cycles', [])
+        timings_emg = self.calibration_recording.get('timings_emg')
+        recording_start_time = timings_emg[0] if timings_emg is not None and len(timings_emg) > 0 else None
+
+        # Extract cue times from cycles (convert absolute timestamps to seconds from start)
+        close_cue_times = []
+        open_cue_times = []
+        reaction_times = []  # List of (cue_time, reaction_duration) tuples
+
+        if is_guided and cycles and recording_start_time is not None:
+            for cycle in cycles:
+                close_cue_time = cycle.get('close_cue_time')
+                open_cue_time = cycle.get('open_cue_time')
+                timing_config = cycle.get('timing_config', {})
+                reaction_time_s = timing_config.get('reaction_time_s', 0.2)
+
+                if close_cue_time is not None:
+                    cue_s = close_cue_time - recording_start_time
+                    close_cue_times.append(cue_s)
+                    reaction_times.append((cue_s, reaction_time_s, 'close'))
+
+                if open_cue_time is not None:
+                    cue_s = open_cue_time - recording_start_time
+                    open_cue_times.append(cue_s)
+                    reaction_times.append((cue_s, reaction_time_s, 'open'))
+
+        # Create 4-subplot figure
+        fig, axs = plt.subplots(4, 1, figsize=(14, 10), sharex=True)
+
+        # Plot 1: EMG with GT overlay
+        ax = axs[0]
+        ax.plot(time_emg, emg[0, :], 'b-', linewidth=0.5, alpha=0.7)
+        emg_max = np.max(np.abs(emg[0, :])) if np.max(np.abs(emg[0, :])) > 0 else 1
+        # Ensure gt has same length as time_emg for fill_between
+        gt_for_plot = gt[:len(time_emg)] if len(gt) >= len(time_emg) else np.pad(gt, (0, len(time_emg) - len(gt)))
+        ax.fill_between(time_emg, -emg_max, emg_max, where=gt_for_plot > 0.5,
+                        alpha=0.15, color='green', label='GT=CLOSED')
+        ax.set_ylabel("EMG Ch1 (µV)")
+        ax.set_title("Offline Threshold Calibration" + (" (Guided Recording)" if is_guided else ""))
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+        # Plot 2: D_open
+        ax = axs[1]
+        ax.plot(timestamps, D_open, 'g-', linewidth=1, label='D_open')
+        ax.axhline(threshold_open, color='r', linestyle='--', linewidth=2,
+                   label=f'Threshold: {threshold_open:.4f}')
+        ax.axhline(plateau_open, color='b', linestyle=':', linewidth=2,
+                   label=f'Plateau: {plateau_open:.4f}')
+        ax.set_ylabel("DTW Distance")
+        ax.set_title("Distance to OPEN templates (checked when hand CLOSED)")
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+        # Plot 3: D_closed
+        ax = axs[2]
+        ax.plot(timestamps, D_closed, 'orange', linewidth=1, label='D_closed')
+        ax.axhline(threshold_closed, color='r', linestyle='--', linewidth=2,
+                   label=f'Threshold: {threshold_closed:.4f}')
+        ax.axhline(plateau_closed, color='b', linestyle=':', linewidth=2,
+                   label=f'Plateau: {plateau_closed:.4f}')
+        ax.set_ylabel("DTW Distance")
+        ax.set_title("Distance to CLOSED templates (checked when hand OPEN)")
+        ax.legend(loc='upper right')
+        ax.grid(True, alpha=0.3)
+
+        # Plot 4: GT with cues and ramps
+        ax = axs[3]
+
+        # Plot GT - use line plot for ramps if guided, step for binary
+        gt_len = min(len(gt), len(time_emg))
+        if is_guided:
+            # Guided recording: GT has linear ramps (0.0 → 1.0 during closing, 1.0 → 0.0 during opening)
+            ax.plot(time_emg[:gt_len], gt[:gt_len], 'purple', linewidth=2, label='GT (with ramps)')
+
+            # Add audio cue markers
+            for i, cue_time in enumerate(close_cue_times):
+                label = 'Close cue' if i == 0 else None
+                ax.axvline(cue_time, color='#1976D2', linestyle='--', linewidth=1.5,
+                           alpha=0.8, label=label)
+
+            for i, cue_time in enumerate(open_cue_times):
+                label = 'Open cue' if i == 0 else None
+                ax.axvline(cue_time, color='#0288D1', linestyle='-.', linewidth=1.5,
+                           alpha=0.8, label=label)
+
+            # Add reaction time shading (between cue and GT transition start)
+            for cue_time, reaction_s, cue_type in reaction_times:
+                color = '#FFF3E0' if cue_type == 'close' else '#E3F2FD'  # Light orange or light blue
+                ax.axvspan(cue_time, cue_time + reaction_s, alpha=0.3, color=color)
+
+            ax.legend(loc='upper right', fontsize=8)
+        else:
+            # Non-guided recording: binary GT
+            ax.step(time_emg[:gt_len], gt[:gt_len], 'purple', linewidth=2, where='post')
+
+        ax.set_ylabel("GT State")
+        ax.set_xlabel("Time (s)")
+        ax.set_ylim(-0.1, 1.1)
+        ax.set_yticks([0, 1])
+        ax.set_yticklabels(['OPEN', 'CLOSED'])
+        ax.grid(True, alpha=0.3)
+
+        plt.tight_layout()
+        plt.show(block=False)
+        plt.pause(0.1)
+
+    def _apply_calibration(self) -> None:
+        """Apply calibrated thresholds to sliders."""
+        if not self.calibration_thresholds:
+            return
+
+        threshold_open = self.calibration_thresholds['threshold_open']
+        threshold_closed = self.calibration_thresholds['threshold_closed']
+
+        # Set thresholds directly
+        self.model_interface.set_threshold_open_direct(threshold_open)
+        self.model_interface.set_threshold_closed_direct(threshold_closed)
+
+        # Update slider display
+        self._update_threshold_display()
+
+        print(f"\n[CALIBRATION] Applied thresholds:")
+        print(f"  OPEN:   {threshold_open:.4f}")
+        print(f"  CLOSED: {threshold_closed:.4f}\n")
 
     def _setup_threshold_slider(self) -> None:
         """Setup threshold tuning sliders UI (direct threshold control)."""
@@ -627,6 +1005,30 @@ class OnlineProtocol(QObject):
     def _on_refractory_changed(self, value: float) -> None:
         """Called when refractory period spinbox value changes."""
         self.model_interface.set_refractory_period(value)
+
+    def _setup_plot_options(self) -> None:
+        """Setup plot options UI."""
+        # Create a group box for plot options
+        self.plot_options_group_box = QGroupBox("Recording Options")
+
+        layout = QHBoxLayout()
+
+        # Checkbox for plotting at end
+        self.plot_at_end_checkbox = QCheckBox("Show plot after recording")
+        self.plot_at_end_checkbox.setChecked(True)  # Default: show plot
+        self.plot_at_end_checkbox.setToolTip(
+            "When enabled, displays distance history plot after stopping recording.\n"
+            "Disable for long recordings to avoid popup."
+        )
+        layout.addWidget(self.plot_at_end_checkbox)
+
+        layout.addStretch()
+
+        self.plot_options_group_box.setLayout(layout)
+
+        # Add to the online commands group box layout
+        if self.online_commands_group_box.layout():
+            self.online_commands_group_box.layout().addWidget(self.plot_options_group_box)
 
     def _on_threshold_open_changed(self, value: int) -> None:
         """Called when OPEN threshold slider is moved (direct threshold control)."""

@@ -652,3 +652,226 @@ def compute_distance_from_training_set_online(
         aggregated_distance = np.mean(distances)
 
     return aggregated_distance
+
+
+def compute_calibration_distances(
+    emg: np.ndarray,
+    gt: np.ndarray,
+    templates_open: list,
+    templates_closed: list,
+    feature_name: str = 'wl',
+    window_length: int = None,
+    increment: int = None,
+    buffer_duration_s: float = 1.0,
+    dtw_interval_s: float = 0.05,
+    active_channels: list = None,
+    distance_aggregation: str = "average",
+):
+    """
+    Compute continuous DTW distances over a recording for offline calibration.
+
+    Simulates real-time processing: slides a 1-second buffer over the recording
+    and computes DTW distances at regular intervals (like online protocol).
+
+    Parameters
+    ----------
+    emg : np.ndarray
+        EMG data, shape (n_channels, n_samples).
+    gt : np.ndarray
+        Ground truth signal, shape (n_samples,). Values 0=OPEN, 1=CLOSED.
+    templates_open : list of np.ndarray
+        Feature-extracted OPEN templates, each (n_windows, n_channels).
+    templates_closed : list of np.ndarray
+        Feature-extracted CLOSED templates, each (n_windows, n_channels).
+    feature_name : str
+        Feature to use (default 'wl').
+    window_length : int
+        Window length for feature extraction in samples. If None, uses config.
+    increment : int
+        Overlap for feature extraction in samples. If None, uses config.
+    buffer_duration_s : float
+        Duration of the sliding buffer in seconds (default 1.0).
+    dtw_interval_s : float
+        Interval between DTW computations in seconds (default 0.05 = 50ms).
+    active_channels : list or None
+        Active channel indices. If None, uses config.active_channels.
+    distance_aggregation : str
+        Method for aggregating distances ("average", "minimum", "avg_3_smallest").
+
+    Returns
+    -------
+    dict with keys:
+        "timestamps": np.ndarray - Time of each DTW computation (seconds).
+        "D_open": np.ndarray - Distance to OPEN templates at each timestamp.
+        "D_closed": np.ndarray - Distance to CLOSED templates at each timestamp.
+        "gt_at_dtw": np.ndarray - GT value at each DTW timestamp.
+    """
+    from mindmove.model.core.windowing import sliding_window
+
+    # Use config defaults if not specified
+    if window_length is None:
+        window_length = config.window_length
+    if increment is None:
+        increment = config.increment
+    if active_channels is None:
+        active_channels = config.active_channels
+
+    # Get feature function
+    feature_info = FEATURES[feature_name]
+    feature_fn = feature_info["function"]
+
+    # Calculate sample counts
+    n_channels, n_samples = emg.shape
+    buffer_samples = int(buffer_duration_s * config.FSAMP)
+    dtw_interval_samples = int(dtw_interval_s * config.FSAMP)
+
+    # Storage for results
+    timestamps = []
+    D_open_list = []
+    D_closed_list = []
+    gt_at_dtw_list = []
+
+    # Slide buffer over recording
+    # Start when we have at least one full buffer
+    start_idx = buffer_samples
+    end_idx = n_samples
+
+    current_idx = start_idx
+    while current_idx <= end_idx:
+        # Extract 1-second buffer ending at current_idx
+        buffer_start = current_idx - buffer_samples
+        buffer_end = current_idx
+        emg_buffer = emg[:, buffer_start:buffer_end]
+
+        # Extract features
+        windowed = sliding_window(emg_buffer, window_length, increment)
+        features = feature_fn(windowed)
+
+        # Compute DTW to both template sets
+        D_open = compute_distance_from_training_set_online(
+            features, templates_open,
+            active_channels=active_channels,
+            distance_aggregation=distance_aggregation
+        )
+        D_closed = compute_distance_from_training_set_online(
+            features, templates_closed,
+            active_channels=active_channels,
+            distance_aggregation=distance_aggregation
+        )
+
+        # Get GT at this timestamp (use the value at the end of the buffer)
+        gt_idx = min(buffer_end - 1, len(gt) - 1)
+        gt_value = gt[gt_idx] if gt_idx >= 0 else 0
+
+        # Store results
+        timestamps.append(buffer_end / config.FSAMP)
+        D_open_list.append(D_open)
+        D_closed_list.append(D_closed)
+        gt_at_dtw_list.append(gt_value)
+
+        # Advance by DTW interval
+        current_idx += dtw_interval_samples
+
+    return {
+        "timestamps": np.array(timestamps),
+        "D_open": np.array(D_open_list),
+        "D_closed": np.array(D_closed_list),
+        "gt_at_dtw": np.array(gt_at_dtw_list),
+    }
+
+
+def find_plateau_thresholds(
+    D_open: np.ndarray,
+    D_closed: np.ndarray,
+    gt: np.ndarray,
+    confidence_k: float = 1.0,
+    plateau_percentile: float = 10.0,
+):
+    """
+    Find plateau values during state transitions and compute thresholds.
+
+    During a true transition (e.g., OPEN->CLOSED), the distance to the target
+    state templates (D_closed) drops and reaches a stable minimum (plateau).
+    The threshold should be set just above this plateau to reliably detect
+    transitions while avoiding false triggers.
+
+    Parameters
+    ----------
+    D_open : np.ndarray
+        Distance to OPEN templates over time.
+    D_closed : np.ndarray
+        Distance to CLOSED templates over time.
+    gt : np.ndarray
+        Ground truth at each DTW timestamp (0=OPEN, 1=CLOSED).
+    confidence_k : float
+        Multiplier for standard deviation to add to plateau value (default 1.0).
+        threshold = plateau_mean + k * plateau_std
+    plateau_percentile : float
+        Percentile of distances to use as plateau (default 10th percentile).
+        Lower values = more aggressive (closer to minimum).
+
+    Returns
+    -------
+    dict with keys:
+        "open_plateau": float - Mean distance during OPENING transitions plateau.
+        "closed_plateau": float - Mean distance during CLOSING transitions plateau.
+        "threshold_open": float - Computed threshold for OPEN detection.
+        "threshold_closed": float - Computed threshold for CLOSED detection.
+        "open_std": float - Std of OPEN plateau distances.
+        "closed_std": float - Std of CLOSED plateau distances.
+        "open_distances_in_state": np.ndarray - D_open when GT=1 (hand closed).
+        "closed_distances_in_state": np.ndarray - D_closed when GT=0 (hand open).
+    """
+    # Ensure gt is 1D
+    if gt.ndim > 1:
+        gt = gt.flatten()
+
+    # For OPEN detection: we look at D_open when GT=1 (hand is closed, checking for open)
+    # The plateau is when D_open is at its minimum during closed state
+    # (i.e., when we're about to transition to open or during active opening)
+    closed_mask = gt > 0.5  # GT=1 means hand is CLOSED
+    open_mask = gt <= 0.5   # GT=0 means hand is OPEN
+
+    # D_open when hand is CLOSED (checking if should open)
+    D_open_when_closed = D_open[closed_mask] if np.any(closed_mask) else np.array([])
+
+    # D_closed when hand is OPEN (checking if should close)
+    D_closed_when_open = D_closed[open_mask] if np.any(open_mask) else np.array([])
+
+    # Find plateau values using percentile (more robust than minimum)
+    if len(D_open_when_closed) > 0:
+        # Use low percentile as plateau estimate
+        open_plateau = np.percentile(D_open_when_closed, plateau_percentile)
+        # Compute std of values near the plateau (bottom 25%)
+        threshold_for_std = np.percentile(D_open_when_closed, 25)
+        near_plateau_open = D_open_when_closed[D_open_when_closed <= threshold_for_std]
+        open_std = np.std(near_plateau_open) if len(near_plateau_open) > 1 else 0.01
+    else:
+        open_plateau = 0.1
+        open_std = 0.01
+
+    if len(D_closed_when_open) > 0:
+        # Use low percentile as plateau estimate
+        closed_plateau = np.percentile(D_closed_when_open, plateau_percentile)
+        # Compute std of values near the plateau (bottom 25%)
+        threshold_for_std = np.percentile(D_closed_when_open, 25)
+        near_plateau_closed = D_closed_when_open[D_closed_when_open <= threshold_for_std]
+        closed_std = np.std(near_plateau_closed) if len(near_plateau_closed) > 1 else 0.01
+    else:
+        closed_plateau = 0.1
+        closed_std = 0.01
+
+    # Compute thresholds: plateau + k * std
+    threshold_open = open_plateau + confidence_k * open_std
+    threshold_closed = closed_plateau + confidence_k * closed_std
+
+    return {
+        "open_plateau": open_plateau,
+        "closed_plateau": closed_plateau,
+        "threshold_open": threshold_open,
+        "threshold_closed": threshold_closed,
+        "open_std": open_std,
+        "closed_std": closed_std,
+        "open_distances_in_state": D_open_when_closed,
+        "closed_distances_in_state": D_closed_when_open,
+    }

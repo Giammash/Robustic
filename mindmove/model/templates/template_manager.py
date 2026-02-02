@@ -647,6 +647,10 @@ class TemplateManager:
         - Rising edge (0→1): CLOSED activation (closing movement)
         - Falling edge (1→0): OPEN activation (opening movement)
 
+        For inverted protocol recordings (close→open→close), the mapping is swapped:
+        - First transition (falling 1→0): OPEN activation
+        - Second transition (rising 0→1): CLOSED activation
+
         Args:
             recording: Recording dict in any supported format
             min_duration_s: Minimum activation duration to keep
@@ -667,6 +671,9 @@ class TemplateManager:
         kinematics = normalized["kinematics"]
         gt_mode = normalized.get("gt_mode", None)
 
+        # Detect protocol mode (standard or inverted)
+        protocol_mode = recording.get("animation_config", {}).get("protocol_mode", "standard")
+
         # Determine how to process ground truth
         if gt_mode in ["keyboard", "guided_animation"] or kinematics.shape[0] == 1:
             # Keyboard/guided format - kinematics is already binary at EMG rate
@@ -677,8 +684,8 @@ class TemplateManager:
 
         # Find all transitions
         gt_diff = np.diff(gt_binary, prepend=gt_binary[0])
-        rising_edges = np.where(gt_diff == 1)[0]   # 0→1 = CLOSING starts
-        falling_edges = np.where(gt_diff == -1)[0]  # 1→0 = OPENING starts
+        rising_edges = np.where(gt_diff == 1)[0]   # 0→1 = CLOSING starts (standard) or CLOSING (inverted)
+        falling_edges = np.where(gt_diff == -1)[0]  # 1→0 = OPENING starts (standard) or OPENING (inverted)
 
         min_samples = int(min_duration_s * config.FSAMP)
         pre_context_samples = int(pre_context_s * config.FSAMP)
@@ -736,6 +743,7 @@ class TemplateManager:
         self.all_activations["open"].extend(open_activations)
 
         print(f"[BIDIRECTIONAL] Extracted {len(closed_activations)} CLOSED, {len(open_activations)} OPEN activations")
+        print(f"  Protocol mode: {protocol_mode}")
         print(f"  Pre-context: {pre_context_s}s, Max duration: {max_duration_s}s")
 
         result = {"open": open_activations, "closed": closed_activations}
@@ -794,6 +802,8 @@ class TemplateManager:
             gt_binary = self._convert_kinematics_to_binary(kinematics, emg.shape[1])
             gt_signal = gt_binary.astype(float)
 
+        # Detect protocol mode (standard or inverted)
+        protocol_mode = recording.get("animation_config", {}).get("protocol_mode", "standard")
 
         # Get audio cue times from guided recording metadata (if available)
         cycle_boundaries = recording.get('cycles', [])
@@ -811,66 +821,129 @@ class TemplateManager:
 
         cycles = []
 
-        # For each rising edge (closing start), find the corresponding falling edge (opening start)
-        for cycle_num, rise_idx in enumerate(rising_edges, start=1):
-            # Find the next falling edge after this rising edge
-            next_falls = falling_edges[falling_edges > rise_idx]
-            if len(next_falls) == 0:
-                # No falling edge found - incomplete cycle, skip
-                continue
-            fall_idx = next_falls[0]
+        if protocol_mode == "inverted":
+            # Inverted: cycle goes 1→0→1 (closed→open→closed)
+            # First transition is falling (opening), second is rising (closing)
+            # For each falling edge (opening start), find the next rising edge (closing start)
+            for cycle_num, fall_idx in enumerate(falling_edges, start=1):
+                # Find the next rising edge after this falling edge
+                next_rises = rising_edges[rising_edges > fall_idx]
+                if len(next_rises) == 0:
+                    # No rising edge found - incomplete cycle, skip
+                    continue
+                rise_idx = next_rises[0]
 
-            # Calculate cycle boundaries
-            # Start: pre_close_s before the rising edge
-            cycle_start = max(0, rise_idx - pre_close_samples)
-            # End: post_open_s after the falling edge
-            cycle_end = min(len(gt_binary), fall_idx + post_open_samples)
+                # Calculate cycle boundaries
+                # Start: pre_open_s before the falling edge (use pre_close_s for consistency)
+                cycle_start = max(0, fall_idx - pre_close_samples)
+                # End: post_close_s after the rising edge (use post_open_s for consistency)
+                cycle_end = min(len(gt_binary), rise_idx + post_open_samples)
 
-            # Extract EMG and GT for this cycle
-            cycle_emg = emg[:, cycle_start:cycle_end]
-            cycle_gt = gt_signal[cycle_start:cycle_end]
+                # Extract EMG and GT for this cycle
+                cycle_emg = emg[:, cycle_start:cycle_end]
+                cycle_gt = gt_signal[cycle_start:cycle_end]
 
-            # Calculate relative indices within the cycle
-            close_start_relative = rise_idx - cycle_start
-            open_start_relative = fall_idx - cycle_start
+                # Calculate relative indices within the cycle
+                # In inverted mode: first transition is opening, second is closing
+                open_start_relative = fall_idx - cycle_start   # Where GT goes 1→0 (first transition)
+                close_start_relative = rise_idx - cycle_start  # Where GT goes 0→1 (second transition)
 
-            # Try to get audio cue times from cycle metadata
-            close_cue_idx = None
-            open_cue_idx = None
+                # Try to get audio cue times from cycle metadata
+                close_cue_idx = None
+                open_cue_idx = None
 
-            if cycle_num <= len(cycle_boundaries) and recording_start_time is not None:
-                cycle_meta = cycle_boundaries[cycle_num - 1]
-                close_cue_time = cycle_meta.get('close_cue_time')
-                open_cue_time = cycle_meta.get('open_cue_time')
+                if cycle_num <= len(cycle_boundaries) and recording_start_time is not None:
+                    cycle_meta = cycle_boundaries[cycle_num - 1]
+                    close_cue_time = cycle_meta.get('close_cue_time')
+                    open_cue_time = cycle_meta.get('open_cue_time')
 
-                if close_cue_time is not None:
-                    # Convert absolute timestamp to sample index relative to recording start
-                    close_cue_abs_idx = int((close_cue_time - recording_start_time) * config.FSAMP)
-                    # Convert to relative index within this cycle view
-                    close_cue_idx = close_cue_abs_idx - cycle_start
-                    if close_cue_idx < 0 or close_cue_idx >= cycle_emg.shape[1]:
-                        close_cue_idx = None  # Out of bounds
+                    if close_cue_time is not None:
+                        close_cue_abs_idx = int((close_cue_time - recording_start_time) * config.FSAMP)
+                        close_cue_idx = close_cue_abs_idx - cycle_start
+                        if close_cue_idx < 0 or close_cue_idx >= cycle_emg.shape[1]:
+                            close_cue_idx = None
 
-                if open_cue_time is not None:
-                    open_cue_abs_idx = int((open_cue_time - recording_start_time) * config.FSAMP)
-                    open_cue_idx = open_cue_abs_idx - cycle_start
-                    if open_cue_idx < 0 or open_cue_idx >= cycle_emg.shape[1]:
-                        open_cue_idx = None  # Out of bounds
+                    if open_cue_time is not None:
+                        open_cue_abs_idx = int((open_cue_time - recording_start_time) * config.FSAMP)
+                        open_cue_idx = open_cue_abs_idx - cycle_start
+                        if open_cue_idx < 0 or open_cue_idx >= cycle_emg.shape[1]:
+                            open_cue_idx = None
 
-            cycles.append({
-                'emg': cycle_emg,
-                'gt': cycle_gt,
-                'close_start_idx': close_start_relative,  # Where GT goes 0→1
-                'open_start_idx': open_start_relative,    # Where GT goes 1→0
-                'close_cue_idx': close_cue_idx,           # Audio cue time (if available)
-                'open_cue_idx': open_cue_idx,             # Audio cue time (if available)
-                'cycle_number': cycle_num,
-                'duration_s': cycle_emg.shape[1] / config.FSAMP,
-            })
+                cycles.append({
+                    'emg': cycle_emg,
+                    'gt': cycle_gt,
+                    'close_start_idx': close_start_relative,  # Where GT goes 0→1 (second in inverted)
+                    'open_start_idx': open_start_relative,    # Where GT goes 1→0 (first in inverted)
+                    'close_cue_idx': close_cue_idx,           # Audio cue time (if available)
+                    'open_cue_idx': open_cue_idx,             # Audio cue time (if available)
+                    'cycle_number': cycle_num,
+                    'duration_s': cycle_emg.shape[1] / config.FSAMP,
+                    'protocol_mode': protocol_mode,
+                })
+        else:
+            # Standard: cycle goes 0→1→0 (open→closed→open)
+            # First transition is rising (closing), second is falling (opening)
+            # For each rising edge (closing start), find the corresponding falling edge (opening start)
+            for cycle_num, rise_idx in enumerate(rising_edges, start=1):
+                # Find the next falling edge after this rising edge
+                next_falls = falling_edges[falling_edges > rise_idx]
+                if len(next_falls) == 0:
+                    # No falling edge found - incomplete cycle, skip
+                    continue
+                fall_idx = next_falls[0]
+
+                # Calculate cycle boundaries
+                # Start: pre_close_s before the rising edge
+                cycle_start = max(0, rise_idx - pre_close_samples)
+                # End: post_open_s after the falling edge
+                cycle_end = min(len(gt_binary), fall_idx + post_open_samples)
+
+                # Extract EMG and GT for this cycle
+                cycle_emg = emg[:, cycle_start:cycle_end]
+                cycle_gt = gt_signal[cycle_start:cycle_end]
+
+                # Calculate relative indices within the cycle
+                close_start_relative = rise_idx - cycle_start
+                open_start_relative = fall_idx - cycle_start
+
+                # Try to get audio cue times from cycle metadata
+                close_cue_idx = None
+                open_cue_idx = None
+
+                if cycle_num <= len(cycle_boundaries) and recording_start_time is not None:
+                    cycle_meta = cycle_boundaries[cycle_num - 1]
+                    close_cue_time = cycle_meta.get('close_cue_time')
+                    open_cue_time = cycle_meta.get('open_cue_time')
+
+                    if close_cue_time is not None:
+                        # Convert absolute timestamp to sample index relative to recording start
+                        close_cue_abs_idx = int((close_cue_time - recording_start_time) * config.FSAMP)
+                        # Convert to relative index within this cycle view
+                        close_cue_idx = close_cue_abs_idx - cycle_start
+                        if close_cue_idx < 0 or close_cue_idx >= cycle_emg.shape[1]:
+                            close_cue_idx = None  # Out of bounds
+
+                    if open_cue_time is not None:
+                        open_cue_abs_idx = int((open_cue_time - recording_start_time) * config.FSAMP)
+                        open_cue_idx = open_cue_abs_idx - cycle_start
+                        if open_cue_idx < 0 or open_cue_idx >= cycle_emg.shape[1]:
+                            open_cue_idx = None  # Out of bounds
+
+                cycles.append({
+                    'emg': cycle_emg,
+                    'gt': cycle_gt,
+                    'close_start_idx': close_start_relative,  # Where GT goes 0→1
+                    'open_start_idx': open_start_relative,    # Where GT goes 1→0
+                    'close_cue_idx': close_cue_idx,           # Audio cue time (if available)
+                    'open_cue_idx': open_cue_idx,             # Audio cue time (if available)
+                    'cycle_number': cycle_num,
+                    'duration_s': cycle_emg.shape[1] / config.FSAMP,
+                    'protocol_mode': protocol_mode,
+                })
 
         # Simple summary output
         if cycles:
-            print(f"Extracted {len(cycles)} cycles ({cycles[0]['duration_s']:.1f}s each)")
+            print(f"Extracted {len(cycles)} cycles ({cycles[0]['duration_s']:.1f}s each, {protocol_mode} mode)")
 
         return cycles
 

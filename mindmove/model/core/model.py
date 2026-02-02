@@ -134,10 +134,21 @@ class Model:
             bool: True if enough samples are available for DTW computation, False otherwise.
         """
         # new_samples shape: (n_channels, n_new_samples)
+        incoming_channels = new_samples.shape[0]
         n_new_samples = new_samples.shape[1]
-        # print(n_new_samples.shape)
-        # print(f"number of new samples: {n_new_samples}")
-        # print(f"buffer length: {self.buffer_length}")
+
+        # Check if buffer needs to be resized for different channel count
+        # This handles switching between monopolar (32ch) and SD (16ch) modes
+        if self.emg_rt_buffer.shape[0] != incoming_channels:
+            print(f"[MODEL] Buffer channel mismatch: buffer={self.emg_rt_buffer.shape[0]}, "
+                  f"incoming={incoming_channels}. Reinitializing buffer.")
+            self.emg_rt_buffer = np.zeros((incoming_channels, self.buffer_length))
+            self.num_channels = incoming_channels
+            # Recompute active_channels for new channel count
+            # Filter dead_channels to only include valid indices for current channel count
+            valid_dead = [ch for ch in self.dead_channels if ch < incoming_channels]
+            self.active_channels = [i for i in range(incoming_channels) if i not in valid_dead]
+            self.samples_since_last_dtw = 0
 
         if n_new_samples >= self.buffer_length:
             # keep only the last buffer_length samples from new_samples
@@ -149,15 +160,13 @@ class Model:
             self.emg_rt_buffer = np.roll(self.emg_rt_buffer, -n_new_samples, axis=1)
             self.emg_rt_buffer[:, -n_new_samples :] = new_samples
             self.samples_since_last_dtw += n_new_samples
-        
+
         # check id should compute DTW
         should_compute = self.samples_since_last_dtw >= self.increment_dtw
 
         if should_compute:
             self.samples_since_last_dtw = 0 # reset counter
-        
-        # print(f"should compute? {should_compute}")
-        
+
         return should_compute
     
 
@@ -219,8 +228,23 @@ class Model:
         # Load new model settings (with defaults for backwards compatibility)
         # dead_channels stored as 0-indexed
         self.dead_channels = data.get("dead_channels", config.dead_channels)
-        # Compute active channels from dead channels
-        self.active_channels = [i for i in range(self.num_channels) if i not in self.dead_channels]
+
+        # Detect channel count from templates (more reliable than config)
+        # Templates are stored as feature matrices: (n_windows, n_channels)
+        if self.templates_open and len(self.templates_open) > 0:
+            template_channels = self.templates_open[0].shape[1]  # n_channels from first template
+            self.num_channels = template_channels
+            print(f"  - Detected channel count from templates: {template_channels}")
+        else:
+            # Fallback to config if no templates
+            self.num_channels = config.num_channels
+
+        # Compute active channels from dead channels, ensuring they don't exceed num_channels
+        valid_dead = [ch for ch in self.dead_channels if ch < self.num_channels]
+        self.active_channels = [i for i in range(self.num_channels) if i not in valid_dead]
+
+        # Reinitialize buffer with correct channel count
+        self.emg_rt_buffer = np.zeros((self.num_channels, self.buffer_length))
 
         # Distance aggregation method: "average", "minimum", "avg_3_smallest"
         self.distance_aggregation = data.get("distance_aggregation", "average")

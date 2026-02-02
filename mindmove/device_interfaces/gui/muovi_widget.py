@@ -205,13 +205,16 @@ class MuoviWidget(QWidget):
         # Extract EMG from raw data
         emg_data = self.device.extract_emg_data(data, milli_volts)
 
-        # Apply real-time filtering if enabled
-        if self.filtering_enabled and emg_data.size > 0:
-            emg_data = self.rt_filter.filter(emg_data)
-
-        # Apply differential transform if enabled
+        # Apply differential transform FIRST if enabled
+        # This is the correct signal processing order:
+        # 1. Differentiate: removes common-mode noise (like 50Hz powerline)
+        # 2. Filter: applied to the differential signal (16 channels instead of 32)
         if self.differential_mode_enabled and emg_data.size > 0:
             emg_data = self.apply_differential_transform(emg_data)
+
+        # Apply real-time filtering AFTER differentiation
+        if self.filtering_enabled and emg_data.size > 0:
+            emg_data = self.rt_filter.filter(emg_data)
 
         # Cache the result for this packet
         if is_same_packet:
@@ -356,18 +359,25 @@ class MuoviWidget(QWidget):
     def _on_differential_mode_toggled(self, checked: bool) -> None:
         """Handle differential mode toggle button state change."""
         self.differential_mode_enabled = checked
-        config.ENABLE_DIFFERENTIAL_MODE = checked  # Update global config for consistency
+
+        # Update global config - this also updates num_channels and active_channels
+        config.set_differential_mode(checked)
+
         self._update_differential_button_style()
 
-        # Reset filter state when changing modes to avoid transients
-        self.rt_filter.reset()
+        # Reinitialize filter with correct channel count for new mode
+        # This is necessary because the filter state is channel-dependent
+        new_channel_count = 16 if checked else 32
+        self.rt_filter = RealTimeEMGFilter(n_channels=new_channel_count)
+        self.filter_description_label.setText(self.rt_filter.get_filter_description())
+
         # Clear cached data
         self._current_filtered_emg = None
 
         if checked:
-            self.device.log_info("Mode: Single Differential (16 channels)")
+            self.device.log_info("Mode: Single Differential (16 channels) - Filter reinitialized")
         else:
-            self.device.log_info("Mode: Monopolar (32 channels)")
+            self.device.log_info("Mode: Monopolar (32 channels) - Filter reinitialized")
 
         # Notify listeners (e.g., plot widget) that mode changed
         self.differential_mode_changed.emit(checked)

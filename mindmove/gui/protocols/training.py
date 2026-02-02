@@ -617,24 +617,39 @@ class CycleReviewWidget(QWidget):
         # Calculate window positions (use saved positions if available, otherwise defaults)
         max_start = n_samples - self.template_duration_samples
 
+        # Detect protocol mode for this cycle
+        protocol_mode = cycle.get('protocol_mode', 'standard')
+
         # CLOSED window position
         if self.current_cycle_idx in self._saved_closed_positions:
             closed_idx = self._saved_closed_positions[self.current_cycle_idx]
         else:
-            # Default: centered around closing phase (after close cue or close_start)
+            # Default: use close_cue_idx or close_start_idx if available
             closed_idx = close_cue_idx if close_cue_idx is not None else close_start_idx
             if closed_idx is None or closed_idx == 0:
-                closed_idx = n_samples // 4  # Fallback
+                # Fallback based on protocol mode:
+                # Standard: CLOSED is first transition (first quarter)
+                # Inverted: CLOSED is second transition (third quarter)
+                if protocol_mode == "inverted":
+                    closed_idx = 3 * n_samples // 4
+                else:
+                    closed_idx = n_samples // 4
         closed_idx = max(0, min(closed_idx, max_start))
 
         # OPEN window position
         if self.current_cycle_idx in self._saved_open_positions:
             open_idx = self._saved_open_positions[self.current_cycle_idx]
         else:
-            # Default: centered around opening phase (after open cue or open_start)
+            # Default: use open_cue_idx or open_start_idx if available
             open_idx = open_cue_idx if open_cue_idx is not None else open_start_idx
             if open_idx is None or open_idx == 0:
-                open_idx = 3 * n_samples // 4  # Fallback
+                # Fallback based on protocol mode:
+                # Standard: OPEN is second transition (third quarter)
+                # Inverted: OPEN is first transition (first quarter)
+                if protocol_mode == "inverted":
+                    open_idx = n_samples // 4
+                else:
+                    open_idx = 3 * n_samples // 4
         open_idx = max(0, min(open_idx, max_start))
 
         # Create draggable windows at calculated positions
@@ -651,7 +666,8 @@ class CycleReviewWidget(QWidget):
         self.ax.set_xlabel('Time (s)')
         self.ax.set_ylabel(f'Channel {channel + 1} (µV)')
         status = " [ACCEPTED]" if is_already_accepted else ""
-        self.ax.set_title(f'Cycle {self.current_cycle_idx + 1}{status}: Drag windows to select templates')
+        mode_indicator = " [INV]" if protocol_mode == "inverted" else ""
+        self.ax.set_title(f'Cycle {self.current_cycle_idx + 1}{mode_indicator}{status}: Drag windows to select templates')
         self.ax.set_xlim(0, n_samples / config.FSAMP)
 
         # Set explicit y-axis limits based on EMG amplitude
@@ -1443,30 +1459,67 @@ class TrainingProtocol(QObject):
 
     def _setup_template_extraction_ui(self) -> None:
         """Setup UI connections for template extraction group box."""
+        # Initialize state variables first (before any signal connections)
+        self._is_guided_mode: bool = False
+        self._manual_selection_mode: bool = False
+        self._manual_templates: List[np.ndarray] = []
+
         # Template Extraction Group Box
         self.template_extraction_group_box = (
             self.main_window.ui.trainingTemplateExtractionGroupBox
         )
 
-        # Class selection combo
+        # Get grid layout for reordering
+        grid_layout = self.template_extraction_group_box.layout()
+
+        # Get references to labels and combos
+        class_label = self.main_window.ui.label_9  # "Class:" label
+        data_format_label = self.main_window.ui.label_12  # "Data Format:" label
         self.template_class_combo = self.main_window.ui.trainingTemplateClassComboBox
+        self.data_format_combo = self.main_window.ui.trainingDataFormatComboBox
+
+        # Remove from current positions
+        grid_layout.removeWidget(class_label)
+        grid_layout.removeWidget(self.template_class_combo)
+        grid_layout.removeWidget(data_format_label)
+        grid_layout.removeWidget(self.data_format_combo)
+
+        # Re-add in swapped positions: Data Format at row 0, Class at row 1
+        grid_layout.addWidget(data_format_label, 0, 0, 1, 1)
+        grid_layout.addWidget(self.data_format_combo, 0, 1, 1, 1)
+        grid_layout.addWidget(class_label, 1, 0, 1, 1)
+        grid_layout.addWidget(self.template_class_combo, 1, 1, 1, 1)
+
+        # Add "Both" option to Class combo (now: Open=0, Closed=1, Both=2)
+        self.template_class_combo.addItem("Both")
 
         # Data format combo - add Guided Recording option
-        self.data_format_combo = self.main_window.ui.trainingDataFormatComboBox
-        # Add new option for guided recordings (existing: 0=MindMove, 1=Legacy)
+        # Existing: 0=Auto-detect (single files), 1=Legacy (EMG + GT folders)
         self.data_format_combo.addItem("Guided Recording (Bidirectional)")  # index 2
         self.data_format_combo.currentIndexChanged.connect(self._on_data_format_changed)
 
-        # Template type combo - add new options programmatically
+        # Template type combo - store original auto-detect options
         self.template_type_combo = self.main_window.ui.trainingTemplateTypeComboBox
-        # Add new options (UI file has "Hold Only" at 0, "Onset + Hold" at 1)
+        # UI file has: "Hold Only" at 0, "Onset + Hold" at 1
+        # We'll manage options dynamically based on data format
+
+        # Define template type options for each mode
+        self._autodetect_template_types = [
+            "Hold Only (skip 0.5s)",      # index 0
+            "Onset + Hold (start -0.2s)", # index 1
+            "Onset (GT=1 start)",         # index 2
+            "Manual Selection",           # index 3
+        ]
+        self._guided_template_types = [
+            "Manual Selection",     # index 0 - opens review dialog with two windows
+            "After Audio Cue",      # index 1 - template starts at audio cue
+            "After Reaction Time",  # index 2 - template starts after reaction time
+        ]
+
+        # Add extra options for auto-detect mode (UI file has only 2)
         self.template_type_combo.addItem("Onset (GT=1 start)")  # index 2
         self.template_type_combo.addItem("Manual Selection")     # index 3
         self.template_type_combo.currentIndexChanged.connect(self._on_template_type_changed)
-
-        # Track if we're in manual selection mode
-        self._manual_selection_mode: bool = False
-        self._manual_templates: List[np.ndarray] = []
 
         # Recording selection (at original row 3)
         self.select_recordings_for_extraction_btn = (
@@ -1480,8 +1533,6 @@ class TrainingProtocol(QObject):
         )
 
         # Template duration combo (add dynamically after activation list, before plot buttons)
-        # We'll insert it at row 6.5 visually by using row 11 and letting Qt handle it
-        grid_layout = self.template_extraction_group_box.layout()
         self.template_duration_label = QLabel("Template Duration:")
         self.template_duration_combo = QComboBox()
         self.template_duration_combo.addItems(["0.5 s", "1.0 s", "1.5 s", "2.0 s"])
@@ -1631,38 +1682,108 @@ class TrainingProtocol(QObject):
 
     def _on_data_format_changed(self, index: int) -> None:
         """Handle data format combo box change."""
-        # Index 0: MindMove format
+        # Index 0: Auto-detect (single files)
         # Index 1: Legacy (EMG + GT folders)
         # Index 2: Guided Recording (Bidirectional)
+
+        self._is_guided_mode = (index == 2)
+
         if index == 1:  # Legacy
             self.select_recordings_for_extraction_btn.setText("Select EMG Folder")
         elif index == 2:  # Guided Recording
             self.select_recordings_for_extraction_btn.setText("Select Guided Recording")
-        else:  # MindMove
+        else:  # Auto-detect
             self.select_recordings_for_extraction_btn.setText("Select Recording(s)")
+
+        # Update Class combo based on data format
+        if self._is_guided_mode:
+            # Guided Recording: Class fixed to "Both", disable combo
+            self.template_class_combo.setCurrentIndex(2)  # "Both"
+            self.template_class_combo.setEnabled(False)
+        else:
+            # Auto-detect / Legacy: Enable class selection
+            self.template_class_combo.setEnabled(True)
+            if self.template_class_combo.currentIndex() == 2:  # If was "Both"
+                self.template_class_combo.setCurrentIndex(0)  # Reset to "Open"
+
+        # Show/hide UI elements based on mode
+        # In guided mode, extraction happens directly in the recording selection
+        # so we hide the manual extraction workflow elements
+        show_extraction_workflow = not self._is_guided_mode
+
+        self.extract_activations_btn.setVisible(show_extraction_workflow)
+        self.activation_count_label.setVisible(show_extraction_workflow)
+        self.selection_mode_combo.setVisible(show_extraction_workflow)
+        self.main_window.ui.label_11.setVisible(show_extraction_workflow)  # "Selection Mode:" label
+        self.activation_list_widget.setVisible(show_extraction_workflow)
+        self.plot_selected_btn.setVisible(show_extraction_workflow)
+        self.select_templates_btn.setVisible(show_extraction_workflow)
+        self.plot_channel_spinbox.setVisible(show_extraction_workflow)
+        self.plot_channel_label.setVisible(show_extraction_workflow)
+
+        # Update Template Type options based on data format
+        self._update_template_type_options()
 
         # Clear previous selections
         self._clear_extraction()
 
+    def _update_template_type_options(self) -> None:
+        """Update template type combo options based on current data format."""
+        # Block signals to prevent triggering _on_template_type_changed during update
+        self.template_type_combo.blockSignals(True)
+
+        # Clear current items
+        self.template_type_combo.clear()
+
+        if self._is_guided_mode:
+            # Guided Recording mode options
+            for option in self._guided_template_types:
+                self.template_type_combo.addItem(option)
+        else:
+            # Auto-detect / Legacy mode options
+            for option in self._autodetect_template_types:
+                self.template_type_combo.addItem(option)
+
+        self.template_type_combo.blockSignals(False)
+
+        # Trigger the change handler to update internal state
+        self._on_template_type_changed(0)
+
     def _on_template_type_changed(self, index: int) -> None:
         """Handle template type combo box change."""
-        # Index 0: "Hold Only (skip 0.5s)" - hold_only mode
-        # Index 1: "Onset + Hold (start -0.2s)" - onset_hold mode
-        # Index 2: "Onset (GT=1 start)" - onset mode (start exactly at GT=1)
-        # Index 3: "Manual Selection" - manual interactive mode
+        if self._is_guided_mode:
+            # Guided Recording mode options:
+            # Index 0: "Manual Selection" - opens review dialog
+            # Index 1: "After Audio Cue" - template starts at audio cue
+            # Index 2: "After Reaction Time" - template starts after reaction time
 
-        self._manual_selection_mode = (index == 3)
+            self._manual_selection_mode = (index == 0)
 
-        if index == 0:
-            self.template_manager.set_template_type(include_onset=False)
-        elif index == 1:
-            self.template_manager.set_template_type(include_onset=True)
-        elif index == 2:
-            # Set to "onset" mode - starts exactly at GT=1
-            self.template_manager.template_type = "onset"
-        elif index == 3:
-            # Manual mode - will be handled in extraction
-            self.template_manager.template_type = "manual"
+            if index == 0:
+                self.template_manager.template_type = "manual"
+            elif index == 1:
+                self.template_manager.template_type = "after_audio_cue"
+            elif index == 2:
+                self.template_manager.template_type = "after_reaction_time"
+        else:
+            # Auto-detect / Legacy mode options:
+            # Index 0: "Hold Only (skip 0.5s)" - hold_only mode
+            # Index 1: "Onset + Hold (start -0.2s)" - onset_hold mode
+            # Index 2: "Onset (GT=1 start)" - onset mode (start exactly at GT=1)
+            # Index 3: "Manual Selection" - manual interactive mode
+
+            self._manual_selection_mode = (index == 3)
+
+            if index == 0:
+                self.template_manager.set_template_type(include_onset=False)
+            elif index == 1:
+                self.template_manager.set_template_type(include_onset=True)
+            elif index == 2:
+                # Set to "onset" mode - starts exactly at GT=1
+                self.template_manager.template_type = "onset"
+            elif index == 3:
+                # Manual mode - will be handled in extraction
+                self.template_manager.template_type = "manual"
 
     def _on_template_duration_changed(self, index: int) -> None:
         """Handle template duration combo box change."""
@@ -1740,7 +1861,7 @@ class TrainingProtocol(QObject):
             self._select_recording_files()
 
     def _select_guided_recording(self) -> None:
-        """Select one or more guided recording files and open the review dialog."""
+        """Select one or more guided recording files and extract templates."""
         if not os.path.exists(self.recordings_dir_path):
             os.makedirs(self.recordings_dir_path)
 
@@ -1787,23 +1908,31 @@ class TrainingProtocol(QObject):
                 )
                 return
 
-            print(f"\n[TRAINING] Opening review dialog with {len(valid_recordings)} recording(s)")
+            # Check template type to decide extraction method
+            template_type = self.template_manager.template_type
 
-            # Open the review dialog with all recordings
-            review_dialog = GuidedRecordingReviewDialog(
-                valid_recordings, self.template_manager, self.main_window
-            )
-            result = review_dialog.exec()
+            if template_type == "manual":
+                # Manual Selection: Open the review dialog
+                print(f"\n[TRAINING] Opening review dialog with {len(valid_recordings)} recording(s)")
 
-            if review_dialog.saved:
-                # Update UI to show templates were saved
-                self.selected_recordings_for_extraction_label.setText(
-                    f"Templates saved from {len(valid_recordings)} recording(s)"
+                review_dialog = GuidedRecordingReviewDialog(
+                    valid_recordings, self.template_manager, self.main_window
                 )
-                # Update template counts
-                n_closed = len(self.template_manager.templates.get("closed", []))
-                n_open = len(self.template_manager.templates.get("open", []))
-                self.template_count_label.setText(f"Saved: {n_closed} closed, {n_open} open")
+                result = review_dialog.exec()
+
+                if review_dialog.saved:
+                    # Update UI to show templates were saved
+                    self.selected_recordings_for_extraction_label.setText(
+                        f"Templates saved from {len(valid_recordings)} recording(s)"
+                    )
+                    # Update template counts
+                    n_closed = len(self.template_manager.templates.get("closed", []))
+                    n_open = len(self.template_manager.templates.get("open", []))
+                    self.template_count_label.setText(f"Saved: {n_closed} closed, {n_open} open")
+
+            elif template_type in ("after_audio_cue", "after_reaction_time"):
+                # Automatic extraction based on cue positions
+                self._extract_templates_from_cues(valid_recordings, template_type)
 
         except Exception as e:
             QMessageBox.critical(
@@ -1814,6 +1943,101 @@ class TrainingProtocol(QObject):
             )
             import traceback
             traceback.print_exc()
+
+    def _extract_templates_from_cues(self, recordings: List[dict], template_type: str) -> None:
+        """
+        Automatically extract templates based on audio cue or reaction time positions.
+
+        Args:
+            recordings: List of guided recording dicts
+            template_type: "after_audio_cue" or "after_reaction_time"
+        """
+        template_duration_s = self.template_manager.template_duration_s
+        template_samples = int(template_duration_s * config.FSAMP)
+
+        open_templates = []
+        closed_templates = []
+        total_cycles = 0
+
+        for recording in recordings:
+            # Extract complete cycles from this recording
+            cycles = self.template_manager.extract_complete_cycles(recording)
+
+            for cycle in cycles:
+                emg = cycle['emg']
+                n_samples = emg.shape[1]
+
+                # Get cue/start indices
+                close_cue_idx = cycle.get('close_cue_idx')
+                open_cue_idx = cycle.get('open_cue_idx')
+                close_start_idx = cycle.get('close_start_idx')  # GT transition (after reaction time)
+                open_start_idx = cycle.get('open_start_idx')    # GT transition (after reaction time)
+
+                # Determine extraction start points based on template type
+                if template_type == "after_audio_cue":
+                    closed_start = close_cue_idx
+                    open_start = open_cue_idx
+                    mode_label = "audio cue"
+                else:  # after_reaction_time
+                    closed_start = close_start_idx
+                    open_start = open_start_idx
+                    mode_label = "reaction time"
+
+                # Extract CLOSED template (at close cue/start)
+                if closed_start is not None:
+                    end_idx = closed_start + template_samples
+                    if end_idx <= n_samples:
+                        template = emg[:, closed_start:end_idx]
+                        closed_templates.append(template)
+                        print(f"  Cycle {cycle['cycle_number']}: CLOSED template from {mode_label} "
+                              f"({closed_start/config.FSAMP:.2f}s - {end_idx/config.FSAMP:.2f}s)")
+                    else:
+                        print(f"  Cycle {cycle['cycle_number']}: CLOSED template would exceed cycle bounds, skipping")
+                else:
+                    print(f"  Cycle {cycle['cycle_number']}: No {mode_label} index for CLOSED")
+
+                # Extract OPEN template (at open cue/start)
+                if open_start is not None:
+                    end_idx = open_start + template_samples
+                    if end_idx <= n_samples:
+                        template = emg[:, open_start:end_idx]
+                        open_templates.append(template)
+                        print(f"  Cycle {cycle['cycle_number']}: OPEN template from {mode_label} "
+                              f"({open_start/config.FSAMP:.2f}s - {end_idx/config.FSAMP:.2f}s)")
+                    else:
+                        print(f"  Cycle {cycle['cycle_number']}: OPEN template would exceed cycle bounds, skipping")
+                else:
+                    print(f"  Cycle {cycle['cycle_number']}: No {mode_label} index for OPEN")
+
+                total_cycles += 1
+
+        # Store extracted templates
+        if closed_templates:
+            if "closed" not in self.template_manager.templates:
+                self.template_manager.templates["closed"] = []
+            self.template_manager.templates["closed"].extend(closed_templates)
+
+        if open_templates:
+            if "open" not in self.template_manager.templates:
+                self.template_manager.templates["open"] = []
+            self.template_manager.templates["open"].extend(open_templates)
+
+        # Update UI
+        n_closed = len(closed_templates)
+        n_open = len(open_templates)
+
+        print(f"\n[TRAINING] Extracted {n_closed} CLOSED and {n_open} OPEN templates from {total_cycles} cycles")
+        print(f"  Template type: {template_type}")
+        print(f"  Template duration: {template_duration_s}s ({template_samples} samples)")
+
+        self.selected_recordings_for_extraction_label.setText(
+            f"Extracted from {len(recordings)} recording(s)"
+        )
+        self.template_count_label.setText(f"Extracted: {n_closed} closed, {n_open} open")
+
+        # Enable save button
+        if n_closed > 0 or n_open > 0:
+            self.save_templates_btn.setEnabled(True)
 
     def _select_recording_files(self) -> None:
         """Select recording files (auto-detect format). Supports .pkl and .mat files."""

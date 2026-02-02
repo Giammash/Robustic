@@ -76,5 +76,23 @@ class config:
         self.POST_PREDICTION_SMOOTHING = "MAJORITY VOTE"  # Options: "NONE", "MAJORITY VOTE", "5 CONSECUTIVE"
         self.SMOOTHING_WINDOW = 5
 
+    def set_differential_mode(self, enable: bool) -> None:
+        """
+        Update differential mode and recalculate channel-dependent settings.
+
+        Args:
+            enable: True for single differential (16 ch), False for monopolar (32 ch)
+        """
+        self.ENABLE_DIFFERENTIAL_MODE = enable
+        self.num_channels = 16 if enable else 32
+        # Recompute active channels based on new channel count
+        # Filter dead_channels to only include valid indices for current channel count
+        valid_dead = [ch for ch in self.dead_channels if ch < self.num_channels]
+        self.active_channels = [i for i in range(self.num_channels) if i not in valid_dead]
+
+        mode_name = "Single Differential (16 ch)" if enable else "Monopolar (32 ch)"
+        print(f"[CONFIG] Mode changed to {mode_name}")
+        print(f"[CONFIG] num_channels={self.num_channels}, active_channels={len(self.active_channels)}")
+
 
 config = config()

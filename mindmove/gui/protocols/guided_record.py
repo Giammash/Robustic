@@ -58,6 +58,7 @@ class HandAnimationSequencer:
     PHASE_REACTION_OPEN = "REACTION_OPEN"  # After open audio cue, before movement
     PHASE_OPENING = "OPENING"
     PHASE_HOLD_OPEN_END = "HOLD_OPEN_END"  # Final hold open (same duration as first)
+    PHASE_HOLD_CLOSED_END = "HOLD_CLOSED_END"  # Final hold closed for inverted mode
 
     def __init__(self):
         self.phases: List[Tuple[str, float]] = []
@@ -74,6 +75,9 @@ class HandAnimationSequencer:
         self.hold_closed_s: float = 2.0
         self.opening_s: float = 0.35  # Time for hand to open
 
+        # Protocol mode: "standard" (open→close→open) or "inverted" (close→open→close)
+        self.protocol_mode: str = "standard"
+
         # Audio cue timestamps (recorded during cycle for later visualization)
         self.close_cue_time: Optional[float] = None
         self.open_cue_time: Optional[float] = None
@@ -84,10 +88,11 @@ class HandAnimationSequencer:
         closing_s: float,
         hold_closed_s: float,
         opening_s: float,
-        reaction_time_s: float = 0.2
+        reaction_time_s: float = 0.2,
+        protocol_mode: str = "standard"
     ):
         """
-        Define one open→close→open cycle with specified timings.
+        Define one cycle with specified timings.
 
         Args:
             hold_open_s: Time before close audio cue (hand stays open)
@@ -95,23 +100,39 @@ class HandAnimationSequencer:
             hold_closed_s: Time before open audio cue (hand stays closed)
             opening_s: Duration for hand to open (VHI movement + GT ramp)
             reaction_time_s: Delay between audio cue and movement start
+            protocol_mode: "standard" (open→close→open) or "inverted" (close→open→close)
         """
         self.hold_open_s = hold_open_s
         self.reaction_time_s = reaction_time_s
         self.closing_s = closing_s
         self.hold_closed_s = hold_closed_s
         self.opening_s = opening_s
+        self.protocol_mode = protocol_mode
 
-        # Phase sequence with durations (includes final HOLD_OPEN_END)
-        self.phases = [
-            (self.PHASE_HOLD_OPEN, hold_open_s),
-            (self.PHASE_REACTION_CLOSE, reaction_time_s),
-            (self.PHASE_CLOSING, closing_s),
-            (self.PHASE_HOLD_CLOSED, hold_closed_s),
-            (self.PHASE_REACTION_OPEN, reaction_time_s),
-            (self.PHASE_OPENING, opening_s),
-            (self.PHASE_HOLD_OPEN_END, hold_open_s),  # Same duration as first hold open
-        ]
+        if protocol_mode == "inverted":
+            # Inverted: start closed → open → close
+            # Phase sequence: HOLD_CLOSED → REACTION_OPEN → OPENING → HOLD_OPEN → REACTION_CLOSE → CLOSING → HOLD_CLOSED_END
+            self.phases = [
+                (self.PHASE_HOLD_CLOSED, hold_closed_s),
+                (self.PHASE_REACTION_OPEN, reaction_time_s),
+                (self.PHASE_OPENING, opening_s),
+                (self.PHASE_HOLD_OPEN, hold_open_s),
+                (self.PHASE_REACTION_CLOSE, reaction_time_s),
+                (self.PHASE_CLOSING, closing_s),
+                (self.PHASE_HOLD_CLOSED_END, hold_closed_s),
+            ]
+        else:
+            # Standard: start open → close → open
+            # Phase sequence with durations (includes final HOLD_OPEN_END)
+            self.phases = [
+                (self.PHASE_HOLD_OPEN, hold_open_s),
+                (self.PHASE_REACTION_CLOSE, reaction_time_s),
+                (self.PHASE_CLOSING, closing_s),
+                (self.PHASE_HOLD_CLOSED, hold_closed_s),
+                (self.PHASE_REACTION_OPEN, reaction_time_s),
+                (self.PHASE_OPENING, opening_s),
+                (self.PHASE_HOLD_OPEN_END, hold_open_s),  # Same duration as first hold open
+            ]
 
         # Reset audio cue times
         self.close_cue_time = None
@@ -123,11 +144,21 @@ class HandAnimationSequencer:
 
     def get_close_cue_time_in_cycle(self) -> float:
         """Get time within cycle when close audio cue should play."""
-        return self.hold_open_s
+        if self.protocol_mode == "inverted":
+            # In inverted mode: HOLD_CLOSED → REACTION_OPEN → OPENING → HOLD_OPEN → [CLOSE CUE]
+            return self.hold_closed_s + self.reaction_time_s + self.opening_s + self.hold_open_s
+        else:
+            # Standard: HOLD_OPEN → [CLOSE CUE]
+            return self.hold_open_s
 
     def get_open_cue_time_in_cycle(self) -> float:
         """Get time within cycle when open audio cue should play."""
-        return self.hold_open_s + self.reaction_time_s + self.closing_s + self.hold_closed_s
+        if self.protocol_mode == "inverted":
+            # In inverted mode: HOLD_CLOSED → [OPEN CUE]
+            return self.hold_closed_s
+        else:
+            # Standard: HOLD_OPEN → REACTION_CLOSE → CLOSING → HOLD_CLOSED → [OPEN CUE]
+            return self.hold_open_s + self.reaction_time_s + self.closing_s + self.hold_closed_s
 
     def start_cycle(self):
         """Begin a new animation cycle."""
@@ -232,6 +263,10 @@ class HandAnimationSequencer:
             # Final hold open, GT = 0
             return [0.0] * 10, 0.0
 
+        elif phase_name == self.PHASE_HOLD_CLOSED_END:
+            # Final hold closed (inverted mode), GT = 1
+            return [1.0] * 10, 1.0
+
         else:
             return [0.0] * 10, 0.0
 
@@ -279,6 +314,7 @@ class AudioCueManager:
     Manages audio feedback for guided recording.
 
     Uses simple beep sounds via winsound (Windows) or print fallback.
+    Audio is played in a background thread to avoid blocking the animation loop.
     """
 
     def __init__(self):
@@ -295,9 +331,37 @@ class AudioCueManager:
             self._has_audio = False
             print("[AUDIO] winsound not available, using print fallback")
 
+        # Import threading for non-blocking audio
+        import threading
+        self._threading = threading
+
+    def _play_beep_async(self, frequency: int, duration_ms: int):
+        """Play a beep in a background thread (non-blocking)."""
+        def _beep():
+            try:
+                self._winsound.Beep(frequency, duration_ms)
+            except Exception as e:
+                print(f"[AUDIO] Error playing sound: {e}")
+
+        thread = self._threading.Thread(target=_beep, daemon=True)
+        thread.start()
+
+    def _play_chime_async(self):
+        """Play completion chime in a background thread (non-blocking)."""
+        def _chime():
+            try:
+                self._winsound.Beep(600, 100)
+                self._winsound.Beep(800, 100)
+                self._winsound.Beep(1000, 200)
+            except Exception as e:
+                print(f"[AUDIO] Error playing sound: {e}")
+
+        thread = self._threading.Thread(target=_chime, daemon=True)
+        thread.start()
+
     def play(self, cue_name: str):
         """
-        Play an audio cue.
+        Play an audio cue (non-blocking).
 
         Cue names:
         - CLOSE_CUE: Signal to start closing (low pitch)
@@ -313,20 +377,15 @@ class AudioCueManager:
         self._last_cue_time = current_time
 
         if self._has_audio:
-            try:
-                if cue_name == "CLOSE_CUE":
-                    # Low-pitched beep for "start closing"
-                    self._winsound.Beep(400, 300)
-                elif cue_name == "OPEN_CUE":
-                    # High-pitched beep for "start opening"
-                    self._winsound.Beep(800, 300)
-                elif cue_name == "CYCLE_COMPLETE":
-                    # Success chime
-                    self._winsound.Beep(600, 100)
-                    self._winsound.Beep(800, 100)
-                    self._winsound.Beep(1000, 200)
-            except Exception as e:
-                print(f"[AUDIO] Error playing sound: {e}")
+            if cue_name == "CLOSE_CUE":
+                # Low-pitched beep for "start closing" (non-blocking)
+                self._play_beep_async(400, 300)
+            elif cue_name == "OPEN_CUE":
+                # High-pitched beep for "start opening" (non-blocking)
+                self._play_beep_async(800, 300)
+            elif cue_name == "CYCLE_COMPLETE":
+                # Success chime (non-blocking)
+                self._play_chime_async()
         else:
             print(f"[AUDIO CUE] {cue_name}")
 
@@ -653,6 +712,25 @@ class GuidedRecordProtocol(QObject):
         self.recording_view = QWidget()
         recording_layout = QVBoxLayout(self.recording_view)
 
+        # === Protocol Mode Group ===
+        protocol_group = QGroupBox("Protocol Mode")
+        protocol_layout = QHBoxLayout(protocol_group)
+
+        protocol_layout.addWidget(QLabel("Animation:"))
+        self.protocol_combo = QComboBox()
+        self.protocol_combo.addItems([
+            "Standard (Open \u2192 Close \u2192 Open)",
+            "Inverted (Close \u2192 Open \u2192 Close)"
+        ])
+        self.protocol_combo.setToolTip(
+            "Standard: For patients with open hand at rest\n"
+            "Inverted: For patients with closed hand at rest"
+        )
+        protocol_layout.addWidget(self.protocol_combo)
+        protocol_layout.addStretch()
+
+        recording_layout.addWidget(protocol_group)
+
         # === Timing Configuration Group ===
         timing_group = QGroupBox("Timing Configuration")
         timing_layout = QGridLayout(timing_group)
@@ -899,12 +977,14 @@ class GuidedRecordProtocol(QObject):
             return
 
         # Setup sequencer with current timing settings
+        protocol_mode = self._get_protocol_mode()
         self.sequencer.setup_cycle(
             hold_open_s=self.hold_open_spinbox.value(),
             closing_s=self.closing_transition_spinbox.value(),
             hold_closed_s=self.hold_closed_spinbox.value(),
             opening_s=self.opening_transition_spinbox.value(),
-            reaction_time_s=self._get_reaction_time_s()
+            reaction_time_s=self._get_reaction_time_s(),
+            protocol_mode=protocol_mode
         )
 
         # Reset state
@@ -937,11 +1017,15 @@ class GuidedRecordProtocol(QObject):
         self.cycle_label.setText("Cycles completed: 0")
         self.phase_label.setText("Phase: Waiting for cycle start")
 
-        # Send open hand to VHI
-        self._send_joints_to_vhi([0.0] * 10)
+        # Send initial hand position to VHI based on protocol mode
+        if protocol_mode == "inverted":
+            self._send_joints_to_vhi([1.0] * 10)  # Start closed
+        else:
+            self._send_joints_to_vhi([0.0] * 10)  # Start open
 
         print("\n" + "=" * 60)
         print("GUIDED RECORDING STARTED")
+        print(f"  Protocol Mode: {protocol_mode.upper()}")
         print("  Predicted Hand becomes Control Hand (visual guide)")
         print(f"  Hold Open: {self.hold_open_spinbox.value()}s")
         print(f"  Closing: {self.closing_transition_spinbox.value()}s")
@@ -995,18 +1079,25 @@ class GuidedRecordProtocol(QObject):
         ms_value = int(text.split()[0])  # Extract number
         return ms_value / 1000.0
 
+    def _get_protocol_mode(self) -> str:
+        """Get protocol mode from the combo box."""
+        # Index 0 = "Standard", Index 1 = "Inverted"
+        return "inverted" if self.protocol_combo.currentIndex() == 1 else "standard"
+
     def _on_start_next_cycle(self):
         """Start the next animation cycle."""
         if not self.is_recording:
             return
 
         # Update sequencer timings in case they changed
+        protocol_mode = self._get_protocol_mode()
         self.sequencer.setup_cycle(
             hold_open_s=self.hold_open_spinbox.value(),
             closing_s=self.closing_transition_spinbox.value(),
             hold_closed_s=self.hold_closed_spinbox.value(),
             opening_s=self.opening_transition_spinbox.value(),
-            reaction_time_s=self._get_reaction_time_s()
+            reaction_time_s=self._get_reaction_time_s(),
+            protocol_mode=protocol_mode
         )
 
         # Start new cycle
@@ -1028,7 +1119,8 @@ class GuidedRecordProtocol(QObject):
                 "hold_closed_s": self.hold_closed_spinbox.value(),
                 "opening_s": self.opening_transition_spinbox.value(),
                 "reaction_time_s": self._get_reaction_time_s(),
-            }
+            },
+            "protocol_mode": protocol_mode,
         })
 
         # Update UI
@@ -1083,10 +1175,13 @@ class GuidedRecordProtocol(QObject):
                 self._on_cycle_complete()
 
         elif self.waiting_for_next_cycle:
-            # Keep VHI at open position while waiting
-            self._send_joints_to_vhi([0.0] * 10)
-            # Still record GT=0 while waiting
-            self.gt_buffer.append((current_time, 0.0))
+            # Keep VHI at starting position while waiting (based on protocol mode)
+            if self.sequencer.protocol_mode == "inverted":
+                self._send_joints_to_vhi([1.0] * 10)  # Closed position
+                self.gt_buffer.append((current_time, 1.0))
+            else:
+                self._send_joints_to_vhi([0.0] * 10)  # Open position
+                self.gt_buffer.append((current_time, 0.0))
 
     def _on_cycle_complete(self):
         """Handle cycle completion."""
@@ -1115,16 +1210,28 @@ class GuidedRecordProtocol(QObject):
 
     def _update_phase_ui(self, phase_name: str, current_time: float):
         """Update UI to show current phase."""
-        # User-friendly phase names
-        display_names = {
-            "HOLD_OPEN": "Hold Open (waiting for close cue)",
-            "REACTION_CLOSE": "Reaction Time (close cue played)",
-            "CLOSING": "Closing (VHI hand closing)",
-            "HOLD_CLOSED": "Hold Closed (waiting for open cue)",
-            "REACTION_OPEN": "Reaction Time (open cue played)",
-            "OPENING": "Opening (VHI hand opening)",
-            "HOLD_OPEN_END": "Hold Open (cycle ending)",
-        }
+        # User-friendly phase names (context-aware for inverted mode)
+        is_inverted = self.sequencer.protocol_mode == "inverted"
+        if is_inverted:
+            display_names = {
+                "HOLD_CLOSED": "Hold Closed (waiting for open cue)",
+                "REACTION_OPEN": "Reaction Time (open cue played)",
+                "OPENING": "Opening (VHI hand opening)",
+                "HOLD_OPEN": "Hold Open (waiting for close cue)",
+                "REACTION_CLOSE": "Reaction Time (close cue played)",
+                "CLOSING": "Closing (VHI hand closing)",
+                "HOLD_CLOSED_END": "Hold Closed (cycle ending)",
+            }
+        else:
+            display_names = {
+                "HOLD_OPEN": "Hold Open (waiting for close cue)",
+                "REACTION_CLOSE": "Reaction Time (close cue played)",
+                "CLOSING": "Closing (VHI hand closing)",
+                "HOLD_CLOSED": "Hold Closed (waiting for open cue)",
+                "REACTION_OPEN": "Reaction Time (open cue played)",
+                "OPENING": "Opening (VHI hand opening)",
+                "HOLD_OPEN_END": "Hold Open (cycle ending)",
+            }
         display_name = display_names.get(phase_name, phase_name)
         self.phase_label.setText(f"Phase: {display_name}")
 
@@ -1138,7 +1245,8 @@ class GuidedRecordProtocol(QObject):
             "HOLD_CLOSED": self.hold_closed_spinbox.value(),
             "REACTION_OPEN": reaction_time,
             "OPENING": self.opening_transition_spinbox.value(),
-            "HOLD_OPEN_END": self.hold_open_spinbox.value(),  # Same as first hold open
+            "HOLD_OPEN_END": self.hold_open_spinbox.value(),
+            "HOLD_CLOSED_END": self.hold_closed_spinbox.value(),
         }
         phase_duration = phase_durations.get(phase_name, 1.0)
         if phase_duration > 0:
@@ -1162,12 +1270,13 @@ class GuidedRecordProtocol(QObject):
             self.emg_buffer.append((time.time(), data))
 
     def _set_timing_controls_enabled(self, enabled: bool):
-        """Enable/disable timing controls."""
+        """Enable/disable timing and protocol controls."""
         self.hold_open_spinbox.setEnabled(enabled)
         self.closing_transition_spinbox.setEnabled(enabled)
         self.hold_closed_spinbox.setEnabled(enabled)
         self.opening_transition_spinbox.setEnabled(enabled)
         self.reaction_time_combo.setEnabled(enabled)
+        self.protocol_combo.setEnabled(enabled)
 
     def _save_recording(self) -> Optional[str]:
         """Save the recording to file."""
@@ -1206,11 +1315,12 @@ class GuidedRecordProtocol(QObject):
                 "hold_closed_s": self.hold_closed_spinbox.value(),
                 "opening_s": self.opening_transition_spinbox.value(),
                 "reaction_time_s": self._get_reaction_time_s(),
+                "protocol_mode": self._get_protocol_mode(),
             },
             "cycles": self.cycle_boundaries,  # Includes close_cue_time and open_cue_time per cycle
             "cycles_completed": self.cycles_completed,
             "label": label,
-            "task": "guided_open_close",
+            "task": f"guided_{self._get_protocol_mode()}",
             "recording_duration_s": time.time() - self.recording_start_time,
             "differential_mode": differential_mode,
         }
