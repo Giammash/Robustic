@@ -7,7 +7,7 @@ from PySide6.QtCore import QObject, Signal, QThread, Qt
 from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QListWidgetItem, QLabel, QLineEdit,
     QComboBox, QPushButton, QSpinBox, QDoubleSpinBox, QGroupBox,
-    QDialog, QVBoxLayout, QHBoxLayout, QSplitter, QWidget
+    QDialog, QVBoxLayout, QHBoxLayout, QSplitter, QWidget, QListWidget
 )
 import pickle
 from datetime import datetime
@@ -497,14 +497,20 @@ class CycleReviewWidget(QWidget):
 
         layout.addLayout(button_layout)
 
-    def set_cycles(self, cycles: List[Dict]):
-        """Set the list of cycles to review."""
+    def set_cycles(self, cycles: List[Dict], recording_name: str = None):
+        """Set the list of cycles to review.
+
+        Args:
+            cycles: List of cycle dictionaries
+            recording_name: Optional name to display in the plot title
+        """
         self.cycles = cycles
         self.current_cycle_idx = 0
         self.accepted_closed_templates = {}  # Keyed by cycle index
         self.accepted_open_templates = {}    # Keyed by cycle index
         self._saved_closed_positions = {}    # Clear saved positions for new data
         self._saved_open_positions = {}      # Clear saved positions for new data
+        self.recording_name = recording_name  # Store for display in title
 
         # Update channel combo for actual channel count
         n_channels = cycles[0]['emg'].shape[0] if cycles else 32
@@ -667,7 +673,9 @@ class CycleReviewWidget(QWidget):
         self.ax.set_ylabel(f'Channel {channel + 1} (µV)')
         status = " [ACCEPTED]" if is_already_accepted else ""
         mode_indicator = " [INV]" if protocol_mode == "inverted" else ""
-        self.ax.set_title(f'Cycle {self.current_cycle_idx + 1}{mode_indicator}{status}: Drag windows to select templates')
+        # Include recording name in title if available
+        rec_name = f'{self.recording_name} - ' if hasattr(self, 'recording_name') and self.recording_name else ''
+        self.ax.set_title(f'{rec_name}Cycle {self.current_cycle_idx + 1}{mode_indicator}{status}: Drag windows to select templates')
         self.ax.set_xlim(0, n_samples / config.FSAMP)
 
         # Set explicit y-axis limits based on EMG amplitude
@@ -905,7 +913,10 @@ class GuidedRecordingReviewDialog(QDialog):
             )
             all_cycles.extend(cycles)
 
-        self.cycle_viewer.set_cycles(all_cycles)
+        # Get recording name from first recording
+        recording_name = self.recordings[0].get('label', 'Recording') if self.recordings else None
+
+        self.cycle_viewer.set_cycles(all_cycles, recording_name=recording_name)
         print(f"[REVIEW] Total: {len(all_cycles)} complete cycles")
         self._update_status()
 
@@ -992,6 +1003,188 @@ class GuidedRecordingReviewDialog(QDialog):
 
         QMessageBox.information(self, "Templates Saved", msg)
         self.accept()
+
+
+class TemplateReviewDialog(QDialog):
+    """
+    Dialog for visualizing extracted templates.
+
+    Shows a side-by-side view of CLOSED and OPEN templates with:
+    - List of templates for each class
+    - Channel selector
+    - Waveform plot of selected template
+    """
+
+    def __init__(self, templates_closed: List[np.ndarray], templates_open: List[np.ndarray], parent=None):
+        super().__init__(parent)
+        self.templates_closed = templates_closed
+        self.templates_open = templates_open
+
+        self.setWindowTitle("Template Review")
+        self.setMinimumSize(1000, 600)
+        self.resize(1200, 700)
+        self.setModal(False)  # Non-modal so user can continue working
+
+        self._setup_ui()
+        self._update_plots()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Title
+        title = QLabel(f"Extracted Templates: {len(self.templates_closed)} CLOSED, {len(self.templates_open)} OPEN")
+        title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        title.setAlignment(Qt.AlignCenter)
+        layout.addWidget(title)
+
+        # Main splitter for CLOSED (left) and OPEN (right)
+        splitter = QSplitter(Qt.Horizontal)
+
+        # CLOSED panel
+        closed_panel = QWidget()
+        closed_layout = QVBoxLayout(closed_panel)
+
+        closed_header = QLabel("CLOSED Templates")
+        closed_header.setStyleSheet("font-weight: bold; color: #FF5722;")
+        closed_layout.addWidget(closed_header)
+
+        # Template list
+        self.closed_list = QListWidget()
+        self.closed_list.setMaximumHeight(150)
+        for i in range(len(self.templates_closed)):
+            self.closed_list.addItem(f"Template {i+1}")
+        if self.templates_closed:
+            self.closed_list.setCurrentRow(0)
+        self.closed_list.currentRowChanged.connect(self._on_closed_selection_changed)
+        closed_layout.addWidget(self.closed_list)
+
+        # Channel selector
+        ch_layout = QHBoxLayout()
+        ch_layout.addWidget(QLabel("Channel:"))
+        self.closed_channel_combo = QComboBox()
+        n_ch = self.templates_closed[0].shape[0] if self.templates_closed else 32
+        for i in range(1, n_ch + 1):
+            self.closed_channel_combo.addItem(str(i))
+        self.closed_channel_combo.currentIndexChanged.connect(self._update_closed_plot)
+        ch_layout.addWidget(self.closed_channel_combo)
+        ch_layout.addStretch()
+        closed_layout.addLayout(ch_layout)
+
+        # Plot canvas
+        self.closed_figure = Figure(figsize=(5, 4), dpi=100)
+        self.closed_canvas = FigureCanvas(self.closed_figure)
+        self.closed_ax = self.closed_figure.add_subplot(111)
+        closed_layout.addWidget(self.closed_canvas)
+
+        splitter.addWidget(closed_panel)
+
+        # OPEN panel
+        open_panel = QWidget()
+        open_layout = QVBoxLayout(open_panel)
+
+        open_header = QLabel("OPEN Templates")
+        open_header.setStyleSheet("font-weight: bold; color: #2196F3;")
+        open_layout.addWidget(open_header)
+
+        # Template list
+        self.open_list = QListWidget()
+        self.open_list.setMaximumHeight(150)
+        for i in range(len(self.templates_open)):
+            self.open_list.addItem(f"Template {i+1}")
+        if self.templates_open:
+            self.open_list.setCurrentRow(0)
+        self.open_list.currentRowChanged.connect(self._on_open_selection_changed)
+        open_layout.addWidget(self.open_list)
+
+        # Channel selector
+        ch_layout2 = QHBoxLayout()
+        ch_layout2.addWidget(QLabel("Channel:"))
+        self.open_channel_combo = QComboBox()
+        n_ch_open = self.templates_open[0].shape[0] if self.templates_open else 32
+        for i in range(1, n_ch_open + 1):
+            self.open_channel_combo.addItem(str(i))
+        self.open_channel_combo.currentIndexChanged.connect(self._update_open_plot)
+        ch_layout2.addWidget(self.open_channel_combo)
+        ch_layout2.addStretch()
+        open_layout.addLayout(ch_layout2)
+
+        # Plot canvas
+        self.open_figure = Figure(figsize=(5, 4), dpi=100)
+        self.open_canvas = FigureCanvas(self.open_figure)
+        self.open_ax = self.open_figure.add_subplot(111)
+        open_layout.addWidget(self.open_canvas)
+
+        splitter.addWidget(open_panel)
+
+        layout.addWidget(splitter)
+
+        # Close button
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+    def _on_closed_selection_changed(self, row: int):
+        self._update_closed_plot()
+
+    def _on_open_selection_changed(self, row: int):
+        self._update_open_plot()
+
+    def _update_plots(self):
+        self._update_closed_plot()
+        self._update_open_plot()
+
+    def _update_closed_plot(self):
+        self.closed_ax.clear()
+        idx = self.closed_list.currentRow()
+        if idx < 0 or idx >= len(self.templates_closed):
+            self.closed_ax.text(0.5, 0.5, "No template selected", ha='center', va='center',
+                               transform=self.closed_ax.transAxes)
+            self.closed_canvas.draw()
+            return
+
+        template = self.templates_closed[idx]
+        channel = self.closed_channel_combo.currentIndex()
+        if channel >= template.shape[0]:
+            channel = 0
+
+        signal = template[channel, :]
+        time_axis = np.arange(len(signal)) / config.FSAMP
+
+        self.closed_ax.plot(time_axis, signal, 'r-', linewidth=0.8)
+        self.closed_ax.set_xlabel('Time (s)')
+        self.closed_ax.set_ylabel('Amplitude (µV)')
+        self.closed_ax.set_title(f'CLOSED Template {idx+1}, Channel {channel+1}')
+        self.closed_ax.grid(True, alpha=0.3)
+        self.closed_figure.tight_layout()
+        self.closed_canvas.draw()
+
+    def _update_open_plot(self):
+        self.open_ax.clear()
+        idx = self.open_list.currentRow()
+        if idx < 0 or idx >= len(self.templates_open):
+            self.open_ax.text(0.5, 0.5, "No template selected", ha='center', va='center',
+                             transform=self.open_ax.transAxes)
+            self.open_canvas.draw()
+            return
+
+        template = self.templates_open[idx]
+        channel = self.open_channel_combo.currentIndex()
+        if channel >= template.shape[0]:
+            channel = 0
+
+        signal = template[channel, :]
+        time_axis = np.arange(len(signal)) / config.FSAMP
+
+        self.open_ax.plot(time_axis, signal, 'b-', linewidth=0.8)
+        self.open_ax.set_xlabel('Time (s)')
+        self.open_ax.set_ylabel('Amplitude (µV)')
+        self.open_ax.set_title(f'OPEN Template {idx+1}, Channel {channel+1}')
+        self.open_ax.grid(True, alpha=0.3)
+        self.open_figure.tight_layout()
+        self.open_canvas.draw()
 
 
 class TrainingProtocol(QObject):
@@ -1497,6 +1690,10 @@ class TrainingProtocol(QObject):
         # Existing: 0=Auto-detect (single files), 1=Legacy (EMG + GT folders)
         self.data_format_combo.addItem("Guided Recording (Bidirectional)")  # index 2
         self.data_format_combo.currentIndexChanged.connect(self._on_data_format_changed)
+        # Rename "Auto-detect (single files)" to "Auto-Detect (myogestic)"
+        self.data_format_combo.setItemText(0, "Auto-Detect (myogestic)")
+        # Default to Guided Recording format - set later after all widgets created
+        # (using blockSignals to avoid triggering _on_data_format_changed during init)
 
         # Template type combo - store original auto-detect options
         self.template_type_combo = self.main_window.ui.trainingTemplateTypeComboBox
@@ -1679,6 +1876,13 @@ class TrainingProtocol(QObject):
         # Progress bar
         self.extraction_progress_bar = self.main_window.ui.trainingExtractionProgressBar
         self.extraction_progress_bar.setValue(0)
+
+        # Set default data format to Guided Recording (now that all widgets are created)
+        self.data_format_combo.blockSignals(True)
+        self.data_format_combo.setCurrentIndex(2)  # Guided Recording
+        self.data_format_combo.blockSignals(False)
+        # Manually trigger initial UI update
+        self._on_data_format_changed(2)
 
     def _on_data_format_changed(self, index: int) -> None:
         """Handle data format combo box change."""
@@ -1930,6 +2134,9 @@ class TrainingProtocol(QObject):
                     n_open = len(self.template_manager.templates.get("open", []))
                     self.template_count_label.setText(f"Saved: {n_closed} closed, {n_open} open")
 
+                    # Show template visualization dialog
+                    self._show_template_review_dialog()
+
             elif template_type in ("after_audio_cue", "after_reaction_time"):
                 # Automatic extraction based on cue positions
                 self._extract_templates_from_cues(valid_recordings, template_type)
@@ -2035,9 +2242,19 @@ class TrainingProtocol(QObject):
         )
         self.template_count_label.setText(f"Extracted: {n_closed} closed, {n_open} open")
 
-        # Enable save button
+        # Enable save button and prompt user to save templates
         if n_closed > 0 or n_open > 0:
             self.save_templates_btn.setEnabled(True)
+
+            # Prompt user to save templates immediately
+            reply = QMessageBox.question(
+                self.main_window, "Save Templates",
+                f"Extracted {n_closed} CLOSED and {n_open} OPEN templates.\n\n"
+                "Save templates now?",
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
+            )
+            if reply == QMessageBox.Yes:
+                self._save_templates()
 
     def _select_recording_files(self) -> None:
         """Select recording files (auto-detect format). Supports .pkl and .mat files."""
@@ -2690,6 +2907,9 @@ class TrainingProtocol(QObject):
                 QMessageBox.Ok,
             )
 
+            # Show template review dialog after saving
+            self._show_template_review_dialog()
+
         except Exception as e:
             QMessageBox.critical(
                 self.main_window,
@@ -2697,6 +2917,20 @@ class TrainingProtocol(QObject):
                 f"Failed to save templates: {e}",
                 QMessageBox.Ok,
             )
+
+    def _show_template_review_dialog(self) -> None:
+        """Show dialog to visualize extracted templates."""
+        # Get templates from template manager
+        templates_closed = self.template_manager.templates.get("closed", [])
+        templates_open = self.template_manager.templates.get("open", [])
+
+        if not templates_closed and not templates_open:
+            print("[TRAINING] No templates to visualize")
+            return
+
+        # Show the review dialog (non-modal)
+        dialog = TemplateReviewDialog(templates_closed, templates_open, self.main_window)
+        dialog.show()
 
     def _clear_extraction(self) -> None:
         """Clear all extracted activations and templates."""

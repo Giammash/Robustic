@@ -555,11 +555,12 @@ class Model:
 
         if self.current_state == "OPEN":
             # Check if should switch to CLOSED
-            D_closed = compute_distance_from_training_set_online(
+            D_closed, all_distances_closed = compute_distance_from_training_set_online(
                 features_emg_buffer,
                 self.templates_closed,
                 active_channels=self.active_channels,
-                distance_aggregation=self.distance_aggregation
+                distance_aggregation=self.distance_aggregation,
+                return_all_distances=True
             )
             if D_closed < self.THRESHOLD_CLOSED:
                 triggered_state = "CLOSED"
@@ -571,14 +572,17 @@ class Model:
             self.distance_history.append((timestamp, None, D_closed, self.current_state))
             self._last_distance = D_closed
             self._last_threshold = self.THRESHOLD_CLOSED
+            self._last_all_distances = all_distances_closed
+            self._last_template_class = "CLOSED"
 
         elif self.current_state == "CLOSED":
             # Check if should switch to OPEN
-            D_open = compute_distance_from_training_set_online(
+            D_open, all_distances_open = compute_distance_from_training_set_online(
                 features_emg_buffer,
                 self.templates_open,
                 active_channels=self.active_channels,
-                distance_aggregation=self.distance_aggregation
+                distance_aggregation=self.distance_aggregation,
+                return_all_distances=True
             )
             if D_open < self.THRESHOLD_OPEN:
                 triggered_state = "OPEN"
@@ -590,6 +594,8 @@ class Model:
             self.distance_history.append((timestamp, D_open, None, self.current_state))
             self._last_distance = D_open
             self._last_threshold = self.THRESHOLD_OPEN
+            self._last_all_distances = all_distances_open
+            self._last_template_class = "OPEN"
 
         dtw_time_ms = (time.perf_counter() - dtw_start) * 1000
 
@@ -682,13 +688,20 @@ class Model:
                 print(f"  >>> HAND OPENED <<<  [{time_str}]")
                 print(f"  Distance: {self._last_distance:.4f} < Threshold: {self._last_threshold:.4f}")
                 print(f"  Refractory: {self.refractory_period_s:.1f}s")
-                print(f"{'='*50}\n")
             else:
                 print(f"\n{'='*50}")
                 print(f"  >>> HAND CLOSED <<<  [{time_str}]")
                 print(f"  Distance: {self._last_distance:.4f} < Threshold: {self._last_threshold:.4f}")
                 print(f"  Refractory: {self.refractory_period_s:.1f}s")
-                print(f"{'='*50}\n")
+
+            # Print top 10 closest templates
+            if hasattr(self, '_last_all_distances') and self._last_all_distances is not None:
+                sorted_idx = np.argsort(self._last_all_distances)
+                n_show = min(10, len(sorted_idx))
+                print(f"  Top {n_show} closest {self._last_template_class} templates:")
+                for rank, idx in enumerate(sorted_idx[:n_show], 1):
+                    print(f"    {rank:2d}. Template {idx+1:2d}: {self._last_all_distances[idx]:.4f}")
+            print(f"{'='*50}\n")
 
         # Update timing stats
         total_time_ms = (time.perf_counter() - computation_start) * 1000

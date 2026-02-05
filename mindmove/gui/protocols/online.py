@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
-from PySide6.QtCore import QObject
+from PySide6.QtCore import QObject, QThread, Signal
 import numpy as np
 from datetime import datetime
 import pickle
@@ -17,6 +17,78 @@ import matplotlib.pyplot as plt
 from mindmove.model.interface import MindMoveInterface
 
 from mindmove.config import config
+
+
+class CalibrationWorker(QObject):
+    """Worker class for running calibration in a separate thread."""
+    finished = Signal(dict, dict)  # (result, thresholds)
+    error = Signal(str)
+
+    def __init__(self, recording, model):
+        super().__init__()
+        self.recording = recording
+        self.model = model
+
+    def run(self):
+        """Run calibration computation in background thread."""
+        try:
+            from mindmove.model.core.algorithm import compute_calibration_distances, find_plateau_thresholds
+
+            # Get data
+            emg = self.recording['emg']
+            gt = self.recording['gt']
+
+            # Ensure gt is 1D array
+            if hasattr(gt, 'flatten'):
+                gt = gt.flatten()
+            gt = np.array(gt)
+
+            # Get model parameters
+            templates_open = self.model.templates_open
+            templates_closed = self.model.templates_closed
+            feature_name = self.model.feature_name
+            window_length = self.model.window_length
+            increment = self.model.increment
+            active_channels = self.model.active_channels
+            distance_aggregation = self.model.distance_aggregation
+
+            print(f"[CALIBRATION WORKER] Starting computation...")
+            print(f"  Feature: {feature_name}")
+            print(f"  Window/increment: {window_length}/{increment} samples")
+            print(f"  Active channels: {len(active_channels)}")
+            print(f"  Distance aggregation: {distance_aggregation}")
+
+            # Compute continuous distances
+            print("\n[CALIBRATION WORKER] Computing DTW distances over recording...")
+            result = compute_calibration_distances(
+                emg, gt,
+                templates_open, templates_closed,
+                feature_name=feature_name,
+                window_length=window_length,
+                increment=increment,
+                active_channels=active_channels,
+                distance_aggregation=distance_aggregation,
+            )
+
+            n_dtw = len(result['timestamps'])
+            print(f"[CALIBRATION WORKER] Computed {n_dtw} DTW distances")
+
+            # Find plateau thresholds
+            print("\n[CALIBRATION WORKER] Finding plateau thresholds...")
+            thresholds = find_plateau_thresholds(
+                result['D_open'],
+                result['D_closed'],
+                result['gt_at_dtw'],
+                confidence_k=1.0,
+            )
+
+            print(f"[CALIBRATION WORKER] Calibration complete")
+            self.finished.emit(result, thresholds)
+
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
 
 if TYPE_CHECKING:
     from mindmove.gui.mindmove import MindMove
@@ -638,71 +710,51 @@ class OnlineProtocol(QObject):
             )
 
     def _run_calibration(self) -> None:
-        """Run offline calibration to find plateau thresholds."""
+        """Run offline calibration to find plateau thresholds (in background thread)."""
         if not self.calibration_recording or not self.model_interface.model_is_loaded:
             return
 
         print("\n" + "=" * 70)
-        print("RUNNING OFFLINE THRESHOLD CALIBRATION")
+        print("RUNNING OFFLINE THRESHOLD CALIBRATION (Background Thread)")
         print("=" * 70)
 
-        # Get data
-        emg = self.calibration_recording['emg']
-        gt = self.calibration_recording['gt']
+        # Disable button and show progress
+        self.run_calibration_button.setEnabled(False)
+        self.run_calibration_button.setText("Calibrating...")
+        self.calibration_results_label.setText("Computing DTW distances... Please wait.")
+        self.calibration_results_label.setVisible(True)
 
-        # Ensure gt is 1D array
-        if hasattr(gt, 'flatten'):
-            gt = gt.flatten()
-        gt = np.array(gt)
-
-        # Get model parameters
-        model = self.model_interface.model
-        templates_open = model.templates_open
-        templates_closed = model.templates_closed
-        feature_name = model.feature_name
-        window_length = model.window_length
-        increment = model.increment
-        active_channels = model.active_channels
-        distance_aggregation = model.distance_aggregation
-
-        print(f"  Feature: {feature_name}")
-        print(f"  Window/increment: {window_length}/{increment} samples")
-        print(f"  Active channels: {len(active_channels)}")
-        print(f"  Distance aggregation: {distance_aggregation}")
-
-        # Compute continuous distances
-        from mindmove.model.core.algorithm import compute_calibration_distances, find_plateau_thresholds
-
-        print("\nComputing DTW distances over recording...")
-        self.calibration_result = compute_calibration_distances(
-            emg, gt,
-            templates_open, templates_closed,
-            feature_name=feature_name,
-            window_length=window_length,
-            increment=increment,
-            active_channels=active_channels,
-            distance_aggregation=distance_aggregation,
+        # Create worker and thread
+        self._cal_thread = QThread()
+        self._cal_worker = CalibrationWorker(
+            self.calibration_recording,
+            self.model_interface.model
         )
+        self._cal_worker.moveToThread(self._cal_thread)
 
-        n_dtw = len(self.calibration_result['timestamps'])
-        print(f"  Computed {n_dtw} DTW distances")
+        # Connect signals
+        self._cal_thread.started.connect(self._cal_worker.run)
+        self._cal_worker.finished.connect(self._on_calibration_finished)
+        self._cal_worker.error.connect(self._on_calibration_error)
+        self._cal_worker.finished.connect(self._cal_thread.quit)
+        self._cal_worker.error.connect(self._cal_thread.quit)
+        self._cal_thread.finished.connect(self._cal_thread.deleteLater)
 
-        # Find plateau thresholds
-        print("\nFinding plateau thresholds...")
-        self.calibration_thresholds = find_plateau_thresholds(
-            self.calibration_result['D_open'],
-            self.calibration_result['D_closed'],
-            self.calibration_result['gt_at_dtw'],
-            confidence_k=1.0,
-        )
+        # Start the thread
+        self._cal_thread.start()
+
+    def _on_calibration_finished(self, result: dict, thresholds: dict) -> None:
+        """Handle calibration completion."""
+        self.calibration_result = result
+        self.calibration_thresholds = thresholds
 
         # Display results
-        open_plateau = self.calibration_thresholds['open_plateau']
-        closed_plateau = self.calibration_thresholds['closed_plateau']
-        threshold_open = self.calibration_thresholds['threshold_open']
-        threshold_closed = self.calibration_thresholds['threshold_closed']
-        open_std = self.calibration_thresholds['open_std']
-        closed_std = self.calibration_thresholds['closed_std']
+        open_plateau = thresholds['open_plateau']
+        closed_plateau = thresholds['closed_plateau']
+        threshold_open = thresholds['threshold_open']
+        threshold_closed = thresholds['threshold_closed']
+        open_std = thresholds['open_std']
+        closed_std = thresholds['closed_std']
 
         print(f"\n  OPEN plateau:   {open_plateau:.4f} (std={open_std:.4f})")
         print(f"  OPEN threshold: {threshold_open:.4f}")
@@ -711,6 +763,8 @@ class OnlineProtocol(QObject):
         print("=" * 70 + "\n")
 
         # Update UI
+        self.run_calibration_button.setEnabled(True)
+        self.run_calibration_button.setText("Run Calibration")
         self.calibration_results_label.setText(
             f"OPEN plateau:     {open_plateau:.4f}\n"
             f"OPEN threshold:   {threshold_open:.4f} (plateau + 1.0 × std)\n\n"
@@ -722,6 +776,16 @@ class OnlineProtocol(QObject):
 
         # Plot calibration results
         self._plot_calibration_results()
+
+    def _on_calibration_error(self, error_msg: str) -> None:
+        """Handle calibration error."""
+        self.run_calibration_button.setEnabled(True)
+        self.run_calibration_button.setText("Run Calibration")
+        self.calibration_results_label.setText(f"Error: {error_msg}")
+        self.calibration_results_label.setStyleSheet(
+            "font-family: monospace; color: red; background-color: #fff0f0; padding: 8px; border-radius: 4px;"
+        )
+        print(f"[CALIBRATION ERROR] {error_msg}")
 
     def _plot_calibration_results(self) -> None:
         """Plot calibration results showing distances and computed thresholds.

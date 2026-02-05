@@ -7,7 +7,6 @@ from PySide6.QtWidgets import QRadioButton
 from mindmove.gui.protocols.record import RecordProtocol
 from mindmove.gui.protocols.training import TrainingProtocol
 from mindmove.gui.protocols.online import OnlineProtocol
-from mindmove.gui.protocols.guided_record import GuidedRecordProtocol
 
 if TYPE_CHECKING:
     from mindmove.gui.mindmove import MindMove
@@ -23,21 +22,18 @@ class Protocol(QObject):
         self._setup_procotol_ui()
 
         # Initialize Protocol
+        # Note: GuidedRecordProtocol is now embedded in RecordProtocol
         self.current_protocol: Optional[
-            Union[RecordProtocol, TrainingProtocol, OnlineProtocol, GuidedRecordProtocol]
+            Union[RecordProtocol, TrainingProtocol, OnlineProtocol]
         ] = None
 
         self.available_protocols: list[
-            Union[RecordProtocol, TrainingProtocol, OnlineProtocol, GuidedRecordProtocol]
+            Union[RecordProtocol, TrainingProtocol, OnlineProtocol]
         ] = [
             RecordProtocol(self.main_window),
             TrainingProtocol(self.main_window),
             OnlineProtocol(self.main_window),
-            GuidedRecordProtocol(self.main_window),
         ]
-
-        # Add custom protocol widgets to stacked widget
-        self._add_custom_protocol_widgets()
 
     def _protocol_record_toggled(self, checked: bool) -> None:
         if checked:
@@ -60,20 +56,6 @@ class Protocol(QObject):
 
             print("Online Protocol toggled")
 
-    def _protocol_guided_toggled(self, checked: bool) -> None:
-        if checked:
-            self.protocol_mode_stacked_widget.setCurrentIndex(3)
-            self.current_protocol = self.available_protocols[3]
-
-            print("Guided Record Protocol toggled")
-
-    def _add_custom_protocol_widgets(self) -> None:
-        """Add custom protocol widgets to the stacked widget."""
-        # Add Guided Record widget (index 3)
-        guided_protocol = self.available_protocols[3]
-        guided_widget = guided_protocol.get_widget()
-        self.protocol_mode_stacked_widget.addWidget(guided_widget)
-
     def _setup_procotol_ui(self):
         self.protocol_mode_stacked_widget = (
             self.main_window.ui.protocolModeStackedWidget
@@ -95,16 +77,4 @@ class Protocol(QObject):
         )
         self.protocol_online_radio_button.toggled.connect(self._protocol_online_toggled)
 
-        # Add Guided Record radio button programmatically
-        self._add_guided_radio_button()
-
-    def _add_guided_radio_button(self) -> None:
-        """Add the Guided Record radio button to the protocol selection."""
-        # Find the layout containing the other radio buttons
-        parent_layout = self.protocol_online_radio_button.parent().layout()
-
-        # Create Guided Record radio button
-        self.protocol_guided_radio_button = QRadioButton("Guided Record")
-        self.protocol_guided_radio_button.toggled.connect(self._protocol_guided_toggled)
-        if parent_layout:
-            parent_layout.addWidget(self.protocol_guided_radio_button)
+        # Note: Guided Record is now embedded in Record Protocol as a mode selector

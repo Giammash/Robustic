@@ -610,6 +610,7 @@ def compute_distance_from_training_set_online(
         templates,
         active_channels=None,
         distance_aggregation="average",
+        return_all_distances=False,
         ):
     """
     Compute DTW distance between current online features and stored templates.
@@ -627,11 +628,16 @@ def compute_distance_from_training_set_online(
         - "average": Mean of all distances (default)
         - "minimum": Minimum distance to any template
         - "avg_3_smallest": Average of the 3 smallest distances (more robust)
+    return_all_distances : bool
+        If True, also return the array of all individual template distances.
+        Default is False for backwards compatibility.
 
     Returns
     -------
     aggregated_distance : float
         The aggregated DTW distance based on the selected method.
+    all_distances : np.ndarray (only if return_all_distances=True)
+        Array of distances to each template.
     """
     nwin, nch = features_buffer.shape
 
@@ -651,6 +657,8 @@ def compute_distance_from_training_set_online(
     else:  # "average" or default
         aggregated_distance = np.mean(distances)
 
+    if return_all_distances:
+        return aggregated_distance, distances.copy()
     return aggregated_distance
 
 

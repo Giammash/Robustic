@@ -14,10 +14,10 @@ clear; clc; close all;
 % Path to exported model (.mat file)
 % model_file = 'data/model_MindMove_Model_sd_20260202_165447_SD_test_rms.mat';
 % model_file = 'data/model_MindMove_Model_mp_20260129_183359_test_2_3.mat';
-model_file = 'data/model_MindMove_Model_20260126_141327_test_01010.mat';
+model_file = 'model_MindMove_Model_sd_20260203_131149_protocol_test_alberto_96_32_wl_avg3_mv.mat';
 
 % Path to exported recording (.mat file)
-recording_file = 'data/recording_27.01.2026_MindMove_GuidedRecording_mp_20260128_154438427220_guided_2cycles.mat';
+recording_file = 'recording_recordings_MindMove_GuidedRecording_sd_20260203_124415596790_Validation_Alberto.mat';
 
 %%  STEP 1: LOAD MODEL
 
@@ -38,16 +38,19 @@ templates_closed = model.templates_closed_features;
 n_closed = size(templates_closed, 1);
 
 % Extract thresholds
-threshold_open = model.threshold_base_open;
-threshold_closed = model.threshold_base_closed;
+% threshold_open = model.threshold_base_open;
+% threshold_closed = model.threshold_base_closed;
+threshold_open = 5.5;
+threshold_closed = 6.2;
 
 fprintf('  Model loaded: %s\n', model_file);
 %% LOAD RECORDING
 fprintf('Loading recording...\n');
 recording = load(recording_file);
 
-emg = recording.emg;
-gt = recording.gt;
+emg = recording.emg(:,1:25*Fs); % prende solo i primi 20 secondi
+% emg = recording.emg;
+gt = recording.gt(1:25*Fs);
 [~, n_samples] = size(emg);
 
 fprintf('  Recording: %.2f seconds\n', n_samples / Fs);
@@ -108,10 +111,12 @@ fprintf('Simulation complete.\n');
 %% VISUALIZATION
 figure('Position', [100, 100, 1200, 800]);
 
+ch_to_plot = 11; % cambiare canale se necessario
+
 subplot(3, 1, 1);
 t_emg = (0:n_samples-1) / Fs;
 yyaxis left;
-plot(t_emg, emg(1, :), 'b', 'LineWidth', 0.5);
+plot(t_emg, emg(ch_to_plot, :), 'b', 'LineWidth', 0.5);
 ylabel('EMG Ch1 (uV)');
 yyaxis right;
 plot(t_emg, gt, 'r', 'LineWidth', 1.5);
@@ -174,47 +179,3 @@ function features = extract_wl_features(emg, window_size, window_shift)
     end
 end
 
-function d = cosine_distance(v1, v2)
-    dot_product = dot(v1, v2);
-    norm1 = norm(v1);
-    norm2 = norm(v2);
-    d = 1 - dot_product / (norm1 * norm2 + 1e-8);
-end
-
-function [alignment_cost, cost_matrix, path] = dtw_cosine(template1, template2)
-    [N, ~] = size(template1);
-    [M, ~] = size(template2);
-    cost_matrix = inf(N + 1, M + 1);
-    cost_matrix(1, 1) = 0;
-    traceback = zeros(N, M);
-    for i = 1:N
-        for j = 1:M
-            dist = cosine_distance(template1(i, :), template2(j, :));
-            candidates = [cost_matrix(i, j), cost_matrix(i, j + 1), cost_matrix(i + 1, j)];
-            [min_cost, direction] = min(candidates);
-            cost_matrix(i + 1, j + 1) = dist + min_cost;
-            traceback(i, j) = direction;
-        end
-    end
-    alignment_cost = cost_matrix(N + 1, M + 1);
-    path = reconstruct_path(traceback, N, M);
-end
-
-function path = reconstruct_path(traceback, N, M)
-    path = [N, M];
-    i = N; j = M;
-    while i > 1 || j > 1
-        if i == 1
-            j = j - 1;
-        elseif j == 1
-            i = i - 1;
-        else
-            direction = traceback(i, j);
-            if direction == 1, i = i - 1; j = j - 1;
-            elseif direction == 2, i = i - 1;
-            else, j = j - 1;
-            end
-        end
-        path = [i, j; path];
-    end
-end

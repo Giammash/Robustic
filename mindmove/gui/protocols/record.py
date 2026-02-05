@@ -1,7 +1,7 @@
 from __future__ import annotations
 from typing import TYPE_CHECKING
 from PySide6.QtCore import QObject, Qt, QEvent
-from PySide6.QtWidgets import QComboBox, QLabel
+from PySide6.QtWidgets import QComboBox, QLabel, QStackedWidget, QVBoxLayout, QWidget, QGroupBox
 import time
 import numpy as np
 import pickle
@@ -18,6 +18,15 @@ class RecordProtocol(QObject):
         super().__init__(parent)
 
         self.main_window = parent
+
+        # Protocol mode: determines which UI is shown
+        # 0 = Guided Record (Open -> Close -> Open)
+        # 1 = Guided Record (Close -> Open -> Close) - Inverted
+        # 2 = Myogestic (basic keyboard GT recording)
+        self.protocol_mode = 0
+
+        # Guided record protocol instance (lazy initialization)
+        self._guided_protocol = None
 
         # Initialize Protocol UI
         self._setup_protocol_ui()
@@ -381,11 +390,131 @@ class RecordProtocol(QObject):
         )
         self.record_kinematics_progress_bar.setValue(0)
 
-        # Add GT mode selector (programmatically)
+        # Add Protocol Mode selector (at top of Record tab)
+        self._setup_protocol_mode_selector()
+
+        # Add GT mode selector (programmatically) - for Myogestic mode only
         self._setup_gt_mode_selector()
 
         # Setup review recording UI
         self._setup_review_ui()
+
+    def _setup_protocol_mode_selector(self) -> None:
+        """Setup Protocol Mode selector at top of Record tab."""
+        from PySide6.QtWidgets import QGridLayout, QHBoxLayout
+
+        # Create Protocol Mode group box
+        self.protocol_mode_group_box = QGroupBox("Protocol Mode")
+        mode_layout = QHBoxLayout(self.protocol_mode_group_box)
+
+        mode_layout.addWidget(QLabel("Recording Type:"))
+        self.protocol_mode_combo_box = QComboBox()
+        self.protocol_mode_combo_box.addItem("Guided Record (Open \u2192 Close \u2192 Open)", 0)
+        self.protocol_mode_combo_box.addItem("Guided Record (Close \u2192 Open \u2192 Close)", 1)
+        self.protocol_mode_combo_box.addItem("Myogestic (Keyboard GT)", 2)
+        self.protocol_mode_combo_box.currentIndexChanged.connect(self._on_protocol_mode_changed)
+        mode_layout.addWidget(self.protocol_mode_combo_box)
+        mode_layout.addStretch()
+
+        # Find the Record tab page widget
+        record_page = self.main_window.ui.protocolModeStackedWidget.widget(0)
+
+        # We need to wrap the existing content to add protocol mode at top
+        if record_page:
+            old_layout = record_page.layout()
+
+            # Create a container for the old content (myogestic mode)
+            self._myogestic_container = QWidget()
+            myogestic_layout = QVBoxLayout(self._myogestic_container)
+            myogestic_layout.setContentsMargins(0, 0, 0, 0)
+
+            # Move existing widgets from old layout to myogestic container
+            if old_layout:
+                # Collect all widgets first (to avoid issues while iterating)
+                widgets_to_move = []
+                while old_layout.count():
+                    item = old_layout.takeAt(0)
+                    if item.widget():
+                        widgets_to_move.append(item.widget())
+
+                # Add widgets to myogestic container
+                for widget in widgets_to_move:
+                    myogestic_layout.addWidget(widget)
+
+                # Delete the old layout by setting it on a temporary widget
+                temp_widget = QWidget()
+                temp_widget.setLayout(old_layout)
+
+            # Create stacked widget to hold different protocol UIs
+            self.protocol_content_stacked_widget = QStackedWidget()
+
+            # Index 0: Guided Record widget (will be created lazily)
+            self._guided_placeholder = QWidget()
+            self.protocol_content_stacked_widget.addWidget(self._guided_placeholder)
+
+            # Create new vertical layout for the record page
+            new_layout = QVBoxLayout()
+            new_layout.setContentsMargins(9, 9, 9, 9)
+
+            # Add protocol mode selector at top
+            new_layout.addWidget(self.protocol_mode_group_box)
+            # Add stacked widget for guided mode
+            new_layout.addWidget(self.protocol_content_stacked_widget)
+            # Add myogestic container
+            new_layout.addWidget(self._myogestic_container)
+
+            # Set the new layout on record page
+            record_page.setLayout(new_layout)
+
+        # Initially show the guided record UI
+        self._on_protocol_mode_changed(0)
+
+    def _on_protocol_mode_changed(self, index: int) -> None:
+        """Handle protocol mode change."""
+        mode_data = self.protocol_mode_combo_box.currentData()
+        self.protocol_mode = mode_data
+
+        if mode_data == 0 or mode_data == 1:
+            # Guided Record modes - show guided protocol UI, hide basic recording UI
+            self._show_guided_mode(mode_data)
+        else:
+            # Myogestic mode - show basic recording UI
+            self._show_myogestic_mode()
+
+    def _show_guided_mode(self, mode: int) -> None:
+        """Show guided recording UI."""
+        # Lazy initialization of guided protocol
+        if self._guided_protocol is None:
+            from mindmove.gui.protocols.guided_record import GuidedRecordProtocol
+            self._guided_protocol = GuidedRecordProtocol(self.main_window)
+
+            # Replace placeholder with actual guided widget
+            guided_widget = self._guided_protocol.get_widget()
+            self.protocol_content_stacked_widget.removeWidget(self._guided_placeholder)
+            self.protocol_content_stacked_widget.insertWidget(0, guided_widget)
+
+            # Hide the internal protocol selector since we control mode externally
+            self._guided_protocol.hide_protocol_selector()
+
+        # Set protocol mode (standard or inverted)
+        self._guided_protocol.set_protocol_mode(mode)
+
+        # Show guided record UI
+        self.protocol_content_stacked_widget.setCurrentIndex(0)
+        self.protocol_content_stacked_widget.setVisible(True)
+
+        # Hide myogestic container
+        if hasattr(self, '_myogestic_container'):
+            self._myogestic_container.setVisible(False)
+
+    def _show_myogestic_mode(self) -> None:
+        """Show basic myogestic recording UI."""
+        # Hide guided recording UI
+        self.protocol_content_stacked_widget.setVisible(False)
+
+        # Show myogestic container
+        if hasattr(self, '_myogestic_container'):
+            self._myogestic_container.setVisible(True)
 
     def _setup_gt_mode_selector(self) -> None:
         """Setup GT mode selector combo box."""

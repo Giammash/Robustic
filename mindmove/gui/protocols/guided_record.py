@@ -948,6 +948,26 @@ class GuidedRecordProtocol(QObject):
         """Return the main widget for this protocol."""
         return self.main_widget
 
+    def set_protocol_mode(self, mode: int) -> None:
+        """
+        Set the protocol mode externally (for embedded use).
+
+        Args:
+            mode: 0 = Standard (Open -> Close -> Open)
+                  1 = Inverted (Close -> Open -> Close)
+        """
+        if hasattr(self, 'protocol_combo'):
+            self.protocol_combo.setCurrentIndex(mode)
+
+    def hide_protocol_selector(self) -> None:
+        """Hide the internal protocol selector (for embedded use)."""
+        # When embedded in RecordProtocol, the mode is controlled externally
+        # Find and hide the protocol mode group box
+        for child in self.recording_view.findChildren(QGroupBox):
+            if child.title() == "Protocol Mode":
+                child.setVisible(False)
+                break
+
     def _on_audio_toggled(self, checked: bool):
         """Handle audio checkbox toggle."""
         self.audio_manager.enabled = checked
