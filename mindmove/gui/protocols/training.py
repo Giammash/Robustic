@@ -521,16 +521,32 @@ class CycleReviewWidget(QWidget):
         self.reset_button.clicked.connect(self._reset_windows)
         button_layout.addWidget(self.reset_button)
 
-        # Accept button - always enabled with draggable windows
-        self.accept_button = QPushButton("✓ Accept Both Templates")
+        # Accept buttons
+        self.accept_button = QPushButton("✓ Accept Both")
         self.accept_button.setStyleSheet(
-            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 16px; }"
+            "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 12px; }"
             "QPushButton:disabled { background-color: #cccccc; color: #666666; }"
         )
         self.accept_button.clicked.connect(self._accept_templates)
         button_layout.addWidget(self.accept_button)
 
-        self.skip_button = QPushButton("Skip Cycle")
+        # Accept Only CLOSED button
+        self.accept_closed_btn = QPushButton("Accept CLOSED")
+        self.accept_closed_btn.setStyleSheet(
+            "QPushButton { background-color: #FF9800; color: white; font-weight: bold; padding: 6px 12px; }"
+        )
+        self.accept_closed_btn.clicked.connect(self._accept_closed_only)
+        button_layout.addWidget(self.accept_closed_btn)
+
+        # Accept Only OPEN button
+        self.accept_open_btn = QPushButton("Accept OPEN")
+        self.accept_open_btn.setStyleSheet(
+            "QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 6px 12px; }"
+        )
+        self.accept_open_btn.clicked.connect(self._accept_open_only)
+        button_layout.addWidget(self.accept_open_btn)
+
+        self.skip_button = QPushButton("Skip")
         self.skip_button.clicked.connect(self._go_next)
         button_layout.addWidget(self.skip_button)
 
@@ -612,23 +628,50 @@ class CycleReviewWidget(QWidget):
         self.next_button.setEnabled(self.current_cycle_idx < n_cycles - 1)
         self.skip_button.setEnabled(self.current_cycle_idx < n_cycles - 1)
 
-        # Update accepted counts (show as "X / Y cycles")
-        n_accepted = len(self.accepted_closed_templates)
-        self.accepted_label.setText(f"Accepted: {n_accepted} / {n_cycles} cycles")
+        # Update accepted counts (show separate CLOSED and OPEN counts)
+        n_closed = len(self.accepted_closed_templates)
+        n_open = len(self.accepted_open_templates)
+        self.accepted_label.setText(f"Accepted: {n_closed} CLOSED, {n_open} OPEN")
 
-        # Update button text based on whether current cycle is already accepted
-        is_already_accepted = self.current_cycle_idx in self.accepted_closed_templates
-        if is_already_accepted:
-            self.accept_button.setText("✓ Update Templates")
+        # Check what's already accepted for current cycle
+        has_closed = self.current_cycle_idx in self.accepted_closed_templates
+        has_open = self.current_cycle_idx in self.accepted_open_templates
+
+        # Update button styles based on accepted status
+        if has_closed and has_open:
+            self.accept_button.setText("✓ Update Both")
             self.accept_button.setStyleSheet(
-                "QPushButton { background-color: #FF9800; color: white; font-weight: bold; padding: 8px 16px; }"
+                "QPushButton { background-color: #FF9800; color: white; font-weight: bold; padding: 6px 12px; }"
             )
         else:
-            self.accept_button.setText("✓ Accept Both Templates")
+            self.accept_button.setText("✓ Accept Both")
             self.accept_button.setStyleSheet(
-                "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 8px 16px; }"
+                "QPushButton { background-color: #4CAF50; color: white; font-weight: bold; padding: 6px 12px; }"
                 "QPushButton:disabled { background-color: #cccccc; color: #666666; }"
             )
+
+        # Update individual button styles
+        if has_closed:
+            self.accept_closed_btn.setStyleSheet(
+                "QPushButton { background-color: #E65100; color: white; font-weight: bold; padding: 6px 12px; }"
+            )
+            self.accept_closed_btn.setText("Update CLOSED")
+        else:
+            self.accept_closed_btn.setStyleSheet(
+                "QPushButton { background-color: #FF9800; color: white; font-weight: bold; padding: 6px 12px; }"
+            )
+            self.accept_closed_btn.setText("Accept CLOSED")
+
+        if has_open:
+            self.accept_open_btn.setStyleSheet(
+                "QPushButton { background-color: #1565C0; color: white; font-weight: bold; padding: 6px 12px; }"
+            )
+            self.accept_open_btn.setText("Update OPEN")
+        else:
+            self.accept_open_btn.setStyleSheet(
+                "QPushButton { background-color: #2196F3; color: white; font-weight: bold; padding: 6px 12px; }"
+            )
+            self.accept_open_btn.setText("Accept OPEN")
 
         # Clear and redraw plot - recreate axes to avoid stale state
         self.figure.clear()
@@ -881,6 +924,73 @@ class CycleReviewWidget(QWidget):
             # All cycles reviewed
             if len(self.accepted_closed_templates) == len(self.cycles):
                 self.info_label.setText("All cycles accepted! Click 'Save All' when ready.")
+
+    def _accept_closed_only(self):
+        """Accept only the CLOSED template from current cycle."""
+        if self.closed_window is None:
+            return
+        if self.current_cycle_idx >= len(self.cycles):
+            return
+
+        cycle = self.cycles[self.current_cycle_idx]
+        emg = cycle['emg']
+        cycle_idx = self.current_cycle_idx
+
+        is_overwrite = cycle_idx in self.accepted_closed_templates
+
+        # Extract CLOSED template only
+        closed_start, closed_end = self.closed_window.get_sample_range()
+        closed_end = min(closed_end, emg.shape[1])
+        if closed_end > closed_start:
+            closed_template = emg[:, closed_start:closed_end]
+            self.accepted_closed_templates[cycle_idx] = closed_template
+
+        action = "Updated" if is_overwrite else "Accepted"
+        self.info_label.setText(f"{action} CLOSED template from cycle {cycle_idx + 1}")
+        self._update_display()
+
+        # Auto-advance
+        if not is_overwrite:
+            self._auto_advance()
+
+    def _accept_open_only(self):
+        """Accept only the OPEN template from current cycle."""
+        if self.open_window is None:
+            return
+        if self.current_cycle_idx >= len(self.cycles):
+            return
+
+        cycle = self.cycles[self.current_cycle_idx]
+        emg = cycle['emg']
+        cycle_idx = self.current_cycle_idx
+
+        is_overwrite = cycle_idx in self.accepted_open_templates
+
+        # Extract OPEN template only
+        open_start, open_end = self.open_window.get_sample_range()
+        open_end = min(open_end, emg.shape[1])
+        if open_end > open_start:
+            open_template = emg[:, open_start:open_end]
+            self.accepted_open_templates[cycle_idx] = open_template
+
+        action = "Updated" if is_overwrite else "Accepted"
+        self.info_label.setText(f"{action} OPEN template from cycle {cycle_idx + 1}")
+        self._update_display()
+
+        # Auto-advance
+        if not is_overwrite:
+            self._auto_advance()
+
+    def _auto_advance(self):
+        """Auto-advance to next cycle that doesn't have both templates accepted."""
+        for next_idx in range(self.current_cycle_idx + 1, len(self.cycles)):
+            # Advance if either template is missing
+            has_closed = next_idx in self.accepted_closed_templates
+            has_open = next_idx in self.accepted_open_templates
+            if not (has_closed and has_open):
+                self.current_cycle_idx = next_idx
+                self._update_display()
+                return
 
     def get_accepted_templates(self) -> Tuple[List[np.ndarray], List[np.ndarray]]:
         """Return (closed_templates, open_templates) as lists."""
@@ -1276,6 +1386,7 @@ class TrainingProtocol(QObject):
         self.selected_extraction_recordings: List[str] = []
         self.legacy_emg_folder: Optional[str] = None
         self.legacy_gt_folder: Optional[str] = None
+        self._guided_recordings_for_review: List[dict] = []  # Store recordings for template review
 
         # File management:
         self.recordings_dir_path: str = "data/recordings/"
@@ -1924,6 +2035,13 @@ class TrainingProtocol(QObject):
         self.save_templates_btn.clicked.connect(self._save_templates)
         self.save_templates_btn.setEnabled(False)
 
+        # Open Template Review button (create programmatically)
+        self.open_template_review_btn = QPushButton("Open Template Review")
+        self.open_template_review_btn.clicked.connect(self._open_template_review)
+        self.open_template_review_btn.setEnabled(False)
+        # Add after save button in the grid
+        grid_layout.addWidget(self.open_template_review_btn, 13, 0, 1, 2)
+
         # Clear button
         self.clear_extraction_btn = self.main_window.ui.trainingClearExtractionPushButton
         self.clear_extraction_btn.clicked.connect(self._clear_extraction)
@@ -2174,6 +2292,9 @@ class TrainingProtocol(QObject):
                 # Manual Selection: Open the review dialog
                 print(f"\n[TRAINING] Opening review dialog with {len(valid_recordings)} recording(s)")
 
+                # Store recordings for later review
+                self._guided_recordings_for_review = valid_recordings
+
                 review_dialog = GuidedRecordingReviewDialog(
                     valid_recordings, self.template_manager, self.main_window
                 )
@@ -2188,13 +2309,14 @@ class TrainingProtocol(QObject):
                     n_closed = len(self.template_manager.templates.get("closed", []))
                     n_open = len(self.template_manager.templates.get("open", []))
                     self.template_count_label.setText(f"Saved: {n_closed} closed, {n_open} open")
-
-                    # Show template visualization dialog
-                    self._show_template_review_dialog()
+                    self.save_templates_btn.setEnabled(True)
+                    self.open_template_review_btn.setEnabled(True)
 
             elif template_type in ("after_audio_cue", "after_reaction_time"):
                 # Automatic extraction based on cue positions
                 self._extract_templates_from_cues(valid_recordings, template_type)
+                # Store recordings for later review
+                self._guided_recordings_for_review = valid_recordings
 
         except Exception as e:
             QMessageBox.critical(
@@ -2214,6 +2336,10 @@ class TrainingProtocol(QObject):
             recordings: List of guided recording dicts
             template_type: "after_audio_cue" or "after_reaction_time"
         """
+        # Clear existing templates before new extraction (don't accumulate)
+        self.template_manager.templates["closed"] = []
+        self.template_manager.templates["open"] = []
+
         template_duration_s = self.template_manager.template_duration_s
         template_samples = int(template_duration_s * config.FSAMP)
 
@@ -2273,16 +2399,9 @@ class TrainingProtocol(QObject):
 
                 total_cycles += 1
 
-        # Store extracted templates
-        if closed_templates:
-            if "closed" not in self.template_manager.templates:
-                self.template_manager.templates["closed"] = []
-            self.template_manager.templates["closed"].extend(closed_templates)
-
-        if open_templates:
-            if "open" not in self.template_manager.templates:
-                self.template_manager.templates["open"] = []
-            self.template_manager.templates["open"].extend(open_templates)
+        # Store extracted templates (replace, don't accumulate)
+        self.template_manager.templates["closed"] = closed_templates
+        self.template_manager.templates["open"] = open_templates
 
         # Update UI
         n_closed = len(closed_templates)
@@ -2297,19 +2416,10 @@ class TrainingProtocol(QObject):
         )
         self.template_count_label.setText(f"Extracted: {n_closed} closed, {n_open} open")
 
-        # Enable save button and prompt user to save templates
+        # Enable save and review buttons
         if n_closed > 0 or n_open > 0:
             self.save_templates_btn.setEnabled(True)
-
-            # Prompt user to save templates immediately
-            reply = QMessageBox.question(
-                self.main_window, "Save Templates",
-                f"Extracted {n_closed} CLOSED and {n_open} OPEN templates.\n\n"
-                "Save templates now?",
-                QMessageBox.Yes | QMessageBox.No, QMessageBox.Yes
-            )
-            if reply == QMessageBox.Yes:
-                self._save_templates()
+            self.open_template_review_btn.setEnabled(True)
 
     def _select_recording_files(self) -> None:
         """Select recording files (auto-detect format). Supports .pkl and .mat files."""
@@ -2973,9 +3083,6 @@ class TrainingProtocol(QObject):
                 QMessageBox.Ok,
             )
 
-            # Show template review dialog after saving
-            self._show_template_review_dialog()
-
         except Exception as e:
             QMessageBox.critical(
                 self.main_window,
@@ -3046,9 +3153,6 @@ class TrainingProtocol(QObject):
                 QMessageBox.Ok,
             )
 
-            # Show template review dialog after saving
-            self._show_template_review_dialog()
-
         except Exception as e:
             QMessageBox.critical(
                 self.main_window,
@@ -3071,6 +3175,37 @@ class TrainingProtocol(QObject):
         dialog = TemplateReviewDialog(templates_closed, templates_open, self.main_window)
         dialog.show()
 
+    def _open_template_review(self) -> None:
+        """Open the template review dialog showing full cycles for manual adjustment.
+
+        This opens the same GuidedRecordingReviewDialog used for manual selection,
+        allowing the user to review and adjust template positions visually.
+        """
+        if not self._guided_recordings_for_review:
+            QMessageBox.warning(
+                self.main_window,
+                "No Recordings",
+                "No recordings available for review.\n"
+                "Please select and extract templates from guided recordings first.",
+                QMessageBox.Ok,
+            )
+            return
+
+        print(f"\n[TRAINING] Opening template review with {len(self._guided_recordings_for_review)} recording(s)")
+
+        # Open the review dialog (same as manual selection)
+        review_dialog = GuidedRecordingReviewDialog(
+            self._guided_recordings_for_review, self.template_manager, self.main_window
+        )
+        result = review_dialog.exec()
+
+        if review_dialog.saved:
+            # Update template counts
+            n_closed = len(self.template_manager.templates.get("closed", []))
+            n_open = len(self.template_manager.templates.get("open", []))
+            self.template_count_label.setText(f"Updated: {n_closed} closed, {n_open} open")
+            print(f"[TRAINING] Templates updated: {n_closed} closed, {n_open} open")
+
     def _clear_extraction(self) -> None:
         """Clear all extracted activations and templates."""
         class_label = self.template_class_combo.currentText().lower()
@@ -3080,6 +3215,7 @@ class TrainingProtocol(QObject):
 
         # Clear UI
         self.selected_extraction_recordings = []
+        self._guided_recordings_for_review = []
         self.legacy_emg_folder = None
         self.legacy_gt_folder = None
         self.selected_recordings_for_extraction_label.setText("No recordings selected")
@@ -3094,6 +3230,7 @@ class TrainingProtocol(QObject):
         self.select_templates_btn.setEnabled(False)
         self.plot_selected_btn.setEnabled(False)
         self.save_templates_btn.setEnabled(False)
+        self.open_template_review_btn.setEnabled(False)
 
     # ==================== DTW Model Creation Methods ====================
 
