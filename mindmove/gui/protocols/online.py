@@ -121,6 +121,7 @@ class OnlineProtocol(QObject):
         self.emg_timings_buffer: list[float] = []
         self.kinematics_timings_buffer: list[float] = []
         self.predictions_buffer: list[list[float]] = []
+        self.unity_output_buffer: list[dict] = []  # Store Unity outputs with timestamps
 
         # File management
         self.prediction_dir_path: str = "data/predictions/"
@@ -153,6 +154,7 @@ class OnlineProtocol(QObject):
         else:
             # Fallback: send all zeros (OPEN state)
             unity_data = [0] * 10
+            result = {'state': 0.0, 'distance': 0.0, 'threshold': 0.0, 'state_name': 'OPEN'}
             self.main_window.virtual_hand_interface.output_message_signal.emit(
                 str(unity_data).encode("utf-8")
             )
@@ -161,6 +163,15 @@ class OnlineProtocol(QObject):
             # Store with timestamp for proper reconstruction (same format as record protocol)
             self.emg_buffer.append((time.time(), emg_data))
             self.predictions_buffer.append(prediction)
+            # Store Unity output with full context
+            self.unity_output_buffer.append({
+                'timestamp': time.time(),
+                'joints': unity_data,
+                'state': result['state'],
+                'state_name': result['state_name'],
+                'distance': result['distance'],
+                'threshold': result['threshold'],
+            })
             # Note: emg_timings_buffer is now redundant but kept for compatibility
             self.emg_timings_buffer.append(time.time())
 
@@ -187,6 +198,7 @@ class OnlineProtocol(QObject):
             self.emg_timings_buffer = []
             self.kinematics_timings_buffer = []
             self.predictions_buffer = []
+            self.unity_output_buffer = []
 
             print("\n" + "=" * 70)
             print("RECORDING STARTED - History reset")
@@ -416,6 +428,8 @@ class OnlineProtocol(QObject):
             "label": self.model_label,
             # Include distance history for offline analysis
             "distance_history": self.model_interface.get_distance_history(),
+            # Unity/VHI output with full context (timestamp, joints, state, distance, threshold)
+            "unity_output": self.unity_output_buffer,
         }
 
         now = datetime.now()
@@ -439,6 +453,7 @@ class OnlineProtocol(QObject):
         self.emg_timings_buffer = []
         self.kinematics_timings_buffer = []
         self.predictions_buffer = []
+        self.unity_output_buffer = []
 
     def _load_model(self) -> None:
         if config.DIAGNOSTIC_MODE:

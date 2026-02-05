@@ -1530,21 +1530,19 @@ class TrainingProtocol(QObject):
         layout = self.training_train_model_group_box.layout()
 
         # Clear existing layout items positioning and add our new widgets
-        # Row 0: Select Open Templates
-        self.select_open_templates_btn = QPushButton("Select Open Templates")
-        self.select_open_templates_btn.clicked.connect(lambda: self._select_template_file("open"))
-        self.open_templates_label = QLabel("No templates selected")
-        layout.addWidget(self.select_open_templates_btn, 0, 0, 1, 1)
-        layout.addWidget(self.open_templates_label, 0, 1, 1, 2)
+        # Row 0: Select Templates (combined file with both OPEN and CLOSED)
+        self.select_templates_btn = QPushButton("Select Templates")
+        self.select_templates_btn.clicked.connect(self._select_combined_template_file)
+        self.templates_label = QLabel("No templates selected")
+        layout.addWidget(self.select_templates_btn, 0, 0, 1, 1)
+        layout.addWidget(self.templates_label, 0, 1, 1, 2)
 
-        # Row 1: Select Closed Templates
-        self.select_closed_templates_btn = QPushButton("Select Closed Templates")
-        self.select_closed_templates_btn.clicked.connect(lambda: self._select_template_file("closed"))
-        self.closed_templates_label = QLabel("No templates selected")
-        layout.addWidget(self.select_closed_templates_btn, 1, 0, 1, 1)
-        layout.addWidget(self.closed_templates_label, 1, 1, 1, 2)
+        # Keep legacy paths for backwards compatibility but hidden
+        self.selected_open_templates_path: Optional[str] = None
+        self.selected_closed_templates_path: Optional[str] = None
+        self.selected_combined_templates_path: Optional[str] = None
 
-        # Row 2: Window/Overlap presets
+        # Row 1: Window/Overlap presets
         self.window_preset_label = QLabel("Window/Overlap:")
         self.window_preset_combo = QComboBox()
         self.window_preset_combo.addItems([
@@ -1554,10 +1552,10 @@ class TrainingProtocol(QObject):
             "Custom"
         ])
         self.window_preset_combo.currentIndexChanged.connect(self._on_window_preset_changed)
-        layout.addWidget(self.window_preset_label, 2, 0, 1, 1)
-        layout.addWidget(self.window_preset_combo, 2, 1, 1, 2)
+        layout.addWidget(self.window_preset_label, 1, 0, 1, 1)
+        layout.addWidget(self.window_preset_combo, 1, 1, 1, 2)
 
-        # Row 3: Custom window/overlap inputs (hidden by default)
+        # Row 2: Custom window/overlap inputs (hidden by default)
         self.custom_window_label = QLabel("Window (ms):")
         self.custom_window_spinbox = QSpinBox()
         self.custom_window_spinbox.setRange(50, 500)
@@ -1566,27 +1564,27 @@ class TrainingProtocol(QObject):
         self.custom_overlap_spinbox = QSpinBox()
         self.custom_overlap_spinbox.setRange(10, 200)
         self.custom_overlap_spinbox.setValue(32)
-        layout.addWidget(self.custom_window_label, 3, 0, 1, 1)
-        layout.addWidget(self.custom_window_spinbox, 3, 1, 1, 1)
-        layout.addWidget(self.custom_overlap_label, 3, 2, 1, 1)
-        layout.addWidget(self.custom_overlap_spinbox, 3, 3, 1, 1)
+        layout.addWidget(self.custom_window_label, 2, 0, 1, 1)
+        layout.addWidget(self.custom_window_spinbox, 2, 1, 1, 1)
+        layout.addWidget(self.custom_overlap_label, 2, 2, 1, 1)
+        layout.addWidget(self.custom_overlap_spinbox, 2, 3, 1, 1)
         # Hide custom inputs by default
         self.custom_window_label.setVisible(False)
         self.custom_window_spinbox.setVisible(False)
         self.custom_overlap_label.setVisible(False)
         self.custom_overlap_spinbox.setVisible(False)
 
-        # Row 4: Feature selection
+        # Row 3: Feature selection
         self.feature_label = QLabel("Feature:")
         self.feature_combo = QComboBox()
         # Add all features from registry
         from mindmove.model.core.features.features_registry import FEATURES
         self.feature_combo.addItems(list(FEATURES.keys()))
         self.feature_combo.setCurrentText("wl")  # Default to waveform length
-        layout.addWidget(self.feature_label, 4, 0, 1, 1)
-        layout.addWidget(self.feature_combo, 4, 1, 1, 2)
+        layout.addWidget(self.feature_label, 3, 0, 1, 1)
+        layout.addWidget(self.feature_combo, 3, 1, 1, 2)
 
-        # Row 5: DTW algorithm selection
+        # Row 4: DTW algorithm selection
         self.dtw_algorithm_label = QLabel("DTW Algorithm:")
         self.dtw_algorithm_combo = QComboBox()
         self.dtw_algorithm_combo.addItems([
@@ -1595,18 +1593,18 @@ class TrainingProtocol(QObject):
             "dtaidistance (Euclidean)",
             "Pure Python (Cosine)"
         ])
-        layout.addWidget(self.dtw_algorithm_label, 5, 0, 1, 1)
-        layout.addWidget(self.dtw_algorithm_combo, 5, 1, 1, 2)
+        layout.addWidget(self.dtw_algorithm_label, 4, 0, 1, 1)
+        layout.addWidget(self.dtw_algorithm_combo, 4, 1, 1, 2)
 
-        # Row 6: Dead channels input (1-indexed for user)
+        # Row 5: Dead channels input (1-indexed for user)
         self.dead_channels_label = QLabel("Dead Channels:")
         self.dead_channels_input = QLineEdit()
         self.dead_channels_input.setPlaceholderText("e.g., 9, 22, 25 (1-indexed)")
         self.dead_channels_input.setToolTip("Enter channel numbers (1-32) separated by commas. These channels will be excluded from DTW computation.")
-        layout.addWidget(self.dead_channels_label, 6, 0, 1, 1)
-        layout.addWidget(self.dead_channels_input, 6, 1, 1, 2)
+        layout.addWidget(self.dead_channels_label, 5, 0, 1, 1)
+        layout.addWidget(self.dead_channels_input, 5, 1, 1, 2)
 
-        # Row 7: Distance aggregation method
+        # Row 6: Distance aggregation method
         self.distance_agg_label = QLabel("Distance Aggregation:")
         self.distance_agg_combo = QComboBox()
         self.distance_agg_combo.addItems([
@@ -1615,10 +1613,10 @@ class TrainingProtocol(QObject):
             "Average of all"
         ])
         self.distance_agg_combo.setToolTip("How to compute final distance from multiple templates")
-        layout.addWidget(self.distance_agg_label, 7, 0, 1, 1)
-        layout.addWidget(self.distance_agg_combo, 7, 1, 1, 2)
+        layout.addWidget(self.distance_agg_label, 6, 0, 1, 1)
+        layout.addWidget(self.distance_agg_combo, 6, 1, 1, 2)
 
-        # Row 8: Post-prediction smoothing
+        # Row 7: Post-prediction smoothing
         self.smoothing_label = QLabel("State Smoothing:")
         self.smoothing_combo = QComboBox()
         self.smoothing_combo.addItems([
@@ -1627,28 +1625,24 @@ class TrainingProtocol(QObject):
             "None"
         ])
         self.smoothing_combo.setToolTip("Method to smooth state transitions")
-        layout.addWidget(self.smoothing_label, 8, 0, 1, 1)
-        layout.addWidget(self.smoothing_combo, 8, 1, 1, 2)
+        layout.addWidget(self.smoothing_label, 7, 0, 1, 1)
+        layout.addWidget(self.smoothing_combo, 7, 1, 1, 2)
 
-        # Row 9: Model name (reuse existing widget, just reposition)
-        layout.addWidget(self.main_window.ui.label_8, 9, 0, 1, 1)
-        layout.addWidget(self.training_model_label_line_edit, 9, 1, 1, 2)
+        # Row 8: Model name (reuse existing widget, just reposition)
+        layout.addWidget(self.main_window.ui.label_8, 8, 0, 1, 1)
+        layout.addWidget(self.training_model_label_line_edit, 8, 1, 1, 2)
 
-        # Row 10: Create Model button
+        # Row 9: Create Model button
         self.create_model_btn = QPushButton("Create Model")
         self.create_model_btn.clicked.connect(self._create_dtw_model)
         self.create_model_btn.setEnabled(False)
-        layout.addWidget(self.create_model_btn, 10, 0, 1, 3)
+        layout.addWidget(self.create_model_btn, 9, 0, 1, 3)
 
-        # Row 11: Progress bar
+        # Row 10: Progress bar
         self.model_creation_progress_bar = self.main_window.ui.trainingProgressBar
         self.model_creation_progress_bar.setVisible(True)
         self.model_creation_progress_bar.setValue(0)
-        layout.addWidget(self.model_creation_progress_bar, 11, 0, 1, 3)
-
-        # Store selected template paths
-        self.selected_open_templates_path: Optional[str] = None
-        self.selected_closed_templates_path: Optional[str] = None
+        layout.addWidget(self.model_creation_progress_bar, 10, 0, 1, 3)
 
     def _setup_template_extraction_ui(self) -> None:
         """Setup UI connections for template extraction group box."""
@@ -2874,6 +2868,17 @@ class TrainingProtocol(QObject):
 
     def _save_templates(self) -> None:
         """Save selected raw templates to disk."""
+        # Check if we're in guided mode with both classes
+        is_guided = getattr(self, '_is_guided_mode', False)
+        templates_closed = self.template_manager.templates.get("closed", [])
+        templates_open = self.template_manager.templates.get("open", [])
+
+        # For guided mode or when we have both classes, save combined
+        if is_guided or (templates_closed and templates_open):
+            self._save_templates_combined()
+            return
+
+        # Original single-class save logic
         class_label = self.template_class_combo.currentText().lower()
         template_count = self.template_manager.get_template_count(class_label)
 
@@ -2904,6 +2909,79 @@ class TrainingProtocol(QObject):
                 "Templates Saved",
                 f"Saved {template_count} raw templates ({duration}s each) to:\n{save_path}\n\n"
                 f"Note: Feature extraction will happen when creating the model.",
+                QMessageBox.Ok,
+            )
+
+            # Show template review dialog after saving
+            self._show_template_review_dialog()
+
+        except Exception as e:
+            QMessageBox.critical(
+                self.main_window,
+                "Error",
+                f"Failed to save templates: {e}",
+                QMessageBox.Ok,
+            )
+
+    def _save_templates_combined(self) -> None:
+        """Save both OPEN and CLOSED templates in a single file (for guided mode)."""
+        templates_closed = self.template_manager.templates.get("closed", [])
+        templates_open = self.template_manager.templates.get("open", [])
+
+        n_closed = len(templates_closed)
+        n_open = len(templates_open)
+
+        if n_closed == 0 and n_open == 0:
+            QMessageBox.warning(
+                self.main_window,
+                "Warning",
+                "No templates to save!",
+                QMessageBox.Ok,
+            )
+            return
+
+        # Get optional template set name
+        template_set_name = self.template_set_name_line_edit.text().strip()
+        if not template_set_name:
+            template_set_name = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Build save dict with both classes
+        duration = self.template_manager.template_duration_s
+        save_dict = {
+            "templates_open": templates_open,
+            "templates_closed": templates_closed,
+            "metadata": {
+                "template_duration_s": duration,
+                "n_open": n_open,
+                "n_closed": n_closed,
+                "format": "combined",  # Mark as combined format
+                "created": datetime.now().isoformat(),
+            }
+        }
+
+        # Save to file
+        templates_dir = "data/templates"
+        if not os.path.exists(templates_dir):
+            os.makedirs(templates_dir)
+
+        filename = f"templates_combined_{template_set_name}.pkl"
+        save_path = os.path.join(templates_dir, filename)
+
+        try:
+            with open(save_path, "wb") as f:
+                pickle.dump(save_dict, f)
+
+            print(f"[TRAINING] Saved combined templates to: {save_path}")
+            print(f"  OPEN: {n_open} templates")
+            print(f"  CLOSED: {n_closed} templates")
+
+            QMessageBox.information(
+                self.main_window,
+                "Templates Saved",
+                f"Saved combined template file:\n{save_path}\n\n"
+                f"OPEN: {n_open} templates\n"
+                f"CLOSED: {n_closed} templates\n"
+                f"Duration: {duration}s each",
                 QMessageBox.Ok,
             )
 
@@ -2957,6 +3035,80 @@ class TrainingProtocol(QObject):
         self.save_templates_btn.setEnabled(False)
 
     # ==================== DTW Model Creation Methods ====================
+
+    def _select_combined_template_file(self) -> None:
+        """Select a combined template file containing both OPEN and CLOSED templates."""
+        templates_dir = "data/templates"
+        if not os.path.exists(templates_dir):
+            templates_dir = "data"
+
+        filename, _ = QFileDialog.getOpenFileName(
+            self.main_window,
+            "Select Templates File",
+            templates_dir,
+            "Pickle files (*.pkl)"
+        )
+
+        if not filename:
+            return
+
+        # Validate the template file
+        try:
+            with open(filename, "rb") as f:
+                data = pickle.load(f)
+
+            # Check for combined format (has both templates_open and templates_closed)
+            if isinstance(data, dict) and "templates_open" in data and "templates_closed" in data:
+                n_open = len(data["templates_open"])
+                n_closed = len(data["templates_closed"])
+                duration = data.get("metadata", {}).get("template_duration_s", "?")
+                label_text = f"{n_open} OPEN + {n_closed} CLOSED ({duration}s)"
+
+                self.selected_combined_templates_path = filename
+                self.selected_open_templates_path = filename  # For compatibility
+                self.selected_closed_templates_path = filename  # For compatibility
+                self.templates_label.setText(label_text)
+                self._update_create_model_button_state()
+                return
+
+            # Check for single-class format (dict with templates and metadata)
+            if isinstance(data, dict) and "templates" in data and "metadata" in data:
+                n_templates = len(data["templates"])
+                duration = data["metadata"].get("template_duration_s", "?")
+                QMessageBox.warning(
+                    self.main_window,
+                    "Single-Class File",
+                    f"This file contains only {n_templates} templates of one class.\n\n"
+                    f"Please select a combined template file (containing both OPEN and CLOSED).",
+                    QMessageBox.Ok,
+                )
+                return
+
+            # Check for legacy format (list of templates)
+            if isinstance(data, list):
+                QMessageBox.warning(
+                    self.main_window,
+                    "Legacy Format",
+                    f"This is a legacy format file with {len(data)} templates.\n\n"
+                    f"Please select a combined template file (containing both OPEN and CLOSED).",
+                    QMessageBox.Ok,
+                )
+                return
+
+            QMessageBox.warning(
+                self.main_window,
+                "Invalid File",
+                "Selected file is not a valid template file.",
+                QMessageBox.Ok,
+            )
+
+        except Exception as e:
+            QMessageBox.critical(
+                self.main_window,
+                "Error",
+                f"Failed to load template file: {e}",
+                QMessageBox.Ok,
+            )
 
     def _select_template_file(self, class_label: str) -> None:
         """Select a template file for the given class."""
@@ -3036,10 +3188,14 @@ class TrainingProtocol(QObject):
             self.custom_overlap_spinbox.setValue(overlap_ms)
 
     def _update_create_model_button_state(self) -> None:
-        """Enable Create Model button only when both template sets are selected."""
+        """Enable Create Model button only when templates are selected."""
+        # Check for combined template file (new format)
+        has_combined = getattr(self, 'selected_combined_templates_path', None) is not None
+        # Check for separate open/closed files (legacy support)
         has_open = self.selected_open_templates_path is not None
         has_closed = self.selected_closed_templates_path is not None
-        self.create_model_btn.setEnabled(has_open and has_closed)
+
+        self.create_model_btn.setEnabled(has_combined or (has_open and has_closed))
 
     def _get_window_overlap_samples(self) -> tuple:
         """Get window and overlap in samples based on current settings."""
@@ -3180,8 +3336,16 @@ class TrainingProtocol(QObject):
 
         # Load templates
         print("\nLoading templates...")
-        open_templates_raw = self._load_templates_from_file(self.selected_open_templates_path)
-        closed_templates_raw = self._load_templates_from_file(self.selected_closed_templates_path)
+
+        # Check if using combined template file
+        combined_path = getattr(self, 'selected_combined_templates_path', None)
+        if combined_path and self.selected_open_templates_path == self.selected_closed_templates_path:
+            # Load from combined file
+            open_templates_raw, closed_templates_raw = self._load_combined_templates(combined_path)
+        else:
+            # Load from separate files (legacy)
+            open_templates_raw = self._load_templates_from_file(self.selected_open_templates_path)
+            closed_templates_raw = self._load_templates_from_file(self.selected_closed_templates_path)
 
         print(f"  Open templates: {len(open_templates_raw)}")
         print(f"  Closed templates: {len(closed_templates_raw)}")
@@ -3358,6 +3522,19 @@ class TrainingProtocol(QObject):
             return data
         else:
             raise ValueError(f"Unknown template format in {filepath}")
+
+    def _load_combined_templates(self, filepath: str) -> Tuple[List[np.ndarray], List[np.ndarray]]:
+        """Load combined template file containing both OPEN and CLOSED templates."""
+        with open(filepath, "rb") as f:
+            data = pickle.load(f)
+
+        if not isinstance(data, dict):
+            raise ValueError(f"Combined template file must be a dict: {filepath}")
+
+        if "templates_open" not in data or "templates_closed" not in data:
+            raise ValueError(f"Combined template file must have 'templates_open' and 'templates_closed': {filepath}")
+
+        return data["templates_open"], data["templates_closed"]
 
     def _create_dtw_model_finished(self) -> None:
         """Called when model creation is complete."""
