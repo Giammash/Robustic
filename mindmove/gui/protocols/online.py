@@ -8,9 +8,14 @@ import os
 import time
 from PySide6.QtWidgets import (
     QFileDialog, QSlider, QLabel, QHBoxLayout, QVBoxLayout, QGroupBox,
-    QDoubleSpinBox, QComboBox, QCheckBox, QPushButton, QMessageBox
+    QDoubleSpinBox, QComboBox, QCheckBox, QPushButton, QMessageBox,
+    QDialog, QWidget, QSpinBox
 )
 from PySide6.QtCore import Qt
+import matplotlib
+matplotlib.use('QtAgg')
+from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
+from matplotlib.figure import Figure
 import matplotlib.pyplot as plt
 
 # MindMove imports
@@ -89,6 +94,193 @@ class CalibrationWorker(QObject):
             import traceback
             traceback.print_exc()
             self.error.emit(str(e))
+
+
+class OnlineSessionReviewDialog(QDialog):
+    """
+    Dialog for reviewing online prediction session with channel selection.
+
+    Shows 3 subplots:
+    - EMG signal (selectable channel)
+    - State over time
+    - Distance to templates with thresholds
+
+    Supports arrow keys for channel switching.
+    """
+
+    def __init__(self, emg_signal, emg_time_axis, history, parent=None):
+        super().__init__(parent)
+        self.emg_signal = emg_signal  # (n_channels, n_samples)
+        self.emg_time_axis = emg_time_axis
+        self.history = history
+        self.current_channel = 0
+        self.n_channels = emg_signal.shape[0] if emg_signal is not None else 32
+
+        self.setWindowTitle("Online Session Review")
+        self.setMinimumSize(1200, 800)
+        self.resize(1400, 900)
+        self.setModal(False)
+
+        self._setup_ui()
+        self._update_plot()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        # Header with channel selector
+        header_layout = QHBoxLayout()
+
+        title = QLabel("Online Prediction Session Review")
+        title.setStyleSheet("font-size: 16px; font-weight: bold;")
+        header_layout.addWidget(title)
+
+        header_layout.addStretch()
+
+        # Channel selector
+        header_layout.addWidget(QLabel("EMG Channel:"))
+        self.channel_combo = QComboBox()
+        for i in range(1, self.n_channels + 1):
+            self.channel_combo.addItem(str(i))
+        self.channel_combo.currentIndexChanged.connect(self._on_channel_changed)
+        self.channel_combo.setToolTip("Use Up/Down arrow keys to switch channels")
+        header_layout.addWidget(self.channel_combo)
+
+        # Instructions
+        hint = QLabel("(↑↓ to change channel)")
+        hint.setStyleSheet("color: #666; font-style: italic;")
+        header_layout.addWidget(hint)
+
+        layout.addLayout(header_layout)
+
+        # Matplotlib figure with 3 subplots
+        self.figure = Figure(figsize=(14, 10), dpi=100)
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setFocusPolicy(Qt.StrongFocus)
+        layout.addWidget(self.canvas)
+
+        # Close button
+        btn_layout = QHBoxLayout()
+        btn_layout.addStretch()
+        close_btn = QPushButton("Close")
+        close_btn.clicked.connect(self.accept)
+        btn_layout.addWidget(close_btn)
+        layout.addLayout(btn_layout)
+
+        # Set focus to canvas for key events
+        self.canvas.setFocus()
+
+    def keyPressEvent(self, event):
+        """Handle arrow key presses for channel switching."""
+        if event.key() == Qt.Key_Up:
+            new_idx = max(0, self.channel_combo.currentIndex() - 1)
+            self.channel_combo.setCurrentIndex(new_idx)
+        elif event.key() == Qt.Key_Down:
+            new_idx = min(self.n_channels - 1, self.channel_combo.currentIndex() + 1)
+            self.channel_combo.setCurrentIndex(new_idx)
+        else:
+            super().keyPressEvent(event)
+
+    def _on_channel_changed(self, index):
+        self.current_channel = index
+        self._update_plot()
+
+    def _update_plot(self):
+        """Update the plot with current channel selection."""
+        self.figure.clear()
+
+        if self.history is None:
+            return
+
+        timestamps = np.array(self.history["timestamps"])
+        D_open = self.history["D_open"]
+        D_closed = self.history["D_closed"]
+        states = self.history["states"]
+        threshold_open = self.history["threshold_open"]
+        threshold_closed = self.history["threshold_closed"]
+        state_transitions = self.history.get("state_transitions", [])
+
+        if len(timestamps) == 0:
+            return
+
+        # Normalize timestamps
+        t0 = timestamps[0]
+        timestamps_rel = timestamps - t0
+
+        # Create 3 subplots
+        axes = self.figure.subplots(3, 1, sharex=True)
+
+        # --- Plot 1: EMG Signal (selected channel) ---
+        ax1 = axes[0]
+        if self.emg_signal is not None and self.emg_time_axis is not None:
+            emg_time_rel = self.emg_time_axis - t0
+            channel_data = self.emg_signal[self.current_channel, :]
+            ax1.plot(emg_time_rel, channel_data, 'b-', linewidth=0.5, alpha=0.8)
+
+        ax1.set_ylabel(f"EMG Ch{self.current_channel + 1} (µV)", fontsize=11)
+        ax1.set_title(f"Online Session Analysis - Channel {self.current_channel + 1}",
+                     fontsize=12, fontweight='bold')
+        ax1.grid(True, alpha=0.3)
+
+        # --- Plot 2: State Over Time ---
+        ax2 = axes[1]
+        states_numeric = [1 if s == "CLOSED" else 0 for s in states]
+
+        ax2.step(timestamps_rel, states_numeric, 'purple', linewidth=2, where='post')
+        ax2.fill_between(timestamps_rel, 0, states_numeric, step='post', alpha=0.3, color='purple')
+
+        ax2.set_ylabel("State", fontsize=11)
+        ax2.set_ylim(-0.1, 1.1)
+        ax2.set_yticks([0, 1])
+        ax2.set_yticklabels(['OPEN', 'CLOSED'])
+        ax2.grid(True, alpha=0.3)
+
+        # Mark state transitions
+        for trans_time, from_state, to_state in state_transitions:
+            trans_t = trans_time - t0
+            if 0 <= trans_t <= timestamps_rel[-1]:
+                color = 'green' if to_state == "OPEN" else 'orange'
+                ax2.axvline(x=trans_t, color=color, linestyle='-', linewidth=2, alpha=0.7)
+
+        # --- Plot 3: Distance to Templates ---
+        ax3 = axes[2]
+
+        distances_to_plot = []
+        thresholds_to_plot = []
+        colors = []
+
+        for i, (t, state) in enumerate(zip(timestamps_rel, states)):
+            if state == "CLOSED":
+                if D_open[i] is not None:
+                    distances_to_plot.append((t, D_open[i]))
+                    thresholds_to_plot.append((t, threshold_open))
+                    colors.append('green')
+            else:
+                if D_closed[i] is not None:
+                    distances_to_plot.append((t, D_closed[i]))
+                    thresholds_to_plot.append((t, threshold_closed))
+                    colors.append('red')
+
+        if distances_to_plot:
+            t_dist = [d[0] for d in distances_to_plot]
+            d_vals = [d[1] for d in distances_to_plot]
+            t_thresh = [th[0] for th in thresholds_to_plot]
+            th_vals = [th[1] for th in thresholds_to_plot]
+
+            for i in range(len(t_dist)):
+                ax3.scatter(t_dist[i], d_vals[i], c=colors[i], s=15, alpha=0.7)
+
+            ax3.step(t_thresh, th_vals, 'k--', linewidth=2, where='post', label='Threshold')
+
+            ax3.scatter([], [], c='green', s=30, label=f'D_open (T={threshold_open:.3f})')
+            ax3.scatter([], [], c='red', s=30, label=f'D_closed (T={threshold_closed:.3f})')
+            ax3.legend(loc='upper right', fontsize=9)
+
+        ax3.set_xlabel("Time (seconds)", fontsize=11)
+        ax3.set_ylabel("DTW Distance", fontsize=11)
+        ax3.grid(True, alpha=0.3)
+
+        self.figure.tight_layout()
+        self.canvas.draw()
 
 if TYPE_CHECKING:
     from mindmove.gui.mindmove import MindMove
@@ -224,14 +416,12 @@ class OnlineProtocol(QObject):
 
     def _plot_distance_history(self) -> None:
         """
-        Plot distance history after stopping recording.
+        Plot distance history after stopping recording using Qt dialog.
 
         Creates a 3-subplot figure:
-        - Top: EMG signal reconstruction
+        - Top: EMG signal (selectable channel with arrow keys)
         - Middle: State over time (0=OPEN, 1=CLOSED)
         - Bottom: Distance to opposite-state templates with threshold
-
-        For long recordings (>100s), creates multiple plots.
         """
         history = self.model_interface.get_distance_history()
 
@@ -240,36 +430,24 @@ class OnlineProtocol(QObject):
             return
 
         timestamps = np.array(history["timestamps"])
-        D_open = history["D_open"]
-        D_closed = history["D_closed"]
-        states = history["states"]
-        threshold_open = history["threshold_open"]
-        threshold_closed = history["threshold_closed"]
         state_transitions = history.get("state_transitions", [])
-        s_open = history.get("s_open", 1.0)
-        s_closed = history.get("s_closed", 1.0)
 
         # Reconstruct continuous EMG signal from buffer
-        # emg_buffer is now list of (timestamp, emg_data) tuples
         if self.emg_buffer:
-            emg_timestamps = np.array([t for t, _ in self.emg_buffer])
-            emg_signal = np.hstack([emg_data for _, emg_data in self.emg_buffer])  # (32, total_samples)
+            emg_signal = np.hstack([emg_data for _, emg_data in self.emg_buffer])
             n_channels, n_samples = emg_signal.shape
 
             # Create continuous time axis for EMG
-            # Each packet has a timestamp; reconstruct sample-level times
             emg_time_axis = np.zeros(n_samples)
             sample_idx = 0
             for i, (pkt_time, pkt_data) in enumerate(self.emg_buffer):
                 pkt_samples = pkt_data.shape[1]
                 if i == 0:
-                    # First packet: samples end at pkt_time
                     pkt_duration = pkt_samples / config.FSAMP
                     emg_time_axis[sample_idx:sample_idx + pkt_samples] = np.linspace(
                         pkt_time - pkt_duration, pkt_time, pkt_samples, endpoint=False
                     )
                 else:
-                    # Subsequent packets: interpolate between timestamps
                     prev_time = self.emg_buffer[i-1][0]
                     emg_time_axis[sample_idx:sample_idx + pkt_samples] = np.linspace(
                         prev_time, pkt_time, pkt_samples, endpoint=False
@@ -279,135 +457,18 @@ class OnlineProtocol(QObject):
             emg_signal = None
             emg_time_axis = None
 
-        # Normalize timestamps to start from 0
-        t0 = timestamps[0] if len(timestamps) > 0 else 0
-        timestamps_rel = timestamps - t0
-
-        if emg_time_axis is not None:
-            emg_time_rel = emg_time_axis - t0
-
         # Total duration
-        total_duration = timestamps_rel[-1] if len(timestamps_rel) > 0 else 0
+        t0 = timestamps[0] if len(timestamps) > 0 else 0
+        total_duration = timestamps[-1] - t0 if len(timestamps) > 0 else 0
 
-        # Window size for plotting (100 seconds)
-        window_size = 100.0
-        n_windows = max(1, int(np.ceil(total_duration / window_size)))
-
-        print(f"\n[PLOT] Creating {n_windows} plot(s) for {total_duration:.1f}s recording")
+        print(f"\n[PLOT] Opening session review dialog for {total_duration:.1f}s recording")
         print(f"       DTW computations: {len(timestamps)}")
         print(f"       EMG samples: {emg_signal.shape[1] if emg_signal is not None else 0}")
         print(f"       State transitions: {len(state_transitions)}")
 
-        for window_idx in range(n_windows):
-            t_start = window_idx * window_size
-            t_end = min((window_idx + 1) * window_size, total_duration + 1)
-
-            # Filter DTW data for this window
-            mask = (timestamps_rel >= t_start) & (timestamps_rel < t_end)
-            t_window = timestamps_rel[mask]
-
-            if len(t_window) == 0:
-                continue
-
-            # Create figure with 3 subplots
-            fig, axes = plt.subplots(3, 1, figsize=(14, 10), sharex=True)
-
-            # --- Plot 1: EMG Signal ---
-            ax1 = axes[0]
-            if emg_signal is not None and emg_time_rel is not None:
-                # Filter EMG samples for this time window
-                emg_mask = (emg_time_rel >= t_start) & (emg_time_rel < t_end)
-                if np.any(emg_mask):
-                    emg_times_window = emg_time_rel[emg_mask]
-                    emg_values_window = emg_signal[0, emg_mask]  # Channel 0
-                    ax1.plot(emg_times_window, emg_values_window, 'b-', linewidth=0.5, alpha=0.7)
-
-            ax1.set_ylabel("EMG Ch1 (µV)", fontsize=11)
-            ax1.set_title(f"Online Session Analysis - Window {window_idx + 1}/{n_windows} "
-                         f"[{t_start:.0f}s - {t_end:.0f}s]", fontsize=12, fontweight='bold')
-            ax1.grid(True, alpha=0.3)
-
-            # --- Plot 2: State Over Time ---
-            ax2 = axes[1]
-            states_window = [states[i] for i in range(len(states)) if mask[i]]
-            states_numeric = [1 if s == "CLOSED" else 0 for s in states_window]
-
-            if len(t_window) > 0 and len(states_numeric) > 0:
-                ax2.step(t_window, states_numeric, 'purple', linewidth=2, where='post')
-                ax2.fill_between(t_window, 0, states_numeric, step='post', alpha=0.3, color='purple')
-
-            ax2.set_ylabel("State", fontsize=11)
-            ax2.set_ylim(-0.1, 1.1)
-            ax2.set_yticks([0, 1])
-            ax2.set_yticklabels(['OPEN', 'CLOSED'])
-            ax2.grid(True, alpha=0.3)
-
-            # Mark state transitions in this window
-            for trans_time, from_state, to_state in state_transitions:
-                trans_t = trans_time - t0
-                if t_start <= trans_t < t_end:
-                    color = 'green' if to_state == "OPEN" else 'orange'
-                    ax2.axvline(x=trans_t, color=color, linestyle='-', linewidth=2, alpha=0.7)
-
-            # --- Plot 3: Distance to Opposite-State Templates ---
-            ax3 = axes[2]
-
-            # For each point, plot the distance that was computed (opposite state)
-            # When state=CLOSED, we computed D_open (checking if should open)
-            # When state=OPEN, we computed D_closed (checking if should close)
-
-            distances_to_plot = []
-            thresholds_to_plot = []
-            colors = []
-
-            for i, (t, state) in enumerate(zip(timestamps_rel, states)):
-                if not (t_start <= t < t_end):
-                    continue
-
-                if state == "CLOSED":
-                    # Was computing D_open to check if should open
-                    if D_open[i] is not None:
-                        distances_to_plot.append((t, D_open[i]))
-                        thresholds_to_plot.append((t, threshold_open))
-                        colors.append('green')  # Green for D_open
-                else:  # OPEN
-                    # Was computing D_closed to check if should close
-                    if D_closed[i] is not None:
-                        distances_to_plot.append((t, D_closed[i]))
-                        thresholds_to_plot.append((t, threshold_closed))
-                        colors.append('red')  # Red for D_closed
-
-            if distances_to_plot:
-                t_dist = [d[0] for d in distances_to_plot]
-                d_vals = [d[1] for d in distances_to_plot]
-                t_thresh = [th[0] for th in thresholds_to_plot]
-                th_vals = [th[1] for th in thresholds_to_plot]
-
-                # Plot distances with color indicating which template set
-                for i in range(len(t_dist)):
-                    ax3.scatter(t_dist[i], d_vals[i], c=colors[i], s=15, alpha=0.7)
-
-                # Plot threshold line (step function that changes with state)
-                ax3.step(t_thresh, th_vals, 'k--', linewidth=2, where='post',
-                        label='Threshold (adaptive)')
-
-                # Add legend
-                ax3.scatter([], [], c='green', s=30, label=f'D_open (T={threshold_open:.3f})')
-                ax3.scatter([], [], c='red', s=30, label=f'D_closed (T={threshold_closed:.3f})')
-                ax3.legend(loc='upper right', fontsize=9)
-
-            ax3.set_xlabel("Time (seconds)", fontsize=11)
-            ax3.set_ylabel("DTW Distance", fontsize=11)
-            ax3.set_title(f"Distance to Opposite-State Templates (s_open={s_open:.2f}, s_closed={s_closed:.2f})",
-                         fontsize=11)
-            ax3.grid(True, alpha=0.3)
-
-            plt.tight_layout()
-            # Use non-blocking show to avoid Qt event loop conflict
-            plt.show(block=False)
-            plt.pause(0.1)  # Small pause to ensure the window renders
-
-        print(f"[PLOT] Done plotting {n_windows} window(s)")
+        # Open the review dialog
+        dialog = OnlineSessionReviewDialog(emg_signal, emg_time_axis, history, self.main_window)
+        dialog.exec()
 
     def _save_data(self) -> None:
         # Reconstruct EMG as (32, total_samples) - same format as record protocol

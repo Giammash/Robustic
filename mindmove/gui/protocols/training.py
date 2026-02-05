@@ -73,6 +73,9 @@ class ActivationReviewWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
 
+        # Enable focus for keyboard events
+        self.setFocusPolicy(Qt.StrongFocus)
+
         # Header with channel selector
         header_layout = QHBoxLayout()
         self.header_label = QLabel(f"{self.class_label.upper()} Activations: 0")
@@ -92,7 +95,13 @@ class ActivationReviewWidget(QWidget):
         for i in range(1, 33):  # 1-32 for user
             self.channel_combo.addItem(str(i))
         self.channel_combo.currentIndexChanged.connect(self._on_channel_changed)
+        self.channel_combo.setToolTip("Use Up/Down arrows to switch channels, Left/Right for navigation")
         header_layout.addWidget(self.channel_combo)
+
+        # Keyboard hint
+        hint = QLabel("(↑↓ ch, ←→ nav)")
+        hint.setStyleSheet("color: #666; font-style: italic; font-size: 10px;")
+        header_layout.addWidget(hint)
 
         layout.addLayout(header_layout)
 
@@ -147,6 +156,25 @@ class ActivationReviewWidget(QWidget):
         """Handle channel selection change."""
         self.current_channel = index  # combo index is 0-based, matches our internal 0-indexed channel
         self._update_display()
+
+    def keyPressEvent(self, event):
+        """Handle arrow key presses for fast channel switching."""
+        if event.key() == Qt.Key_Up:
+            new_idx = max(0, self.channel_combo.currentIndex() - 1)
+            self.channel_combo.setCurrentIndex(new_idx)
+            event.accept()
+        elif event.key() == Qt.Key_Down:
+            new_idx = min(31, self.channel_combo.currentIndex() + 1)
+            self.channel_combo.setCurrentIndex(new_idx)
+            event.accept()
+        elif event.key() == Qt.Key_Left:
+            self._go_prev()
+            event.accept()
+        elif event.key() == Qt.Key_Right:
+            self._go_next()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
     def set_activations(self, activations: List[np.ndarray], gt_signals: Optional[List[np.ndarray]] = None):
         """Set activations and optionally their GT signals."""
@@ -228,6 +256,8 @@ class ActivationReviewWidget(QWidget):
         self.canvas.draw()
 
     def _on_canvas_click(self, event):
+        # Grab focus for keyboard events
+        self.setFocus()
         if event.inaxes != self.ax:
             return
         if len(self.activations) == 0 or self.current_index >= len(self.activations):
@@ -402,6 +432,9 @@ class CycleReviewWidget(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
 
+        # Enable focus for keyboard events
+        self.setFocusPolicy(Qt.StrongFocus)
+
         # Header with cycle info and channel selector
         header_layout = QHBoxLayout()
 
@@ -425,7 +458,13 @@ class CycleReviewWidget(QWidget):
         for i in range(1, 33):
             self.channel_combo.addItem(str(i))
         self.channel_combo.currentIndexChanged.connect(self._on_channel_changed)
+        self.channel_combo.setToolTip("Use Up/Down arrows to switch channels, Left/Right for cycle navigation")
         header_layout.addWidget(self.channel_combo)
+
+        # Keyboard hint
+        hint = QLabel("(↑↓ ch, ←→ nav)")
+        hint.setStyleSheet("color: #666; font-style: italic; font-size: 10px;")
+        header_layout.addWidget(hint)
 
         layout.addLayout(header_layout)
 
@@ -527,6 +566,26 @@ class CycleReviewWidget(QWidget):
         self._save_window_positions()
         self.current_channel = index
         self._update_display()
+
+    def keyPressEvent(self, event):
+        """Handle arrow key presses for fast channel switching."""
+        n_channels = self.channel_combo.count()
+        if event.key() == Qt.Key_Up:
+            new_idx = max(0, self.channel_combo.currentIndex() - 1)
+            self.channel_combo.setCurrentIndex(new_idx)
+            event.accept()
+        elif event.key() == Qt.Key_Down:
+            new_idx = min(n_channels - 1, self.channel_combo.currentIndex() + 1)
+            self.channel_combo.setCurrentIndex(new_idx)
+            event.accept()
+        elif event.key() == Qt.Key_Left:
+            self._go_prev()
+            event.accept()
+        elif event.key() == Qt.Key_Right:
+            self._go_next()
+            event.accept()
+        else:
+            super().keyPressEvent(event)
 
     def _save_window_positions(self):
         """Save current window positions for the current cycle."""
@@ -715,6 +774,8 @@ class CycleReviewWidget(QWidget):
 
     def _on_mouse_press(self, event):
         """Handle mouse press for dragging."""
+        # Grab focus for keyboard events
+        self.setFocus()
         if event.inaxes != self.ax or event.xdata is None:
             return
 
