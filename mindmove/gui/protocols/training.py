@@ -773,7 +773,7 @@ class CycleReviewWidget(QWidget):
         # Labels and formatting
         self.ax.set_xlabel('Time (s)')
         self.ax.set_ylabel(f'Channel {channel + 1} (µV)')
-        status = " [ACCEPTED]" if is_already_accepted else ""
+        status = " [ACCEPTED]" if (has_closed and has_open) else (" [CLOSED]" if has_closed else (" [OPEN]" if has_open else ""))
         mode_indicator = " [INV]" if protocol_mode == "inverted" else ""
         # Include recording name in title if available
         rec_name = f'{self.recording_name} - ' if hasattr(self, 'recording_name') and self.recording_name else ''
