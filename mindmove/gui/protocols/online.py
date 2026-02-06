@@ -185,7 +185,14 @@ class OnlineSessionReviewDialog(QDialog):
         self._update_plot()
 
     def _update_plot(self):
-        """Update the plot with current channel selection."""
+        """Update the plot with current channel selection.
+
+        Shows 4 subplots like offline_test.py:
+        1. Raw EMG (selected channel) with predicted state overlay
+        2. Distance to OPEN templates with threshold
+        3. Distance to CLOSED templates with threshold
+        4. Predicted State (0=OPEN, 1=CLOSED)
+        """
         self.figure.clear()
 
         if self.history is None:
@@ -206,78 +213,86 @@ class OnlineSessionReviewDialog(QDialog):
         t0 = timestamps[0]
         timestamps_rel = timestamps - t0
 
-        # Create 3 subplots
-        axes = self.figure.subplots(3, 1, sharex=True)
+        # Create 4 subplots (like offline_test.py)
+        axes = self.figure.subplots(4, 1, sharex=True)
 
-        # --- Plot 1: EMG Signal (selected channel) ---
+        # --- Plot 1: EMG Signal (selected channel) with state overlay ---
         ax1 = axes[0]
         if self.emg_signal is not None and self.emg_time_axis is not None:
             emg_time_rel = self.emg_time_axis - t0
             channel_data = self.emg_signal[self.current_channel, :]
+
+            # Add predicted state as background shading
+            states_numeric = np.array([1 if s == "CLOSED" else 0 for s in states])
+            emg_max = np.max(np.abs(channel_data)) if len(channel_data) > 0 else 1
+
+            # Interpolate states to EMG time resolution for shading
+            if len(timestamps_rel) > 1:
+                from scipy.interpolate import interp1d
+                state_interp = interp1d(timestamps_rel, states_numeric, kind='previous',
+                                        bounds_error=False, fill_value=(states_numeric[0], states_numeric[-1]))
+                states_at_emg = state_interp(emg_time_rel)
+                ax1.fill_between(emg_time_rel, -emg_max, emg_max,
+                                where=states_at_emg > 0.5, alpha=0.15, color='purple', label='CLOSED')
+
             ax1.plot(emg_time_rel, channel_data, 'b-', linewidth=0.5, alpha=0.8)
 
-        ax1.set_ylabel(f"EMG Ch{self.current_channel + 1} (µV)", fontsize=11)
-        ax1.set_title(f"Online Session Analysis - Channel {self.current_channel + 1}",
-                     fontsize=12, fontweight='bold')
+        ax1.set_ylabel(f"EMG Ch{self.current_channel + 1} (µV)", fontsize=10)
+        ax1.set_title(f"Online Session - Channel {self.current_channel + 1}", fontsize=11, fontweight='bold')
         ax1.grid(True, alpha=0.3)
+        ax1.legend(loc='upper right', fontsize=8)
 
-        # --- Plot 2: State Over Time ---
+        # --- Plot 2: Distance to OPEN templates ---
         ax2 = axes[1]
-        states_numeric = [1 if s == "CLOSED" else 0 for s in states]
-
-        ax2.step(timestamps_rel, states_numeric, 'purple', linewidth=2, where='post')
-        ax2.fill_between(timestamps_rel, 0, states_numeric, step='post', alpha=0.3, color='purple')
-
-        ax2.set_ylabel("State", fontsize=11)
-        ax2.set_ylim(-0.1, 1.1)
-        ax2.set_yticks([0, 1])
-        ax2.set_yticklabels(['OPEN', 'CLOSED'])
+        # Filter out None values
+        valid_d_open = [(t, d) for t, d in zip(timestamps_rel, D_open) if d is not None]
+        if valid_d_open:
+            t_open = [x[0] for x in valid_d_open]
+            d_open = [x[1] for x in valid_d_open]
+            ax2.plot(t_open, d_open, 'g-', linewidth=1, label='D_open')
+            ax2.axhline(threshold_open, color='r', linestyle='--', linewidth=2,
+                       label=f'Threshold ({threshold_open:.3f})')
+        ax2.set_ylabel("DTW Distance", fontsize=10)
+        ax2.set_title("Distance to OPEN templates", fontsize=10)
+        ax2.legend(loc='upper right', fontsize=8)
         ax2.grid(True, alpha=0.3)
 
-        # Mark state transitions
+        # --- Plot 3: Distance to CLOSED templates ---
+        ax3 = axes[2]
+        # Filter out None values
+        valid_d_closed = [(t, d) for t, d in zip(timestamps_rel, D_closed) if d is not None]
+        if valid_d_closed:
+            t_closed = [x[0] for x in valid_d_closed]
+            d_closed = [x[1] for x in valid_d_closed]
+            ax3.plot(t_closed, d_closed, 'orange', linewidth=1, label='D_closed')
+            ax3.axhline(threshold_closed, color='r', linestyle='--', linewidth=2,
+                       label=f'Threshold ({threshold_closed:.3f})')
+        ax3.set_ylabel("DTW Distance", fontsize=10)
+        ax3.set_title("Distance to CLOSED templates", fontsize=10)
+        ax3.legend(loc='upper right', fontsize=8)
+        ax3.grid(True, alpha=0.3)
+
+        # --- Plot 4: Predicted State ---
+        ax4 = axes[3]
+        states_numeric = [1 if s == "CLOSED" else 0 for s in states]
+        ax4.step(timestamps_rel, states_numeric, 'purple', linewidth=2, where='post', label='Predicted')
+        ax4.fill_between(timestamps_rel, 0, states_numeric, step='post', alpha=0.3, color='purple')
+
+        # Mark state transitions with vertical lines
         for trans_time, from_state, to_state in state_transitions:
             trans_t = trans_time - t0
             if 0 <= trans_t <= timestamps_rel[-1]:
                 color = 'green' if to_state == "OPEN" else 'orange'
-                ax2.axvline(x=trans_t, color=color, linestyle='-', linewidth=2, alpha=0.7)
+                ax4.axvline(x=trans_t, color=color, linestyle='-', linewidth=1.5, alpha=0.7)
 
-        # --- Plot 3: Distance to Templates ---
-        ax3 = axes[2]
-
-        distances_to_plot = []
-        thresholds_to_plot = []
-        colors = []
-
-        for i, (t, state) in enumerate(zip(timestamps_rel, states)):
-            if state == "CLOSED":
-                if D_open[i] is not None:
-                    distances_to_plot.append((t, D_open[i]))
-                    thresholds_to_plot.append((t, threshold_open))
-                    colors.append('green')
-            else:
-                if D_closed[i] is not None:
-                    distances_to_plot.append((t, D_closed[i]))
-                    thresholds_to_plot.append((t, threshold_closed))
-                    colors.append('red')
-
-        if distances_to_plot:
-            t_dist = [d[0] for d in distances_to_plot]
-            d_vals = [d[1] for d in distances_to_plot]
-            t_thresh = [th[0] for th in thresholds_to_plot]
-            th_vals = [th[1] for th in thresholds_to_plot]
-
-            for i in range(len(t_dist)):
-                ax3.scatter(t_dist[i], d_vals[i], c=colors[i], s=15, alpha=0.7)
-
-            ax3.step(t_thresh, th_vals, 'k--', linewidth=2, where='post', label='Threshold')
-
-            ax3.scatter([], [], c='green', s=30, label=f'D_open (T={threshold_open:.3f})')
-            ax3.scatter([], [], c='red', s=30, label=f'D_closed (T={threshold_closed:.3f})')
-            ax3.legend(loc='upper right', fontsize=9)
-
-        ax3.set_xlabel("Time (seconds)", fontsize=11)
-        ax3.set_ylabel("DTW Distance", fontsize=11)
-        ax3.grid(True, alpha=0.3)
+        ax4.set_ylabel("State", fontsize=10)
+        ax4.set_xlabel("Time (seconds)", fontsize=10)
+        ax4.set_title("Predicted State (0=OPEN, 1=CLOSED)", fontsize=10)
+        ax4.set_ylim(-0.1, 1.1)
+        ax4.set_yticks([0, 1])
+        ax4.set_yticklabels(['OPEN', 'CLOSED'])
+        ax4.grid(True, alpha=0.3)
+        ax4.legend(loc='upper right', fontsize=8)
 
         self.figure.tight_layout()
         self.canvas.draw()

@@ -89,7 +89,8 @@ class HandAnimationSequencer:
         hold_closed_s: float,
         opening_s: float,
         reaction_time_s: float = 0.2,
-        protocol_mode: str = "standard"
+        protocol_mode: str = "standard",
+        repetitions: int = 1
     ):
         """
         Define one cycle with specified timings.
@@ -101,6 +102,7 @@ class HandAnimationSequencer:
             opening_s: Duration for hand to open (VHI movement + GT ramp)
             reaction_time_s: Delay between audio cue and movement start
             protocol_mode: "standard" (open→close→open) or "inverted" (close→open→close)
+            repetitions: Number of repetitions per cycle (>1 means final hold becomes next start)
         """
         self.hold_open_s = hold_open_s
         self.reaction_time_s = reaction_time_s
@@ -108,31 +110,59 @@ class HandAnimationSequencer:
         self.hold_closed_s = hold_closed_s
         self.opening_s = opening_s
         self.protocol_mode = protocol_mode
+        self.repetitions = repetitions
 
         if protocol_mode == "inverted":
             # Inverted: start closed → open → close
-            # Phase sequence: HOLD_CLOSED → REACTION_OPEN → OPENING → HOLD_OPEN → REACTION_CLOSE → CLOSING → HOLD_CLOSED_END
-            self.phases = [
+            # First repetition phases
+            first_rep = [
                 (self.PHASE_HOLD_CLOSED, hold_closed_s),
                 (self.PHASE_REACTION_OPEN, reaction_time_s),
                 (self.PHASE_OPENING, opening_s),
                 (self.PHASE_HOLD_OPEN, hold_open_s),
                 (self.PHASE_REACTION_CLOSE, reaction_time_s),
                 (self.PHASE_CLOSING, closing_s),
-                (self.PHASE_HOLD_CLOSED_END, hold_closed_s),
             ]
+            # Additional repetitions (skip initial HOLD_CLOSED, use previous CLOSING end as start)
+            extra_rep = [
+                (self.PHASE_HOLD_CLOSED, hold_closed_s),  # Previous closing leads into this
+                (self.PHASE_REACTION_OPEN, reaction_time_s),
+                (self.PHASE_OPENING, opening_s),
+                (self.PHASE_HOLD_OPEN, hold_open_s),
+                (self.PHASE_REACTION_CLOSE, reaction_time_s),
+                (self.PHASE_CLOSING, closing_s),
+            ]
+            self.phases = first_rep.copy()
+            for _ in range(repetitions - 1):
+                self.phases.extend(extra_rep)
+            # Final hold
+            self.phases.append((self.PHASE_HOLD_CLOSED_END, hold_closed_s))
         else:
             # Standard: start open → close → open
-            # Phase sequence with durations (includes final HOLD_OPEN_END)
-            self.phases = [
+            # First repetition phases
+            first_rep = [
                 (self.PHASE_HOLD_OPEN, hold_open_s),
                 (self.PHASE_REACTION_CLOSE, reaction_time_s),
                 (self.PHASE_CLOSING, closing_s),
                 (self.PHASE_HOLD_CLOSED, hold_closed_s),
                 (self.PHASE_REACTION_OPEN, reaction_time_s),
                 (self.PHASE_OPENING, opening_s),
-                (self.PHASE_HOLD_OPEN_END, hold_open_s),  # Same duration as first hold open
             ]
+            # Additional repetitions (the previous OPENING end + short pause becomes next HOLD_OPEN)
+            # We use HOLD_OPEN for the "pause" between reps, then continue
+            extra_rep = [
+                (self.PHASE_HOLD_OPEN, hold_open_s),  # Previous opening leads into this
+                (self.PHASE_REACTION_CLOSE, reaction_time_s),
+                (self.PHASE_CLOSING, closing_s),
+                (self.PHASE_HOLD_CLOSED, hold_closed_s),
+                (self.PHASE_REACTION_OPEN, reaction_time_s),
+                (self.PHASE_OPENING, opening_s),
+            ]
+            self.phases = first_rep.copy()
+            for _ in range(repetitions - 1):
+                self.phases.extend(extra_rep)
+            # Final hold
+            self.phases.append((self.PHASE_HOLD_OPEN_END, hold_open_s))
 
         # Reset audio cue times
         self.close_cue_time = None
@@ -785,11 +815,24 @@ class GuidedRecordProtocol(QObject):
         self.reaction_time_combo.setToolTip("Delay between audio cue and VHI hand movement start")
         timing_layout.addWidget(self.reaction_time_combo, 4, 1)
 
+        # Repetitions per cycle
+        timing_layout.addWidget(QLabel("Repetitions per cycle:"), 5, 0)
+        from PySide6.QtWidgets import QSpinBox
+        self.repetitions_spinbox = QSpinBox()
+        self.repetitions_spinbox.setRange(1, 10)
+        self.repetitions_spinbox.setValue(1)
+        self.repetitions_spinbox.setToolTip(
+            "Number of repetitions per cycle.\n"
+            "With >1, final HOLD_OPEN becomes start of next repetition.\n"
+            "E.g., 2 reps: HOLD_OPEN→CLOSE→HOLD_CLOSED→OPEN→[CLOSE→HOLD_CLOSED→OPEN→HOLD_OPEN]"
+        )
+        timing_layout.addWidget(self.repetitions_spinbox, 5, 1)
+
         # Audio cues checkbox
         self.audio_checkbox = QCheckBox("Audio cues enabled (Close / Open)")
         self.audio_checkbox.setChecked(True)
         self.audio_checkbox.toggled.connect(self._on_audio_toggled)
-        timing_layout.addWidget(self.audio_checkbox, 5, 0, 1, 2)
+        timing_layout.addWidget(self.audio_checkbox, 6, 0, 1, 2)
 
         # Add timing group to recording layout
         recording_layout.addWidget(timing_group)
@@ -818,9 +861,22 @@ class GuidedRecordProtocol(QObject):
         self.status_label.setStyleSheet("font-weight: bold; padding: 5px;")
         control_layout.addWidget(self.status_label)
 
-        # Cycle counter
+        # Cycle counter with reject button
+        cycle_row_layout = QHBoxLayout()
         self.cycle_label = QLabel("Cycles completed: 0")
-        control_layout.addWidget(self.cycle_label)
+        cycle_row_layout.addWidget(self.cycle_label)
+
+        self.reject_last_cycle_btn = QPushButton("Reject Last Cycle")
+        self.reject_last_cycle_btn.setEnabled(False)
+        self.reject_last_cycle_btn.clicked.connect(self._on_reject_last_cycle)
+        self.reject_last_cycle_btn.setStyleSheet(
+            "QPushButton { background-color: #f44336; color: white; padding: 5px 10px; }"
+            "QPushButton:disabled { background-color: #cccccc; color: #666666; }"
+        )
+        self.reject_last_cycle_btn.setToolTip("Remove the last completed cycle's data")
+        cycle_row_layout.addWidget(self.reject_last_cycle_btn)
+        cycle_row_layout.addStretch()
+        control_layout.addLayout(cycle_row_layout)
 
         # Start Next Cycle button
         self.start_cycle_button = QPushButton("Start Next Cycle")
@@ -1004,7 +1060,8 @@ class GuidedRecordProtocol(QObject):
             hold_closed_s=self.hold_closed_spinbox.value(),
             opening_s=self.opening_transition_spinbox.value(),
             reaction_time_s=self._get_reaction_time_s(),
-            protocol_mode=protocol_mode
+            protocol_mode=protocol_mode,
+            repetitions=self.repetitions_spinbox.value()
         )
 
         # Reset state
@@ -1117,7 +1174,8 @@ class GuidedRecordProtocol(QObject):
             hold_closed_s=self.hold_closed_spinbox.value(),
             opening_s=self.opening_transition_spinbox.value(),
             reaction_time_s=self._get_reaction_time_s(),
-            protocol_mode=protocol_mode
+            protocol_mode=protocol_mode,
+            repetitions=self.repetitions_spinbox.value()
         )
 
         # Start new cycle
@@ -1218,6 +1276,7 @@ class GuidedRecordProtocol(QObject):
 
         # Update UI
         self.start_cycle_button.setEnabled(True)
+        self.reject_last_cycle_btn.setEnabled(True)  # Enable reject button
         self.cycle_label.setText(f"Cycles completed: {self.cycles_completed}")
         self.status_label.setText(f"Status: Cycle {self.cycles_completed} complete - Ready for next")
         self.phase_label.setText("Phase: Cycle complete - Position patient for next cycle")
@@ -1227,6 +1286,55 @@ class GuidedRecordProtocol(QObject):
         print("[GUIDED] Position patient and press 'Start Next Cycle'")
 
         self.cycle_completed.emit(self.cycles_completed)
+
+    def _on_reject_last_cycle(self):
+        """Reject (remove) the last completed cycle."""
+        if self.cycles_completed <= 0 or not self.cycle_boundaries:
+            return
+
+        # Get the last cycle's boundary info
+        last_cycle = self.cycle_boundaries[-1]
+        last_start_time = last_cycle.get("start_time", 0)
+
+        # Remove EMG data from this cycle
+        # Find the index where the last cycle started and truncate
+        if self.emg_buffer:
+            # Find first EMG timestamp >= last_start_time
+            truncate_idx = None
+            for i, (ts, _) in enumerate(self.emg_buffer):
+                if ts >= last_start_time:
+                    truncate_idx = i
+                    break
+            if truncate_idx is not None:
+                removed_count = len(self.emg_buffer) - truncate_idx
+                self.emg_buffer = self.emg_buffer[:truncate_idx]
+                print(f"[GUIDED] Removed {removed_count} EMG packets from rejected cycle")
+
+        # Remove GT data from this cycle
+        if self.gt_buffer:
+            truncate_idx = None
+            for i, (ts, _) in enumerate(self.gt_buffer):
+                if ts >= last_start_time:
+                    truncate_idx = i
+                    break
+            if truncate_idx is not None:
+                self.gt_buffer = self.gt_buffer[:truncate_idx]
+
+        # Remove the cycle boundary
+        self.cycle_boundaries.pop()
+
+        # Decrement counter
+        self.cycles_completed -= 1
+
+        # Update UI
+        self.cycle_label.setText(f"Cycles completed: {self.cycles_completed}")
+        self.status_label.setText(f"Status: Cycle {self.cycles_completed + 1} rejected - Ready for next")
+
+        # Disable reject button if no more cycles
+        if self.cycles_completed <= 0:
+            self.reject_last_cycle_btn.setEnabled(False)
+
+        print(f"[GUIDED] Rejected last cycle. Now have {self.cycles_completed} cycles.")
 
     def _update_phase_ui(self, phase_name: str, current_time: float):
         """Update UI to show current phase."""
@@ -1297,6 +1405,7 @@ class GuidedRecordProtocol(QObject):
         self.opening_transition_spinbox.setEnabled(enabled)
         self.reaction_time_combo.setEnabled(enabled)
         self.protocol_combo.setEnabled(enabled)
+        self.repetitions_spinbox.setEnabled(enabled)
 
     def _save_recording(self) -> Optional[str]:
         """Save the recording to file."""

@@ -1116,61 +1116,48 @@ class GuidedRecordingReviewDialog(QDialog):
         timestamp = now.strftime("%Y%m%d_%H%M%S")
         mode_suffix = "sd" if config.ENABLE_DIFFERENTIAL_MODE else "mp"
 
-        if label:
-            folder_name = f"templates_{mode_suffix}_{timestamp}_{label}"
-        else:
-            folder_name = f"templates_{mode_suffix}_{timestamp}"
-
+        # Save as combined file (both OPEN and CLOSED together)
         templates_base_dir = "data/templates"
-        folder_path = os.path.join(templates_base_dir, folder_name)
-        os.makedirs(folder_path, exist_ok=True)
+        os.makedirs(templates_base_dir, exist_ok=True)
 
-        saved_files = []
+        if label:
+            filename = f"templates_{mode_suffix}_{timestamp}_{label}.pkl"
+        else:
+            filename = f"templates_{mode_suffix}_{timestamp}.pkl"
 
-        # Save CLOSED templates
-        if closed_templates:
-            closed_data = {
-                "templates": closed_templates,
-                "metadata": {
-                    "class_label": "closed",
-                    "n_templates": len(closed_templates),
-                    "template_duration_s": self.template_manager.template_duration_s,
-                    "created_at": now.isoformat(),
-                    "label": label,
-                    "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
-                }
+        save_path = os.path.join(templates_base_dir, filename)
+
+        # Combined data structure
+        combined_data = {
+            "templates_open": open_templates,
+            "templates_closed": closed_templates,
+            "metadata": {
+                "n_open": len(open_templates),
+                "n_closed": len(closed_templates),
+                "template_duration_s": self.template_manager.template_duration_s,
+                "created_at": now.isoformat(),
+                "label": label,
+                "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
             }
-            closed_path = os.path.join(folder_path, "templates_closed.pkl")
-            with open(closed_path, "wb") as f:
-                pickle.dump(closed_data, f)
-            saved_files.append(closed_path)
-            print(f"[REVIEW] Saved {len(closed_templates)} CLOSED templates to {closed_path}")
+        }
 
-        # Save OPEN templates
-        if open_templates:
-            open_data = {
-                "templates": open_templates,
-                "metadata": {
-                    "class_label": "open",
-                    "n_templates": len(open_templates),
-                    "template_duration_s": self.template_manager.template_duration_s,
-                    "created_at": now.isoformat(),
-                    "label": label,
-                    "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
-                }
-            }
-            open_path = os.path.join(folder_path, "templates_open.pkl")
-            with open(open_path, "wb") as f:
-                pickle.dump(open_data, f)
-            saved_files.append(open_path)
-            print(f"[REVIEW] Saved {len(open_templates)} OPEN templates to {open_path}")
+        with open(save_path, "wb") as f:
+            pickle.dump(combined_data, f)
+
+        print(f"[REVIEW] Saved combined templates to {save_path}")
+        print(f"  OPEN: {len(open_templates)} templates")
+        print(f"  CLOSED: {len(closed_templates)} templates")
+
+        # Also update the template manager so templates are available for model creation
+        self.template_manager.templates["open"] = open_templates
+        self.template_manager.templates["closed"] = closed_templates
 
         self.saved = True
 
         msg = f"Templates saved successfully!\n\n"
         msg += f"CLOSED templates: {len(closed_templates)}\n"
         msg += f"OPEN templates: {len(open_templates)}\n\n"
-        msg += f"Saved to folder:\n{folder_path}"
+        msg += f"Saved to:\n{save_path}"
 
         QMessageBox.information(self, "Templates Saved", msg)
         self.accept()

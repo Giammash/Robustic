@@ -883,3 +883,121 @@ def find_plateau_thresholds(
         "open_distances_in_state": D_open_when_closed,
         "closed_distances_in_state": D_closed_when_open,
     }
+
+
+def find_transition_based_thresholds(
+    D_open: np.ndarray,
+    D_closed: np.ndarray,
+    gt: np.ndarray,
+    timestamps: np.ndarray,
+    window_s: float = 0.5,
+    confidence_k: float = 1.0,
+):
+    """
+    Find thresholds by focusing on GT transition neighborhoods.
+
+    The idea: During a real transition (e.g., OPEN->CLOSED), look at a small
+    window around the GT change and find the minimum distance to the target
+    class templates. This minimum is where the classifier should trigger.
+
+    Parameters
+    ----------
+    D_open : np.ndarray
+        Distance to OPEN templates over time.
+    D_closed : np.ndarray
+        Distance to CLOSED templates over time.
+    gt : np.ndarray
+        Ground truth at each DTW timestamp (0=OPEN, 1=CLOSED).
+    timestamps : np.ndarray
+        Timestamps corresponding to each distance measurement.
+    window_s : float
+        Half-window size in seconds to search around each transition (default 0.5s).
+    confidence_k : float
+        Multiplier for standard deviation: threshold = min + k * std.
+
+    Returns
+    -------
+    dict with threshold values and transition info.
+    """
+    # Ensure gt is 1D
+    if gt.ndim > 1:
+        gt = gt.flatten()
+
+    # Find GT transitions
+    gt_diff = np.diff(gt)
+    closing_transitions = np.where(gt_diff > 0.5)[0]  # GT goes 0->1 (OPEN to CLOSED)
+    opening_transitions = np.where(gt_diff < -0.5)[0]  # GT goes 1->0 (CLOSED to OPEN)
+
+    print(f"\n[THRESHOLD] Found {len(closing_transitions)} closing and {len(opening_transitions)} opening transitions")
+
+    # Collect minimum D_closed values around closing transitions (OPEN->CLOSED)
+    # During closing, D_closed should drop - we want the minimum
+    min_d_closed_at_closing = []
+    for idx in closing_transitions:
+        trans_time = timestamps[idx] if idx < len(timestamps) else timestamps[-1]
+        # Find samples within window_s of this transition
+        mask = np.abs(timestamps - trans_time) <= window_s
+        if np.any(mask):
+            d_closed_in_window = D_closed[mask]
+            # Filter out None values
+            d_closed_valid = [d for d in d_closed_in_window if d is not None]
+            if d_closed_valid:
+                min_d = np.min(d_closed_valid)
+                min_d_closed_at_closing.append(min_d)
+                print(f"  Closing transition at {trans_time:.2f}s: min D_closed = {min_d:.4f}")
+
+    # Collect minimum D_open values around opening transitions (CLOSED->OPEN)
+    # During opening, D_open should drop - we want the minimum
+    min_d_open_at_opening = []
+    for idx in opening_transitions:
+        trans_time = timestamps[idx] if idx < len(timestamps) else timestamps[-1]
+        # Find samples within window_s of this transition
+        mask = np.abs(timestamps - trans_time) <= window_s
+        if np.any(mask):
+            d_open_in_window = D_open[mask]
+            # Filter out None values
+            d_open_valid = [d for d in d_open_in_window if d is not None]
+            if d_open_valid:
+                min_d = np.min(d_open_valid)
+                min_d_open_at_opening.append(min_d)
+                print(f"  Opening transition at {trans_time:.2f}s: min D_open = {min_d:.4f}")
+
+    # Compute thresholds from transition minimums
+    if min_d_closed_at_closing:
+        closed_mins = np.array(min_d_closed_at_closing)
+        closed_mean = np.mean(closed_mins)
+        closed_std = np.std(closed_mins) if len(closed_mins) > 1 else closed_mean * 0.1
+        threshold_closed = closed_mean + confidence_k * closed_std
+        print(f"\n[THRESHOLD] D_closed at transitions: mean={closed_mean:.4f}, std={closed_std:.4f}")
+    else:
+        threshold_closed = 0.15
+        closed_mean = 0.1
+        closed_std = 0.02
+        print("[THRESHOLD] No closing transitions found, using default")
+
+    if min_d_open_at_opening:
+        open_mins = np.array(min_d_open_at_opening)
+        open_mean = np.mean(open_mins)
+        open_std = np.std(open_mins) if len(open_mins) > 1 else open_mean * 0.1
+        threshold_open = open_mean + confidence_k * open_std
+        print(f"[THRESHOLD] D_open at transitions: mean={open_mean:.4f}, std={open_std:.4f}")
+    else:
+        threshold_open = 0.15
+        open_mean = 0.1
+        open_std = 0.02
+        print("[THRESHOLD] No opening transitions found, using default")
+
+    print(f"\n[THRESHOLD] Computed thresholds: OPEN={threshold_open:.4f}, CLOSED={threshold_closed:.4f}")
+
+    return {
+        "threshold_open": threshold_open,
+        "threshold_closed": threshold_closed,
+        "open_transition_mins": min_d_open_at_opening,
+        "closed_transition_mins": min_d_closed_at_closing,
+        "open_mean": open_mean,
+        "open_std": open_std,
+        "closed_mean": closed_mean,
+        "closed_std": closed_std,
+        "n_opening_transitions": len(opening_transitions),
+        "n_closing_transitions": len(closing_transitions),
+    }

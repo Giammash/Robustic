@@ -810,6 +810,15 @@ class TemplateManager:
         timings_emg = recording.get('timings_emg')
         recording_start_time = timings_emg[0] if timings_emg is not None and len(timings_emg) > 0 else None
 
+        # Debug: print audio cue info
+        print(f"[DEBUG] cycle_boundaries count: {len(cycle_boundaries)}")
+        print(f"[DEBUG] recording_start_time: {recording_start_time}")
+        if cycle_boundaries:
+            for i, cb in enumerate(cycle_boundaries):
+                cct = cb.get('close_cue_time')
+                oct = cb.get('open_cue_time')
+                print(f"[DEBUG] Cycle {i+1}: close_cue_time={cct}, open_cue_time={oct}")
+
         # Find all transitions from the binarized GT
         gt_diff = np.diff(gt_binary, prepend=gt_binary[0])
         rising_edges = np.where(gt_diff == 1)[0]   # 0→1 = CLOSING starts
