@@ -7,7 +7,8 @@ from PySide6.QtCore import QObject, Signal, QThread, Qt
 from PySide6.QtWidgets import (
     QFileDialog, QMessageBox, QListWidgetItem, QLabel, QLineEdit,
     QComboBox, QPushButton, QSpinBox, QDoubleSpinBox, QGroupBox,
-    QDialog, QVBoxLayout, QHBoxLayout, QSplitter, QWidget, QListWidget
+    QDialog, QVBoxLayout, QHBoxLayout, QSplitter, QWidget, QListWidget,
+    QScrollArea,
 )
 import pickle
 from datetime import datetime
@@ -25,6 +26,43 @@ from matplotlib.patches import Rectangle
 from mindmove.model.interface import MindMoveInterface
 from mindmove.model.templates.template_manager import TemplateManager
 from mindmove.config import config
+
+def _detect_mode_from_data(data: dict) -> bool | None:
+    """
+    Detect differential mode from loaded data dict.
+
+    Returns:
+        True if SD (differential), False if MP (monopolar), None if unknown.
+    """
+    # Check direct field
+    mode = data.get('differential_mode')
+    if mode is not None:
+        return bool(mode)
+
+    # Check metadata
+    metadata = data.get('metadata', {})
+    if isinstance(metadata, dict):
+        mode = metadata.get('differential_mode')
+        if mode is not None:
+            return bool(mode)
+
+    # Infer from EMG shape
+    emg = data.get('emg')
+    if emg is not None and hasattr(emg, 'shape') and len(emg.shape) >= 1:
+        return emg.shape[0] <= 16
+
+    return None
+
+
+def _infer_mode_from_templates(templates: list) -> bool:
+    """
+    Infer differential mode from template arrays.
+    Templates are (n_channels, n_samples) — if n_channels <= 16 it's SD.
+    """
+    if templates and hasattr(templates[0], 'shape'):
+        return templates[0].shape[0] <= 16
+    return config.ENABLE_DIFFERENTIAL_MODE  # fallback
+
 
 if TYPE_CHECKING:
     from mindmove.gui.mindmove import MindMove
@@ -405,7 +443,6 @@ class CycleReviewWidget(QWidget):
         super().__init__(parent)
         self.cycles: List[Dict] = []
         self.current_cycle_idx: int = 0
-        self.current_channel: int = 0  # 0-indexed
 
         # Template duration
         self.template_duration_samples: int = int(1.0 * config.FSAMP)
@@ -425,6 +462,9 @@ class CycleReviewWidget(QWidget):
         # Saved window positions per cycle - preserves positions when changing channels
         self._saved_closed_positions: Dict[int, int] = {}  # cycle_idx -> start_sample
         self._saved_open_positions: Dict[int, int] = {}    # cycle_idx -> start_sample
+
+        # Onset detection info - per-cycle channel activation data
+        self._onset_info: list = []  # list of dicts with channels_fired per cycle
 
         self._setup_ui()
 
@@ -451,18 +491,8 @@ class CycleReviewWidget(QWidget):
 
         header_layout.addSpacing(20)
 
-        # Channel selector
-        header_layout.addWidget(QLabel("Channel:"))
-        self.channel_combo = QComboBox()
-        self.channel_combo.setFixedWidth(60)
-        for i in range(1, 33):
-            self.channel_combo.addItem(str(i))
-        self.channel_combo.currentIndexChanged.connect(self._on_channel_changed)
-        self.channel_combo.setToolTip("Use Up/Down arrows to switch channels, Left/Right for cycle navigation")
-        header_layout.addWidget(self.channel_combo)
-
         # Keyboard hint
-        hint = QLabel("(↑↓ ch, ←→ nav)")
+        hint = QLabel("(←→ nav)")
         hint.setStyleSheet("color: #666; font-style: italic; font-size: 10px;")
         header_layout.addWidget(hint)
 
@@ -479,10 +509,10 @@ class CycleReviewWidget(QWidget):
         self.instruction_label.setWordWrap(True)
         layout.addWidget(self.instruction_label)
 
-        # Matplotlib figure - wider for better signal visibility
-        self.figure = Figure(figsize=(14, 5), dpi=100)
+        # Matplotlib figure - wider and taller for stacked all-channels view
+        self.figure = Figure(figsize=(14, 8), dpi=100)
         self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumHeight(400)
+        self.canvas.setMinimumHeight(500)
         self.ax = self.figure.add_subplot(111)
         self.figure.tight_layout()
 
@@ -567,34 +597,11 @@ class CycleReviewWidget(QWidget):
         self._saved_open_positions = {}      # Clear saved positions for new data
         self.recording_name = recording_name  # Store for display in title
 
-        # Update channel combo for actual channel count
-        n_channels = cycles[0]['emg'].shape[0] if cycles else 32
-        self.channel_combo.clear()
-        for i in range(1, n_channels + 1):
-            self.channel_combo.addItem(str(i))
-
-        self._update_display()
-
-    def _on_channel_changed(self, index: int):
-        if index < 0:
-            return  # Ignore invalid index (happens when combo is cleared)
-        # Save current window positions before changing channel
-        self._save_window_positions()
-        self.current_channel = index
         self._update_display()
 
     def keyPressEvent(self, event):
-        """Handle arrow key presses for fast channel switching."""
-        n_channels = self.channel_combo.count()
-        if event.key() == Qt.Key_Up:
-            new_idx = max(0, self.channel_combo.currentIndex() - 1)
-            self.channel_combo.setCurrentIndex(new_idx)
-            event.accept()
-        elif event.key() == Qt.Key_Down:
-            new_idx = min(n_channels - 1, self.channel_combo.currentIndex() + 1)
-            self.channel_combo.setCurrentIndex(new_idx)
-            event.accept()
-        elif event.key() == Qt.Key_Left:
+        """Handle arrow key presses for cycle navigation."""
+        if event.key() == Qt.Key_Left:
             self._go_prev()
             event.accept()
         elif event.key() == Qt.Key_Right:
@@ -696,31 +703,115 @@ class CycleReviewWidget(QWidget):
         close_cue_idx = cycle.get('close_cue_idx')
         open_cue_idx = cycle.get('open_cue_idx')
 
+        n_channels = emg.shape[0]
         n_samples = emg.shape[1]
         time_axis = np.arange(n_samples) / config.FSAMP
 
-        # Get selected channel's EMG
-        channel = max(0, min(self.current_channel, emg.shape[0] - 1))
-        emg_signal = emg[channel, :]
-        max_val = np.max(np.abs(emg_signal)) if np.max(np.abs(emg_signal)) > 0 else 1
+        # Compute vertical offset for stacked channels from median peak-to-peak
+        all_ranges = [np.ptp(emg[ch, :]) for ch in range(n_channels)]
+        offset_step = np.median(all_ranges) * 1.5 if np.median(all_ranges) > 0 else 1.0
 
-        # Plot GT as overlapping line scaled to EMG amplitude
-        gt_scaled = gt * max_val * 0.95
+        # Get onset channel info for this cycle (if available)
+        closed_channels_fired = set()
+        open_channels_fired = set()
+        dead_channels = set()
+        artifact_channels_closed = set()
+        artifact_channels_open = set()
+        if self._onset_info and self.current_cycle_idx < len(self._onset_info):
+            info = self._onset_info[self.current_cycle_idx]
+            closed_channels_fired = set(info.get("closed_channels_fired", []))
+            open_channels_fired = set(info.get("open_channels_fired", []))
+            dead_channels = set(info.get("dead_channels", []))
+            artifact_channels_closed = set(info.get("artifact_channels_closed", []))
+            artifact_channels_open = set(info.get("artifact_channels_open", []))
+        artifact_channels = artifact_channels_closed | artifact_channels_open
+
+        # Plot all EMG channels stacked with vertical offset
+        yticks = []
+        ytick_labels = []
+        for ch in range(n_channels):
+            offset = (n_channels - ch) * offset_step  # CH1 at top, leave slot 0 for GT
+
+            # Dead channels: gray dashed
+            if ch in dead_channels:
+                color, lw, alpha = '#999999', 0.6, 0.5
+                linestyle = '--'
+                suffix = " [DEAD]"
+            # Artifact channels: red dashed (overrides onset coloring)
+            elif ch in artifact_channels:
+                color, lw, alpha = '#D32F2F', 0.8, 0.9
+                linestyle = '--'
+                # Build suffix combining onset + artifact info
+                onset_suffix = ""
+                if ch in closed_channels_fired and ch in open_channels_fired:
+                    onset_suffix = " [C+O]"
+                elif ch in closed_channels_fired:
+                    onset_suffix = " [C]"
+                elif ch in open_channels_fired:
+                    onset_suffix = " [O]"
+                suffix = f"{onset_suffix} [ART]"
+            # Highlight channels detected by onset detection
+            elif ch in closed_channels_fired and ch in open_channels_fired:
+                color, lw, alpha = '#9C27B0', 0.8, 0.95  # Purple = both
+                linestyle = '-'
+                suffix = " [C+O]"
+            elif ch in closed_channels_fired:
+                color, lw, alpha = '#FF5722', 0.8, 0.95  # Orange = CLOSED flexor
+                linestyle = '-'
+                suffix = " [C]"
+            elif ch in open_channels_fired:
+                color, lw, alpha = '#2196F3', 0.8, 0.95  # Blue = OPEN extensor
+                linestyle = '-'
+                suffix = " [O]"
+            else:
+                color, lw, alpha = 'k', 0.5, 0.9
+                linestyle = '-'
+                suffix = ""
+
+            self.ax.plot(time_axis, emg[ch, :] + offset, color=color, linewidth=lw,
+                         alpha=alpha, linestyle=linestyle)
+            yticks.append(offset)
+            ytick_labels.append(f"CH{ch + 1}{suffix}")
+
+        # Plot GT as bottom trace (slot below all channels)
+        gt_scaled = gt * offset_step * 0.8
         self.ax.plot(time_axis, gt_scaled, 'r-', linewidth=1.5, alpha=0.7, label='GT')
+        yticks.append(0)
+        ytick_labels.append("GT")
 
-        # Mark audio cue times with blue dashed lines (if available)
+        # Add OPEN/CLOSED text labels on constant GT regions
+        # GT=0 → OPEN, GT=1 → CLOSED (regardless of protocol mode)
+        gt_binary = (gt > 0.5).astype(int)
+        gt_diff = np.diff(gt_binary, prepend=gt_binary[0])
+        # Find constant regions by detecting transitions
+        transitions = np.where(gt_diff != 0)[0]
+        region_starts = np.concatenate([[0], transitions])
+        region_ends = np.concatenate([transitions, [n_samples]])
+        gt_label_y = offset_step * 0.9  # Just above GT trace max
+        for rs, re in zip(region_starts, region_ends):
+            if re - rs < config.FSAMP * 0.3:
+                continue  # Skip very short regions (transitions)
+            mid_time = (rs + re) / 2 / config.FSAMP
+            region_val = gt_binary[min(rs + (re - rs) // 2, n_samples - 1)]
+            state_label = "CLOSED" if region_val == 1 else "OPEN"
+            state_color = '#FF5722' if region_val == 1 else '#2196F3'
+            self.ax.text(mid_time, gt_label_y, state_label,
+                        ha='center', va='bottom', fontsize=8, fontweight='bold',
+                        color=state_color, alpha=0.8)
+
+        self.ax.set_yticks(yticks)
+        self.ax.set_yticklabels(ytick_labels, fontsize=7)
+
+        # Mark audio cue times with distinct colors
         if close_cue_idx is not None:
             close_cue_time = close_cue_idx / config.FSAMP
-            self.ax.axvline(close_cue_time, color='blue', linestyle='--', linewidth=1.5,
+            self.ax.axvline(close_cue_time, color='#FF5722', linestyle='--', linewidth=1.5,
                            alpha=0.7, label='Close cue')
 
         if open_cue_idx is not None:
             open_cue_time = open_cue_idx / config.FSAMP
-            self.ax.axvline(open_cue_time, color='blue', linestyle='--', linewidth=1.5,
+            self.ax.axvline(open_cue_time, color='#2196F3', linestyle='--', linewidth=1.5,
                            alpha=0.7, label='Open cue')
-
-        # Plot EMG signal
-        self.ax.plot(time_axis, emg_signal, 'k-', linewidth=0.5, alpha=0.9, label=f'EMG Ch{channel + 1}')
 
         # Calculate window positions (use saved positions if available, otherwise defaults)
         max_start = n_samples - self.template_duration_samples
@@ -735,9 +826,6 @@ class CycleReviewWidget(QWidget):
             # Default: use close_cue_idx or close_start_idx if available
             closed_idx = close_cue_idx if close_cue_idx is not None else close_start_idx
             if closed_idx is None or closed_idx == 0:
-                # Fallback based on protocol mode:
-                # Standard: CLOSED is first transition (first quarter)
-                # Inverted: CLOSED is second transition (third quarter)
                 if protocol_mode == "inverted":
                     closed_idx = 3 * n_samples // 4
                 else:
@@ -751,9 +839,6 @@ class CycleReviewWidget(QWidget):
             # Default: use open_cue_idx or open_start_idx if available
             open_idx = open_cue_idx if open_cue_idx is not None else open_start_idx
             if open_idx is None or open_idx == 0:
-                # Fallback based on protocol mode:
-                # Standard: OPEN is second transition (third quarter)
-                # Inverted: OPEN is first transition (first quarter)
                 if protocol_mode == "inverted":
                     open_idx = n_samples // 4
                 else:
@@ -772,21 +857,45 @@ class CycleReviewWidget(QWidget):
 
         # Labels and formatting
         self.ax.set_xlabel('Time (s)')
-        self.ax.set_ylabel(f'Channel {channel + 1} (µV)')
         status = " [ACCEPTED]" if (has_closed and has_open) else (" [CLOSED]" if has_closed else (" [OPEN]" if has_open else ""))
         mode_indicator = " [INV]" if protocol_mode == "inverted" else ""
-        # Include recording name in title if available
         rec_name = f'{self.recording_name} - ' if hasattr(self, 'recording_name') and self.recording_name else ''
-        self.ax.set_title(f'{rec_name}Cycle {self.current_cycle_idx + 1}{mode_indicator}{status}: Drag windows to select templates')
+
+        # Onset detection status indicator
+        onset_status = ""
+        if self._onset_info and self.current_cycle_idx < len(self._onset_info):
+            info = self._onset_info[self.current_cycle_idx]
+            has_closed_onset = "closed_channels_fired" in info and info["closed_channels_fired"]
+            has_open_onset = "open_channels_fired" in info and info["open_channels_fired"]
+            if has_closed_onset and has_open_onset:
+                onset_status = " [ONSET: C+O]"
+            elif has_closed_onset:
+                onset_status = " [ONSET: C only]"
+            elif has_open_onset:
+                onset_status = " [ONSET: O only]"
+            else:
+                onset_status = " [NO ONSET]"
+
+        # Signal quality indicator (dead + artifact channels)
+        quality_status = ""
+        if dead_channels or artifact_channels:
+            parts = []
+            if dead_channels:
+                parts.append("DEAD:" + ",".join(f"CH{ch+1}" for ch in sorted(dead_channels)))
+            if artifact_channels:
+                parts.append("ART:" + ",".join(f"CH{ch+1}" for ch in sorted(artifact_channels)))
+            quality_status = " [" + " ".join(parts) + "]"
+
+        self.ax.set_title(f'{rec_name}Cycle {self.current_cycle_idx + 1}{mode_indicator}{onset_status}{quality_status}{status}: Drag windows to select templates')
         self.ax.set_xlim(0, n_samples / config.FSAMP)
 
-        # Set explicit y-axis limits based on EMG amplitude
-        y_margin = max_val * 1.3
-        self.ax.set_ylim(-y_margin, y_margin)
+        # Set y-axis limits to encompass all stacked channels + GT
+        y_min = -offset_step * 0.5
+        y_max = (n_channels + 1) * offset_step
+        self.ax.set_ylim(y_min, y_max)
 
-        # Legend outside the plot area to avoid overlap
         self.ax.legend(loc='upper left', fontsize=7, framealpha=0.8)
-        self.ax.grid(True, alpha=0.3)
+        self.ax.grid(True, alpha=0.3, axis='x')
 
         self.figure.tight_layout()
         self.canvas.draw_idle()
@@ -1006,7 +1115,8 @@ class GuidedRecordingReviewDialog(QDialog):
     Shows complete cycles one at a time for unified template selection.
     """
 
-    def __init__(self, recordings: List[dict], template_manager: TemplateManager, parent=None):
+    def __init__(self, recordings: List[dict], template_manager: TemplateManager,
+                 parent=None, onset_detection: bool = False, onset_info: list = None):
         super().__init__(parent)
         if isinstance(recordings, dict):
             self.recordings = [recordings]
@@ -1014,9 +1124,12 @@ class GuidedRecordingReviewDialog(QDialog):
             self.recordings = recordings
         self.template_manager = template_manager
         self.saved = False
+        self._onset_detection = onset_detection
+        self._onset_info = onset_info  # list of dicts with channels_fired and positions per cycle
 
         n_recordings = len(self.recordings)
-        self.setWindowTitle(f"Review & Extract Templates ({n_recordings} recording{'s' if n_recordings > 1 else ''})")
+        title_suffix = " (Onset Detection)" if onset_detection else ""
+        self.setWindowTitle(f"Review & Extract Templates ({n_recordings} recording{'s' if n_recordings > 1 else ''}){title_suffix}")
         self.setMinimumSize(1400, 800)
         self.resize(1500, 850)  # Start with a larger size
         self.setModal(True)
@@ -1089,7 +1202,114 @@ class GuidedRecordingReviewDialog(QDialog):
 
         self.cycle_viewer.set_cycles(all_cycles, recording_name=recording_name)
         print(f"[REVIEW] Total: {len(all_cycles)} complete cycles")
+
+        # Pre-set window positions and channel info from onset detection
+        if self._onset_detection and all_cycles:
+            if self._onset_info:
+                # Use pre-computed onset info from automatic extraction
+                self._apply_onset_info(all_cycles)
+            else:
+                # Run onset detection now (for manual mode with onset)
+                self._run_onset_detection(all_cycles)
+
         self._update_status()
+
+    def _apply_onset_info(self, cycles: list):
+        """Apply pre-computed onset detection results to cycle viewer."""
+        for idx in range(min(len(cycles), len(self._onset_info))):
+            info = self._onset_info[idx]
+            if info["closed_pos"] is not None:
+                self.cycle_viewer._saved_closed_positions[idx] = info["closed_pos"]
+            if info["open_pos"] is not None:
+                self.cycle_viewer._saved_open_positions[idx] = info["open_pos"]
+
+        # Store channel info for highlighting
+        self.cycle_viewer._onset_info = self._onset_info
+        self.cycle_viewer._update_display()
+
+    def _run_onset_detection(self, cycles: list):
+        """Run per-channel onset detection and pre-set window positions."""
+        from mindmove.model.template_study import (
+            detect_onset_per_channel,
+            place_template_at_onset,
+            ONSET_BASELINE_DURATION_S,
+        )
+
+        template_samples = int(self.template_manager.template_duration_s * config.FSAMP)
+        baseline_samples = int(ONSET_BASELINE_DURATION_S * config.FSAMP)
+
+        n_closed_detected = 0
+        n_open_detected = 0
+        n_total = len(cycles)
+        onset_info = []
+
+        for idx, cycle in enumerate(cycles):
+            emg = cycle["emg"]
+            n_samples = emg.shape[1]
+
+            closed_search_start = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
+            closed_search_end = (cycle.get("open_cue_idx") or cycle.get("open_start_idx", n_samples)) - template_samples
+            open_search_start = cycle.get("open_cue_idx") or cycle.get("open_start_idx", 0)
+            open_search_end = n_samples - template_samples
+
+            closed_baseline_start = max(0, closed_search_start - baseline_samples)
+            open_baseline_start = max(0, open_search_start - baseline_samples)
+
+            cycle_info = {
+                "closed_channels_fired": [],
+                "open_channels_fired": [],
+                "closed_pos": None,
+                "open_pos": None,
+            }
+
+            # CLOSED onset
+            result = detect_onset_per_channel(
+                emg, closed_search_start, closed_search_end,
+                baseline_start=closed_baseline_start,
+            )
+            if result["earliest_onset"] is not None:
+                pos = place_template_at_onset(result["earliest_onset"], n_samples)
+                pos = max(pos, closed_search_start)
+                pos = min(pos, n_samples - template_samples)
+                self.cycle_viewer._saved_closed_positions[idx] = pos
+                cycle_info["closed_channels_fired"] = result["channels_fired"]
+                cycle_info["closed_pos"] = pos
+                n_closed_detected += 1
+                fired = ",".join(str(ch+1) for ch in result["channels_fired"])
+                print(f"  Cycle {idx+1} CLOSED: onset={result['earliest_onset']/config.FSAMP:.2f}s, "
+                      f"channels=[{fired}]")
+            else:
+                print(f"  Cycle {idx+1} CLOSED: no onset detected (manual placement needed)")
+
+            # OPEN onset
+            result = detect_onset_per_channel(
+                emg, open_search_start, open_search_end,
+                baseline_start=open_baseline_start,
+            )
+            if result["earliest_onset"] is not None:
+                pos = place_template_at_onset(result["earliest_onset"], n_samples)
+                pos = max(pos, open_search_start)
+                pos = min(pos, n_samples - template_samples)
+                self.cycle_viewer._saved_open_positions[idx] = pos
+                cycle_info["open_channels_fired"] = result["channels_fired"]
+                cycle_info["open_pos"] = pos
+                n_open_detected += 1
+                fired = ",".join(str(ch+1) for ch in result["channels_fired"])
+                print(f"  Cycle {idx+1} OPEN:   onset={result['earliest_onset']/config.FSAMP:.2f}s, "
+                      f"channels=[{fired}]")
+            else:
+                print(f"  Cycle {idx+1} OPEN:   no onset detected (manual placement needed)")
+
+            onset_info.append(cycle_info)
+
+        print(f"\n[ONSET] Detected: {n_closed_detected}/{n_total} CLOSED, "
+              f"{n_open_detected}/{n_total} OPEN onsets")
+        if n_closed_detected < n_total or n_open_detected < n_total:
+            print(f"[ONSET] Cycles without detection will use default positions — adjust manually")
+
+        # Store channel info for highlighting in review
+        self.cycle_viewer._onset_info = onset_info
+        self.cycle_viewer._update_display()
 
     def _on_templates_accepted(self, closed_template, open_template):
         """Called when templates are accepted from a cycle."""
@@ -1114,7 +1334,11 @@ class GuidedRecordingReviewDialog(QDialog):
 
         now = datetime.now()
         timestamp = now.strftime("%Y%m%d_%H%M%S")
-        mode_suffix = "sd" if config.ENABLE_DIFFERENTIAL_MODE else "mp"
+
+        # Infer mode from actual template data, not current config
+        all_templates = closed_templates + open_templates
+        is_differential = _infer_mode_from_templates(all_templates)
+        mode_suffix = "sd" if is_differential else "mp"
 
         # Save as combined file (both OPEN and CLOSED together)
         templates_base_dir = "data/templates"
@@ -1137,7 +1361,7 @@ class GuidedRecordingReviewDialog(QDialog):
                 "template_duration_s": self.template_manager.template_duration_s,
                 "created_at": now.isoformat(),
                 "label": label,
-                "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
+                "differential_mode": is_differential,
             }
         }
 
@@ -1179,8 +1403,8 @@ class TemplateReviewDialog(QDialog):
         self.templates_open = templates_open
 
         self.setWindowTitle("Template Review")
-        self.setMinimumSize(1000, 600)
-        self.resize(1200, 700)
+        self.setMinimumSize(1000, 700)
+        self.resize(1200, 850)
         self.setModal(False)  # Non-modal so user can continue working
 
         self._setup_ui()
@@ -1197,6 +1421,17 @@ class TemplateReviewDialog(QDialog):
 
         # Main splitter for CLOSED (left) and OPEN (right)
         splitter = QSplitter(Qt.Horizontal)
+
+        # Compute global offset for stacked view from all templates
+        all_templates = self.templates_closed + self.templates_open
+        if all_templates:
+            all_ranges = []
+            for t in all_templates:
+                for ch in range(t.shape[0]):
+                    all_ranges.append(np.ptp(t[ch, :]))
+            self._offset_step = np.median(all_ranges) * 1.5 if np.median(all_ranges) > 0 else 1.0
+        else:
+            self._offset_step = 1.0
 
         # CLOSED panel
         closed_panel = QWidget()
@@ -1216,20 +1451,8 @@ class TemplateReviewDialog(QDialog):
         self.closed_list.currentRowChanged.connect(self._on_closed_selection_changed)
         closed_layout.addWidget(self.closed_list)
 
-        # Channel selector
-        ch_layout = QHBoxLayout()
-        ch_layout.addWidget(QLabel("Channel:"))
-        self.closed_channel_combo = QComboBox()
-        n_ch = self.templates_closed[0].shape[0] if self.templates_closed else 32
-        for i in range(1, n_ch + 1):
-            self.closed_channel_combo.addItem(str(i))
-        self.closed_channel_combo.currentIndexChanged.connect(self._update_closed_plot)
-        ch_layout.addWidget(self.closed_channel_combo)
-        ch_layout.addStretch()
-        closed_layout.addLayout(ch_layout)
-
         # Plot canvas
-        self.closed_figure = Figure(figsize=(5, 4), dpi=100)
+        self.closed_figure = Figure(figsize=(5, 6), dpi=100)
         self.closed_canvas = FigureCanvas(self.closed_figure)
         self.closed_ax = self.closed_figure.add_subplot(111)
         closed_layout.addWidget(self.closed_canvas)
@@ -1254,20 +1477,8 @@ class TemplateReviewDialog(QDialog):
         self.open_list.currentRowChanged.connect(self._on_open_selection_changed)
         open_layout.addWidget(self.open_list)
 
-        # Channel selector
-        ch_layout2 = QHBoxLayout()
-        ch_layout2.addWidget(QLabel("Channel:"))
-        self.open_channel_combo = QComboBox()
-        n_ch_open = self.templates_open[0].shape[0] if self.templates_open else 32
-        for i in range(1, n_ch_open + 1):
-            self.open_channel_combo.addItem(str(i))
-        self.open_channel_combo.currentIndexChanged.connect(self._update_open_plot)
-        ch_layout2.addWidget(self.open_channel_combo)
-        ch_layout2.addStretch()
-        open_layout.addLayout(ch_layout2)
-
         # Plot canvas
-        self.open_figure = Figure(figsize=(5, 4), dpi=100)
+        self.open_figure = Figure(figsize=(5, 6), dpi=100)
         self.open_canvas = FigureCanvas(self.open_figure)
         self.open_ax = self.open_figure.add_subplot(111)
         open_layout.addWidget(self.open_canvas)
@@ -1294,6 +1505,29 @@ class TemplateReviewDialog(QDialog):
         self._update_closed_plot()
         self._update_open_plot()
 
+    def _plot_stacked_template(self, ax, figure, canvas, template, title, color):
+        """Plot a template with all channels stacked vertically."""
+        ax.clear()
+        n_channels = template.shape[0]
+        n_samples = template.shape[1]
+        time_axis = np.arange(n_samples) / config.FSAMP
+
+        yticks = []
+        ytick_labels = []
+        for ch in range(n_channels):
+            offset = (n_channels - 1 - ch) * self._offset_step
+            ax.plot(time_axis, template[ch, :] + offset, color=color, linewidth=0.8)
+            yticks.append(offset)
+            ytick_labels.append(f"CH{ch + 1}")
+
+        ax.set_yticks(yticks)
+        ax.set_yticklabels(ytick_labels, fontsize=7)
+        ax.set_xlabel('Time (s)')
+        ax.set_title(title)
+        ax.grid(True, alpha=0.3, axis='x')
+        figure.tight_layout()
+        canvas.draw()
+
     def _update_closed_plot(self):
         self.closed_ax.clear()
         idx = self.closed_list.currentRow()
@@ -1304,20 +1538,10 @@ class TemplateReviewDialog(QDialog):
             return
 
         template = self.templates_closed[idx]
-        channel = self.closed_channel_combo.currentIndex()
-        if channel >= template.shape[0]:
-            channel = 0
-
-        signal = template[channel, :]
-        time_axis = np.arange(len(signal)) / config.FSAMP
-
-        self.closed_ax.plot(time_axis, signal, 'r-', linewidth=0.8)
-        self.closed_ax.set_xlabel('Time (s)')
-        self.closed_ax.set_ylabel('Amplitude (µV)')
-        self.closed_ax.set_title(f'CLOSED Template {idx+1}, Channel {channel+1}')
-        self.closed_ax.grid(True, alpha=0.3)
-        self.closed_figure.tight_layout()
-        self.closed_canvas.draw()
+        self._plot_stacked_template(
+            self.closed_ax, self.closed_figure, self.closed_canvas,
+            template, f'CLOSED Template {idx+1}', '#FF5722'
+        )
 
     def _update_open_plot(self):
         self.open_ax.clear()
@@ -1329,20 +1553,562 @@ class TemplateReviewDialog(QDialog):
             return
 
         template = self.templates_open[idx]
-        channel = self.open_channel_combo.currentIndex()
-        if channel >= template.shape[0]:
-            channel = 0
+        self._plot_stacked_template(
+            self.open_ax, self.open_figure, self.open_canvas,
+            template, f'OPEN Template {idx+1}', '#2196F3'
+        )
 
-        signal = template[channel, :]
-        time_axis = np.arange(len(signal)) / config.FSAMP
 
-        self.open_ax.plot(time_axis, signal, 'b-', linewidth=0.8)
-        self.open_ax.set_xlabel('Time (s)')
-        self.open_ax.set_ylabel('Amplitude (µV)')
-        self.open_ax.set_title(f'OPEN Template {idx+1}, Channel {channel+1}')
-        self.open_ax.grid(True, alpha=0.3)
-        self.open_figure.tight_layout()
-        self.open_canvas.draw()
+class TemplateStudyDialog(QDialog):
+    """Dialog for analyzing template quality via DTW distance matrix and statistics."""
+
+    def __init__(
+        self,
+        templates_closed: list,
+        templates_open: list,
+        default_feature: str = "rms",
+        default_window_samples: int = 192,
+        default_overlap_samples: int = 64,
+        default_aggregation_idx: int = 0,
+        default_dead_channels_text: str = "",
+        parent=None,
+    ):
+        super().__init__(parent)
+        self.templates_closed = list(templates_closed)  # work on a copy
+        self.templates_open = list(templates_open)
+        self.templates_modified = False
+        self.setWindowTitle("Template Study")
+        self.resize(900, 700)
+
+        layout = QVBoxLayout(self)
+
+        # ── Parameter section ──
+        from mindmove.model.core.features.features_registry import FEATURES
+        param_layout = QHBoxLayout()
+
+        param_layout.addWidget(QLabel("Feature:"))
+        self.feature_combo = QComboBox()
+        self.feature_combo.addItems(list(FEATURES.keys()))
+        self.feature_combo.setCurrentText(default_feature)
+        param_layout.addWidget(self.feature_combo)
+
+        param_layout.addWidget(QLabel("Window (samp):"))
+        self.window_spinbox = QSpinBox()
+        self.window_spinbox.setRange(1, 2000)
+        self.window_spinbox.setValue(default_window_samples)
+        param_layout.addWidget(self.window_spinbox)
+
+        param_layout.addWidget(QLabel("Overlap (samp):"))
+        self.overlap_spinbox = QSpinBox()
+        self.overlap_spinbox.setRange(0, 1999)
+        self.overlap_spinbox.setValue(default_overlap_samples)
+        param_layout.addWidget(self.overlap_spinbox)
+
+        param_layout.addWidget(QLabel("Aggregation:"))
+        self.agg_combo = QComboBox()
+        self.agg_combo.addItems([
+            "Average of 3 smallest",
+            "Minimum distance",
+            "Average of all",
+        ])
+        self.agg_combo.setCurrentIndex(default_aggregation_idx)
+        param_layout.addWidget(self.agg_combo)
+
+        param_layout.addWidget(QLabel("Dead Ch:"))
+        self.dead_ch_input = QLineEdit()
+        self.dead_ch_input.setPlaceholderText("e.g. 9,22")
+        self.dead_ch_input.setText(default_dead_channels_text)
+        self.dead_ch_input.setFixedWidth(80)
+        param_layout.addWidget(self.dead_ch_input)
+
+        self.compute_btn = QPushButton("Compute")
+        self.compute_btn.clicked.connect(self._compute)
+        param_layout.addWidget(self.compute_btn)
+
+        self.compare_btn = QPushButton("Compare All Features")
+        self.compare_btn.clicked.connect(self._compare_features)
+        param_layout.addWidget(self.compare_btn)
+
+        self.load_btn = QPushButton("Load from File")
+        self.load_btn.clicked.connect(self._load_templates_from_file)
+        param_layout.addWidget(self.load_btn)
+
+        layout.addLayout(param_layout)
+
+        # ── Results section ──
+        self.figure = Figure(figsize=(8, 6), dpi=100)
+        self.canvas = FigureCanvas(self.figure)
+        self.canvas.setMinimumHeight(400)
+        layout.addWidget(self.canvas)
+
+        n_c = len(self.templates_closed)
+        n_o = len(self.templates_open)
+        if n_c > 0 or n_o > 0:
+            initial_text = f"Loaded {n_c} CLOSED + {n_o} OPEN templates. Click 'Compute' to analyze."
+        else:
+            initial_text = "No templates loaded. Use 'Load from File' to load a template set, then click 'Compute'."
+        self.stats_label = QLabel(initial_text)
+        self.stats_label.setStyleSheet("font-family: monospace; font-size: 11px;")
+        self.stats_label.setWordWrap(True)
+        layout.addWidget(self.stats_label)
+
+        # ── Flagged templates section (populated after Compute) ──
+        self.flagged_container = QWidget()
+        self.flagged_layout = QVBoxLayout(self.flagged_container)
+        self.flagged_layout.setContentsMargins(0, 0, 0, 0)
+
+        flagged_scroll = QScrollArea()
+        flagged_scroll.setWidget(self.flagged_container)
+        flagged_scroll.setWidgetResizable(True)
+        flagged_scroll.setMaximumHeight(160)
+        layout.addWidget(flagged_scroll)
+
+        # ── Template count label ──
+        self.count_label = QLabel(f"Templates: {n_c} CLOSED + {n_o} OPEN")
+        self.count_label.setStyleSheet("font-weight: bold;")
+        layout.addWidget(self.count_label)
+
+    def _parse_dead_channels(self) -> list:
+        text = self.dead_ch_input.text().strip()
+        if not text:
+            return []
+        dead = []
+        for part in text.split(","):
+            part = part.strip()
+            if part.isdigit():
+                ch = int(part)
+                if 1 <= ch <= 32:
+                    dead.append(ch - 1)
+        return sorted(set(dead))
+
+    def _load_templates_from_file(self):
+        """Load templates from a .pkl file (combined template file or single-class files)."""
+        import pickle
+        from PySide6.QtWidgets import QFileDialog, QMessageBox
+
+        start_dir = "data/templates"
+        if not os.path.exists(start_dir):
+            start_dir = "data"
+
+        filename, _ = QFileDialog.getOpenFileName(
+            self, "Select Templates File", start_dir, "Pickle files (*.pkl)"
+        )
+        if not filename:
+            return
+
+        try:
+            with open(filename, "rb") as f:
+                data = pickle.load(f)
+
+            templates_closed = []
+            templates_open = []
+
+            if isinstance(data, dict):
+                # Combined format: templates_open + templates_closed
+                if "templates_open" in data and "templates_closed" in data:
+                    raw_open = data["templates_open"]
+                    raw_closed = data["templates_closed"]
+                    # Distinguish raw EMG (n_ch, n_samples) from feature matrices (n_windows, n_ch)
+                    # Raw EMG: first dim is small (channels), second is large (samples)
+                    # Feature: first dim is large (windows), second is small (channels)
+                    if len(raw_open) > 0 and hasattr(raw_open[0], 'shape') and len(raw_open[0].shape) == 2:
+                        if raw_open[0].shape[0] <= 64:  # likely raw EMG (n_ch, n_samples)
+                            templates_open = raw_open
+                        else:
+                            QMessageBox.warning(
+                                self, "Feature Templates",
+                                "This file contains feature-extracted templates, not raw EMG.\n"
+                                "Template Study needs raw EMG templates.",
+                                QMessageBox.Ok,
+                            )
+                            return
+                    else:
+                        templates_open = raw_open
+                    if len(raw_closed) > 0 and hasattr(raw_closed[0], 'shape') and len(raw_closed[0].shape) == 2:
+                        if raw_closed[0].shape[0] <= 64:
+                            templates_closed = raw_closed
+                        else:
+                            QMessageBox.warning(
+                                self, "Feature Templates",
+                                "This file contains feature-extracted templates, not raw EMG.\n"
+                                "Template Study needs raw EMG templates.",
+                                QMessageBox.Ok,
+                            )
+                            return
+                    else:
+                        templates_closed = raw_closed
+
+                # Single-class format: templates + metadata
+                elif "templates" in data and "metadata" in data:
+                    class_label = data["metadata"].get("class_label", "").lower()
+                    if "open" in class_label:
+                        templates_open = data["templates"]
+                    elif "closed" in class_label or "close" in class_label:
+                        templates_closed = data["templates"]
+                    else:
+                        QMessageBox.warning(
+                            self, "Unknown Class",
+                            f"Could not determine class from metadata: '{class_label}'.\n"
+                            "Expected 'open' or 'closed'.",
+                            QMessageBox.Ok,
+                        )
+                        return
+                else:
+                    QMessageBox.warning(
+                        self, "Invalid File",
+                        "File format not recognized.\nExpected combined template file "
+                        "(templates_open + templates_closed) or single-class file (templates + metadata).",
+                        QMessageBox.Ok,
+                    )
+                    return
+            else:
+                QMessageBox.warning(
+                    self, "Invalid File",
+                    "File format not recognized (expected dict).",
+                    QMessageBox.Ok,
+                )
+                return
+
+            n_c = len(templates_closed)
+            n_o = len(templates_open)
+            if n_c == 0 and n_o == 0:
+                QMessageBox.warning(self, "Empty", "No templates found in file.", QMessageBox.Ok)
+                return
+
+            # Infer channel count from templates
+            sample = templates_closed[0] if templates_closed else templates_open[0]
+            if hasattr(sample, 'shape') and len(sample.shape) == 2:
+                n_ch = sample.shape[0]
+                if n_ch != config.num_channels:
+                    print(f"[TEMPLATE STUDY] Adjusting config.num_channels: {config.num_channels} -> {n_ch}")
+                    config.num_channels = n_ch
+                    config.active_channels = [i for i in range(n_ch) if i not in config.dead_channels]
+
+            self.templates_closed = list(templates_closed)
+            self.templates_open = list(templates_open)
+            self.templates_modified = True  # loaded new set
+            basename = os.path.basename(filename)
+            self.setWindowTitle(f"Template Study — {basename}")
+            self.count_label.setText(f"Templates: {n_c} CLOSED + {n_o} OPEN")
+            self.stats_label.setText(
+                f"Loaded {n_c} CLOSED + {n_o} OPEN templates from:\n{basename}\n\n"
+                f"Click 'Compute' to analyze."
+            )
+            print(f"[TEMPLATE STUDY] Loaded {n_c} CLOSED + {n_o} OPEN from {basename}")
+
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to load file:\n{e}", QMessageBox.Ok)
+            import traceback
+            traceback.print_exc()
+
+    def _compute_metrics(self, feature_name=None, silent=False):
+        """Core computation — returns (metrics, quality, params) or None on error."""
+        from mindmove.model.template_study import (
+            compute_template_metrics_with_aggregation,
+            analyze_template_quality,
+        )
+
+        if feature_name is None:
+            feature_name = self.feature_combo.currentText()
+        window_samples = self.window_spinbox.value()
+        overlap_samples = self.overlap_spinbox.value()
+        increment_samples = max(1, window_samples - overlap_samples)
+
+        agg_text = self.agg_combo.currentText()
+        if "3 smallest" in agg_text:
+            agg = "avg_3_smallest"
+        elif "Minimum" in agg_text:
+            agg = "minimum"
+        else:
+            agg = "average"
+
+        dead = self._parse_dead_channels()
+        n_ch = config.num_channels
+        active_channels = [i for i in range(n_ch) if i not in dead]
+
+        metrics = compute_template_metrics_with_aggregation(
+            templates_closed=self.templates_closed,
+            templates_open=self.templates_open,
+            feature_name=feature_name,
+            window_length=window_samples,
+            window_increment=increment_samples,
+            distance_aggregation=agg,
+            active_channels=active_channels,
+        )
+
+        n_closed = len(self.templates_closed)
+        n_open = len(self.templates_open)
+        quality = analyze_template_quality(metrics, n_closed, n_open)
+
+        params = {
+            "feature_name": feature_name,
+            "window_samples": window_samples,
+            "overlap_samples": overlap_samples,
+            "agg": agg,
+            "dead": dead,
+        }
+        return metrics, quality, params
+
+    def _compute(self):
+        from mindmove.model.template_study import plot_distance_matrix
+        from mindmove.model.core.algorithm import compute_spatial_profiles
+
+        if not self.templates_closed and not self.templates_open:
+            self.stats_label.setText("No templates loaded. Use 'Load from File' to load templates.")
+            return
+
+        self.compute_btn.setEnabled(False)
+        self.compute_btn.setText("Computing...")
+        from PySide6.QtWidgets import QApplication
+        QApplication.processEvents()
+
+        try:
+            result = self._compute_metrics()
+            if result is None:
+                return
+            metrics, quality, params = result
+
+            # Compute spatial profiles
+            spatial_closed = compute_spatial_profiles(self.templates_closed) if self.templates_closed else None
+            spatial_open = compute_spatial_profiles(self.templates_open) if self.templates_open else None
+
+            # Plot: DTW distance matrix (left) + spatial profiles (right)
+            self.figure.clear()
+
+            if spatial_closed is not None or spatial_open is not None:
+                ax_dtw = self.figure.add_subplot(121)
+                ax_spatial = self.figure.add_subplot(122)
+
+                # Plot spatial profiles as grouped bar chart
+                n_ch = 0
+                if spatial_closed is not None:
+                    n_ch = len(spatial_closed["weights"])
+                elif spatial_open is not None:
+                    n_ch = len(spatial_open["weights"])
+
+                channels = np.arange(n_ch)
+                bar_width = 0.35
+
+                if spatial_closed is not None:
+                    ax_spatial.bar(channels - bar_width / 2, spatial_closed["weights"],
+                                   bar_width, label="CLOSED", color="#d44", alpha=0.8)
+                if spatial_open is not None:
+                    ax_spatial.bar(channels + bar_width / 2, spatial_open["weights"],
+                                   bar_width, label="OPEN", color="#48b", alpha=0.8)
+
+                ax_spatial.set_xlabel("Channel")
+                ax_spatial.set_ylabel("Consistency Weight")
+                ax_spatial.set_title("Spatial Profile (consistency weights)")
+                ax_spatial.set_xticks(channels)
+                ax_spatial.set_xticklabels([str(c + 1) for c in channels], fontsize=7)
+                ax_spatial.legend(fontsize=8)
+                ax_spatial.grid(axis='y', alpha=0.3)
+            else:
+                ax_dtw = self.figure.add_subplot(111)
+
+            plot_distance_matrix(metrics, ax=ax_dtw)
+            self.figure.tight_layout()
+            self.canvas.draw()
+
+            # Build stats text
+            ic = metrics["intra_closed"]
+            io = metrics["intra_open"]
+            ec = metrics["inter_closed_to_open"]
+            eo = metrics["inter_open_to_closed"]
+
+            ic_upper = ic["mean"] + ic["std"]
+            io_upper = io["mean"] + io["std"]
+            ec_lower = ec["mean"] - ec["std"]
+            eo_lower = eo["mean"] - eo["std"]
+
+            gap_closed = ec_lower - ic_upper
+            gap_open = eo_lower - io_upper
+            ok_c = "OK" if gap_closed > 0 else "OVERLAP"
+            ok_o = "OK" if gap_open > 0 else "OVERLAP"
+
+            midgap_closed = (ic_upper + ec_lower) / 2
+            midgap_open = (io_upper + eo_lower) / 2
+
+            text = (
+                f"Intra CLOSED:  mean={ic['mean']:.4f}  std={ic['std']:.4f}  ->  mean+std={ic_upper:.4f}\n"
+                f"Intra OPEN:    mean={io['mean']:.4f}  std={io['std']:.4f}  ->  mean+std={io_upper:.4f}\n"
+                f"Inter (C->O):  mean={ec['mean']:.4f}  std={ec['std']:.4f}  ->  mean-std={ec_lower:.4f}\n"
+                f"Inter (O->C):  mean={eo['mean']:.4f}  std={eo['std']:.4f}  ->  mean-std={eo_lower:.4f}\n"
+                f"\n"
+                f"Gap CLOSED: {gap_closed:.4f} [{ok_c}]   Mid-gap threshold: {midgap_closed:.4f}\n"
+                f"Gap OPEN:   {gap_open:.4f} [{ok_o}]   Mid-gap threshold: {midgap_open:.4f}\n"
+                f"\n"
+                f"{quality['summary']}\n"
+                f"\n"
+                f"Aggregation: {params['agg']}  |  Feature: {params['feature_name']}  |  "
+                f"Window: {params['window_samples']} samp  Overlap: {params['overlap_samples']} samp  |  "
+                f"Dead channels: {[ch+1 for ch in params['dead']] if params['dead'] else 'None'}"
+            )
+            self.stats_label.setText(text)
+
+            # Populate flagged templates with remove buttons
+            self._populate_flagged_templates(quality)
+
+        except Exception as e:
+            self.stats_label.setText(f"Error: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.compute_btn.setEnabled(True)
+            self.compute_btn.setText("Compute")
+
+    def _populate_flagged_templates(self, quality):
+        """Build the flagged-templates section with Remove buttons."""
+        # Clear previous content
+        while self.flagged_layout.count():
+            child = self.flagged_layout.takeAt(0)
+            if child.widget():
+                child.widget().deleteLater()
+
+        flagged = []
+        for t in quality.get("closed_analysis", []):
+            if t["n_flags"] > 0:
+                flagged.append(("closed", t))
+        for t in quality.get("open_analysis", []):
+            if t["n_flags"] > 0:
+                flagged.append(("open", t))
+
+        if not flagged:
+            lbl = QLabel("No flagged templates.")
+            lbl.setStyleSheet("color: green; font-style: italic;")
+            self.flagged_layout.addWidget(lbl)
+            return
+
+        header = QLabel(f"{len(flagged)} flagged template(s) — remove outliers to improve quality:")
+        header.setStyleSheet("font-weight: bold;")
+        self.flagged_layout.addWidget(header)
+
+        for class_name, t in flagged:
+            row = QHBoxLayout()
+            flag_str = ", ".join(t["flags"])
+            consensus = " [OUTLIER]" if t["is_outlier"] else ""
+            info = QLabel(
+                f"{t['label']}  intra={t['intra']:.4f}  inter={t['inter']:.4f}  "
+                f"margin={t['margin']:.4f}  sil={t['silhouette']:.3f}  "
+                f"[{flag_str}]{consensus}"
+            )
+            info.setStyleSheet(
+                "font-family: monospace; font-size: 11px;"
+                + (" color: red;" if t["is_outlier"] else " color: #cc6600;")
+            )
+            row.addWidget(info, stretch=1)
+
+            remove_btn = QPushButton("Remove")
+            remove_btn.setFixedWidth(70)
+            remove_btn.setStyleSheet("background-color: #ff6666;")
+            idx = t["index"]
+            remove_btn.clicked.connect(
+                lambda checked=False, cn=class_name, i=idx: self._remove_template(cn, i)
+            )
+            row.addWidget(remove_btn)
+
+            container = QWidget()
+            container.setLayout(row)
+            self.flagged_layout.addWidget(container)
+
+    def _remove_template(self, class_name, index):
+        """Remove a template by class and index, then re-compute."""
+        target = self.templates_closed if class_name == "closed" else self.templates_open
+        if 0 <= index < len(target):
+            removed_label = f"{'C' if class_name == 'closed' else 'O'}{index + 1}"
+            del target[index]
+            self.templates_modified = True
+            n_c = len(self.templates_closed)
+            n_o = len(self.templates_open)
+            self.count_label.setText(f"Templates: {n_c} CLOSED + {n_o} OPEN")
+            print(f"[TEMPLATE STUDY] Removed {removed_label} — now {n_c} CLOSED + {n_o} OPEN")
+            # Re-compute automatically
+            self._compute()
+
+    def _compare_features(self):
+        """Run analysis across all features and display a comparison table."""
+        if not self.templates_closed and not self.templates_open:
+            self.stats_label.setText("No templates loaded. Use 'Load from File' to load templates.")
+            return
+
+        from mindmove.model.core.features.features_registry import FEATURES
+        from PySide6.QtWidgets import QApplication
+
+        self.compare_btn.setEnabled(False)
+        self.compare_btn.setText("Comparing...")
+        QApplication.processEvents()
+
+        try:
+            results = []
+            for feature_name in FEATURES:
+                try:
+                    result = self._compute_metrics(feature_name=feature_name)
+                    if result is None:
+                        continue
+                    metrics, quality, params = result
+                    grade = quality["grade"]
+
+                    ic = metrics["intra_closed"]
+                    io = metrics["intra_open"]
+                    ec = metrics["inter_closed_to_open"]
+                    eo = metrics["inter_open_to_closed"]
+
+                    gap_c = (ec["mean"] - ec["std"]) - (ic["mean"] + ic["std"])
+                    gap_o = (eo["mean"] - eo["std"]) - (io["mean"] + io["std"])
+
+                    results.append({
+                        "feature": feature_name,
+                        "total": grade["total"],
+                        "sep": grade["separation"],
+                        "con": grade["consistency"],
+                        "rob": grade["robustness"],
+                        "gap_c": gap_c,
+                        "gap_o": gap_o,
+                        "outliers": grade["details"]["n_outliers"],
+                        "crossers": grade["details"]["n_crossers"],
+                    })
+                except Exception as e:
+                    print(f"[COMPARE] {feature_name}: Error — {e}")
+
+            if not results:
+                self.stats_label.setText("No features could be computed.")
+                return
+
+            # Sort by total grade descending
+            results.sort(key=lambda r: r["total"], reverse=True)
+
+            # Build comparison table
+            header = (
+                f"{'Feature':<20} {'Grade':>6} {'Sep':>5} {'Con':>5} {'Rob':>5} "
+                f"{'GapC':>8} {'GapO':>8} {'Out':>4} {'Cross':>5}\n"
+                f"{'-'*20} {'-'*6} {'-'*5} {'-'*5} {'-'*5} "
+                f"{'-'*8} {'-'*8} {'-'*4} {'-'*5}"
+            )
+            rows = []
+            for r in results:
+                rows.append(
+                    f"{r['feature']:<20} {r['total']:>6.1f} {r['sep']:>5.1f} {r['con']:>5.1f} {r['rob']:>5.1f} "
+                    f"{r['gap_c']:>8.4f} {r['gap_o']:>8.4f} {r['outliers']:>4d} {r['crossers']:>5d}"
+                )
+
+            best = results[0]
+            text = (
+                f"FEATURE COMPARISON  ({len(results)} features tested)\n"
+                f"Settings: Aggregation={self.agg_combo.currentText()}, "
+                f"Window={self.window_spinbox.value()} samp, "
+                f"Overlap={self.overlap_spinbox.value()} samp\n\n"
+                f"{header}\n" + "\n".join(rows) + "\n\n"
+                f"Best feature: {best['feature']} (Grade: {best['total']:.1f}/30)"
+            )
+            self.stats_label.setText(text)
+
+        except Exception as e:
+            self.stats_label.setText(f"Error during comparison: {e}")
+            import traceback
+            traceback.print_exc()
+        finally:
+            self.compare_btn.setEnabled(True)
+            self.compare_btn.setText("Compare All Features")
 
 
 class TrainingProtocol(QObject):
@@ -1383,6 +2149,43 @@ class TrainingProtocol(QObject):
 
         # Initialize Template Extraction UI
         self._setup_template_extraction_ui()
+
+    def _validate_differential_mode(self, loaded_mode: bool) -> bool:
+        """
+        Check if loaded data's differential mode matches the current app config.
+
+        If mismatch, show dialog offering to switch. If user accepts, toggles the
+        device UI button (which triggers the full config + filter chain).
+
+        Args:
+            loaded_mode: True if loaded data is SD (differential), False if MP.
+
+        Returns:
+            True if modes match (or user switched), False if user declined (abort load).
+        """
+        if loaded_mode == config.ENABLE_DIFFERENTIAL_MODE:
+            return True
+
+        loaded_name = "Single Differential (16ch)" if loaded_mode else "Monopolar (32ch)"
+        current_name = "Single Differential (16ch)" if config.ENABLE_DIFFERENTIAL_MODE else "Monopolar (32ch)"
+
+        result = QMessageBox.question(
+            self.main_window,
+            "Differential Mode Mismatch",
+            f"This data was recorded in <b>{loaded_name}</b> mode,\n"
+            f"but the app is currently in <b>{current_name}</b> mode.\n\n"
+            f"Switch to <b>{loaded_name}</b> to match?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.Yes,
+        )
+
+        if result == QMessageBox.Yes:
+            self.main_window.device.differential_mode_button.setChecked(loaded_mode)
+            print(f"[MODE] Auto-switched to {'SD' if loaded_mode else 'MP'} to match loaded data")
+            return True
+        else:
+            print(f"[MODE] User declined mode switch — load aborted")
+            return False
 
     def select_recordings(self) -> None:
         self.training_create_dataset_push_button.setEnabled(False)
@@ -1717,11 +2520,11 @@ class TrainingProtocol(QObject):
         # Row 2: Custom window/overlap inputs (hidden by default)
         self.custom_window_label = QLabel("Window (ms):")
         self.custom_window_spinbox = QSpinBox()
-        self.custom_window_spinbox.setRange(50, 500)
+        self.custom_window_spinbox.setRange(1, 500)
         self.custom_window_spinbox.setValue(96)
         self.custom_overlap_label = QLabel("Overlap (ms):")
         self.custom_overlap_spinbox = QSpinBox()
-        self.custom_overlap_spinbox.setRange(10, 200)
+        self.custom_overlap_spinbox.setRange(0, 499)
         self.custom_overlap_spinbox.setValue(32)
         layout.addWidget(self.custom_window_label, 2, 0, 1, 1)
         layout.addWidget(self.custom_window_spinbox, 2, 1, 1, 1)
@@ -1763,7 +2566,45 @@ class TrainingProtocol(QObject):
         layout.addWidget(self.dead_channels_label, 5, 0, 1, 1)
         layout.addWidget(self.dead_channels_input, 5, 1, 1, 2)
 
-        # Row 6: Distance aggregation method
+        # Row 6: Channel mode selection (global vs per-class)
+        self.channel_mode_label = QLabel("Channel Mode:")
+        self.channel_mode_combo = QComboBox()
+        self.channel_mode_combo.addItems([
+            "Global (all channels)",
+            "Per-class (spatial separation)"
+        ])
+        self.channel_mode_combo.currentIndexChanged.connect(self._on_channel_mode_changed)
+        layout.addWidget(self.channel_mode_label, 6, 0, 1, 1)
+        layout.addWidget(self.channel_mode_combo, 6, 1, 1, 2)
+
+        # Row 7: Per-class channel fields (hidden by default)
+        self.closed_channels_label = QLabel("CLOSED Ch:")
+        self.closed_channels_input = QLineEdit()
+        self.closed_channels_input.setPlaceholderText("e.g., 5,6,8,9,10,11 (1-indexed)")
+        self.closed_channels_input.setToolTip("Channels assigned to CLOSED class (1-indexed)")
+        self.open_channels_label = QLabel("OPEN Ch:")
+        self.open_channels_input = QLineEdit()
+        self.open_channels_input.setPlaceholderText("e.g., 1,12,13 (1-indexed)")
+        self.open_channels_input.setToolTip("Channels assigned to OPEN class (1-indexed)")
+        layout.addWidget(self.closed_channels_label, 7, 0, 1, 1)
+        layout.addWidget(self.closed_channels_input, 7, 1, 1, 2)
+        layout.addWidget(self.open_channels_label, 7, 2, 1, 1)
+        layout.addWidget(self.open_channels_input, 7, 3, 1, 1)
+        # Hide per-class fields by default
+        self.closed_channels_label.setVisible(False)
+        self.closed_channels_input.setVisible(False)
+        self.open_channels_label.setVisible(False)
+        self.open_channels_input.setVisible(False)
+
+        # Row 8: Auto-detect button for per-class channels (hidden by default)
+        self.auto_detect_channels_btn = QPushButton("Auto-Detect Channels from Onset")
+        self.auto_detect_channels_btn.setToolTip("Run per-class channel assignment using onset detection data")
+        self.auto_detect_channels_btn.clicked.connect(self._auto_detect_per_class_channels)
+        self.auto_detect_channels_btn.setEnabled(False)
+        layout.addWidget(self.auto_detect_channels_btn, 8, 0, 1, 3)
+        self.auto_detect_channels_btn.setVisible(False)
+
+        # Row 9: Distance aggregation method
         self.distance_agg_label = QLabel("Distance Aggregation:")
         self.distance_agg_combo = QComboBox()
         self.distance_agg_combo.addItems([
@@ -1772,10 +2613,10 @@ class TrainingProtocol(QObject):
             "Average of all"
         ])
         self.distance_agg_combo.setToolTip("How to compute final distance from multiple templates")
-        layout.addWidget(self.distance_agg_label, 6, 0, 1, 1)
-        layout.addWidget(self.distance_agg_combo, 6, 1, 1, 2)
+        layout.addWidget(self.distance_agg_label, 9, 0, 1, 1)
+        layout.addWidget(self.distance_agg_combo, 9, 1, 1, 2)
 
-        # Row 7: Post-prediction smoothing
+        # Row 10: Post-prediction smoothing
         self.smoothing_label = QLabel("State Smoothing:")
         self.smoothing_combo = QComboBox()
         self.smoothing_combo.addItems([
@@ -1784,24 +2625,24 @@ class TrainingProtocol(QObject):
             "None"
         ])
         self.smoothing_combo.setToolTip("Method to smooth state transitions")
-        layout.addWidget(self.smoothing_label, 7, 0, 1, 1)
-        layout.addWidget(self.smoothing_combo, 7, 1, 1, 2)
+        layout.addWidget(self.smoothing_label, 10, 0, 1, 1)
+        layout.addWidget(self.smoothing_combo, 10, 1, 1, 2)
 
-        # Row 8: Model name (reuse existing widget, just reposition)
-        layout.addWidget(self.main_window.ui.label_8, 8, 0, 1, 1)
-        layout.addWidget(self.training_model_label_line_edit, 8, 1, 1, 2)
+        # Row 11: Model name (reuse existing widget, just reposition)
+        layout.addWidget(self.main_window.ui.label_8, 11, 0, 1, 1)
+        layout.addWidget(self.training_model_label_line_edit, 11, 1, 1, 2)
 
-        # Row 9: Create Model button
+        # Row 12: Create Model button
         self.create_model_btn = QPushButton("Create Model")
         self.create_model_btn.clicked.connect(self._create_dtw_model)
         self.create_model_btn.setEnabled(False)
-        layout.addWidget(self.create_model_btn, 9, 0, 1, 3)
+        layout.addWidget(self.create_model_btn, 12, 0, 1, 3)
 
-        # Row 10: Progress bar
+        # Row 13: Progress bar
         self.model_creation_progress_bar = self.main_window.ui.trainingProgressBar
         self.model_creation_progress_bar.setVisible(True)
         self.model_creation_progress_bar.setValue(0)
-        layout.addWidget(self.model_creation_progress_bar, 10, 0, 1, 3)
+        layout.addWidget(self.model_creation_progress_bar, 13, 0, 1, 3)
 
     def _setup_template_extraction_ui(self) -> None:
         """Setup UI connections for template extraction group box."""
@@ -1864,6 +2705,7 @@ class TrainingProtocol(QObject):
             "Manual Selection",     # index 0 - opens review dialog with two windows
             "After Audio Cue",      # index 1 - template starts at audio cue
             "After Reaction Time",  # index 2 - template starts after reaction time
+            "Onset Detection",      # index 3 - auto-detect onset, then review
         ]
 
         # Add extra options for auto-detect mode (UI file has only 2)
@@ -2029,6 +2871,19 @@ class TrainingProtocol(QObject):
         # Add after save button in the grid
         grid_layout.addWidget(self.open_template_review_btn, 13, 0, 1, 2)
 
+        # Template Study button
+        self.template_study_btn = QPushButton("Template Study")
+        self.template_study_btn.clicked.connect(self._open_template_study)
+        self.template_study_btn.setEnabled(True)
+        self.template_study_btn.setToolTip("Analyze template quality: distance matrix heatmap and intra/inter-class statistics.\nCan load templates from file if none are extracted.")
+        grid_layout.addWidget(self.template_study_btn, 14, 0, 1, 1)
+
+        # Load Templates from File button
+        self.load_templates_file_btn = QPushButton("Load from File")
+        self.load_templates_file_btn.clicked.connect(self._import_templates_from_file)
+        self.load_templates_file_btn.setToolTip("Load a saved template set (.pkl) into the extraction panel.\nEnables save under a new name and model creation.")
+        grid_layout.addWidget(self.load_templates_file_btn, 14, 1, 1, 1)
+
         # Clear button
         self.clear_extraction_btn = self.main_window.ui.trainingClearExtractionPushButton
         self.clear_extraction_btn.clicked.connect(self._clear_extraction)
@@ -2121,7 +2976,7 @@ class TrainingProtocol(QObject):
             # Index 1: "After Audio Cue" - template starts at audio cue
             # Index 2: "After Reaction Time" - template starts after reaction time
 
-            self._manual_selection_mode = (index == 0)
+            self._manual_selection_mode = (index == 0 or index == 3)
 
             if index == 0:
                 self.template_manager.template_type = "manual"
@@ -2129,6 +2984,8 @@ class TrainingProtocol(QObject):
                 self.template_manager.template_type = "after_audio_cue"
             elif index == 2:
                 self.template_manager.template_type = "after_reaction_time"
+            elif index == 3:
+                self.template_manager.template_type = "onset_detection"
         else:
             # Auto-detect / Legacy mode options:
             # Index 0: "Hold Only (skip 0.5s)" - hold_only mode
@@ -2298,6 +3155,13 @@ class TrainingProtocol(QObject):
                     self.template_count_label.setText(f"Saved: {n_closed} closed, {n_open} open")
                     self.save_templates_btn.setEnabled(True)
                     self.open_template_review_btn.setEnabled(True)
+                    self.template_study_btn.setEnabled(True)
+
+            elif template_type == "onset_detection":
+                # Onset detection: auto-extract, store for optional review
+                print(f"\n[TRAINING] Running onset detection on {len(valid_recordings)} recording(s)")
+                self._guided_recordings_for_review = valid_recordings
+                self._extract_templates_from_onset(valid_recordings)
 
             elif template_type in ("after_audio_cue", "after_reaction_time"):
                 # Automatic extraction based on cue positions
@@ -2407,6 +3271,212 @@ class TrainingProtocol(QObject):
         if n_closed > 0 or n_open > 0:
             self.save_templates_btn.setEnabled(True)
             self.open_template_review_btn.setEnabled(True)
+            self.template_study_btn.setEnabled(True)
+
+    @staticmethod
+    def _print_onset_diagnostics(result: dict, class_name: str, cycle_num: int) -> None:
+        """Print per-channel diagnostics when onset detection fails."""
+        env_data = result["envelope_data"]
+        per_ch_env = env_data["per_channel_env"]
+        env_time = env_data["env_time"]
+        baselines = env_data["per_channel_baseline"]
+        thresholds = env_data["per_channel_threshold"]
+        search_start_s = env_data["search_start_s"]
+        search_end_s = env_data["search_end_s"]
+
+        from mindmove.model.template_study import ONSET_ENVELOPE_WINDOW_S
+        env_step = int(ONSET_ENVELOPE_WINDOW_S * config.FSAMP) // 2
+        search_start_env = max(0, int(search_start_s * config.FSAMP) // env_step)
+        search_end_env = min(len(env_time), int(search_end_s * config.FSAMP) // env_step)
+
+        n_ch = per_ch_env.shape[0]
+        print(f"           Diagnostics for {class_name} (search: {search_start_s:.2f}-{search_end_s:.2f}s):")
+
+        # Find channels with highest peak-to-threshold ratio
+        ratios = []
+        for ch in range(n_ch):
+            search_seg = per_ch_env[ch, search_start_env:search_end_env]
+            if len(search_seg) == 0:
+                ratios.append((ch, 0, baselines[ch], thresholds[ch], 0))
+                continue
+            peak = float(np.max(search_seg))
+            thr = thresholds[ch]
+            ratio = peak / thr if thr > 0 else 0
+            ratios.append((ch, peak, baselines[ch], thr, ratio))
+
+        # Sort by ratio descending, show top 5 closest to firing
+        ratios.sort(key=lambda x: x[4], reverse=True)
+        for ch, peak, bl, thr, ratio in ratios[:5]:
+            status = "CLOSE" if ratio > 0.7 else "far"
+            print(f"           CH{ch+1}: baseline={bl:.4f}, threshold={thr:.4f}, "
+                  f"peak={peak:.4f}, peak/thr={ratio:.2f} [{status}]")
+
+    def _extract_templates_from_onset(self, recordings: List[dict]) -> None:
+        """
+        Extract templates using per-channel onset detection.
+        Templates are placed at onset - 20% preparation, clamped to valid region.
+        Stores onset info (channels fired) for use in review dialog.
+        """
+        from mindmove.model.template_study import (
+            detect_onset_per_channel,
+            place_template_at_onset,
+            detect_dead_channels,
+            detect_artifact_channels,
+            ONSET_THRESHOLD_K,
+            ONSET_BASELINE_DURATION_S,
+        )
+
+        self.template_manager.templates["closed"] = []
+        self.template_manager.templates["open"] = []
+
+        template_duration_s = self.template_manager.template_duration_s
+        template_samples = int(template_duration_s * config.FSAMP)
+        baseline_samples = int(ONSET_BASELINE_DURATION_S * config.FSAMP)
+
+        closed_templates = []
+        open_templates = []
+        total_cycles = 0
+
+        # Store onset info for review dialog
+        self._onset_info = []  # list of dicts per cycle
+
+        for recording in recordings:
+            # Need enough post-open data for onset search + template (1s) + margin
+            cycles = self.template_manager.extract_complete_cycles(
+                recording, post_open_s=2.0
+            )
+
+            for cycle in cycles:
+                emg = cycle["emg"]
+                n_samples = emg.shape[1]
+                cn = cycle["cycle_number"]
+
+                closed_search_start = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
+                closed_search_end = (cycle.get("open_cue_idx") or cycle.get("open_start_idx", n_samples)) - template_samples
+                open_search_start = cycle.get("open_cue_idx") or cycle.get("open_start_idx", 0)
+                open_search_end = n_samples - template_samples
+
+                closed_baseline_start = max(0, closed_search_start - baseline_samples)
+                open_baseline_start = max(0, open_search_start - baseline_samples)
+
+                cycle_info = {
+                    "closed_channels_fired": [],
+                    "open_channels_fired": [],
+                    "closed_pos": None,
+                    "open_pos": None,
+                    "dead_channels": [],
+                    "artifact_channels_closed": [],
+                    "artifact_channels_open": [],
+                }
+
+                # Dead channel detection (whole cycle)
+                cycle_info["dead_channels"] = detect_dead_channels(emg)
+                if cycle_info["dead_channels"]:
+                    print(f"  Cycle {cn} DEAD channels: {[ch+1 for ch in cycle_info['dead_channels']]}")
+
+                # CLOSED onset
+                result = detect_onset_per_channel(
+                    emg, closed_search_start, closed_search_end,
+                    baseline_start=closed_baseline_start,
+                )
+                if result["earliest_onset"] is not None:
+                    pos = place_template_at_onset(result["earliest_onset"], n_samples)
+                    # Clamp: don't start before the cue
+                    pos = max(pos, closed_search_start)
+                    pos = min(pos, n_samples - template_samples)
+                    end_idx = pos + template_samples
+                    closed_templates.append(emg[:, pos:end_idx])
+                    cycle_info["closed_channels_fired"] = result["channels_fired"]
+                    cycle_info["closed_pos"] = pos
+                    fired = ",".join(str(ch+1) for ch in result["channels_fired"])
+                    print(f"  Cycle {cn} CLOSED: onset={result['earliest_onset']/config.FSAMP:.2f}s, "
+                          f"window={pos/config.FSAMP:.2f}s-{end_idx/config.FSAMP:.2f}s, ch=[{fired}]")
+
+                    # Artifact detection for CLOSED template
+                    art = detect_artifact_channels(
+                        emg, pos, end_idx,
+                        closed_baseline_start, closed_search_start,
+                    )
+                    cycle_info["artifact_channels_closed"] = art["artifact_channels"]
+                    if art["artifact_channels"]:
+                        art_str = ",".join(str(ch+1) for ch in art["artifact_channels"])
+                        print(f"           CLOSED artifacts: CH[{art_str}]")
+                else:
+                    print(f"  Cycle {cn} CLOSED: no onset detected — skipped")
+                    self._print_onset_diagnostics(result, "CLOSED", cn)
+
+                # OPEN onset
+                result = detect_onset_per_channel(
+                    emg, open_search_start, open_search_end,
+                    baseline_start=open_baseline_start,
+                )
+                if result["earliest_onset"] is not None:
+                    pos = place_template_at_onset(result["earliest_onset"], n_samples)
+                    # Clamp: don't start before the cue
+                    pos = max(pos, open_search_start)
+                    pos = min(pos, n_samples - template_samples)
+                    end_idx = pos + template_samples
+                    open_templates.append(emg[:, pos:end_idx])
+                    cycle_info["open_channels_fired"] = result["channels_fired"]
+                    cycle_info["open_pos"] = pos
+                    fired = ",".join(str(ch+1) for ch in result["channels_fired"])
+                    print(f"  Cycle {cn} OPEN:   onset={result['earliest_onset']/config.FSAMP:.2f}s, "
+                          f"window={pos/config.FSAMP:.2f}s-{end_idx/config.FSAMP:.2f}s, ch=[{fired}]")
+
+                    # Artifact detection for OPEN template
+                    art = detect_artifact_channels(
+                        emg, pos, end_idx,
+                        open_baseline_start, open_search_start,
+                    )
+                    cycle_info["artifact_channels_open"] = art["artifact_channels"]
+                    if art["artifact_channels"]:
+                        art_str = ",".join(str(ch+1) for ch in art["artifact_channels"])
+                        print(f"           OPEN artifacts: CH[{art_str}]")
+                else:
+                    print(f"  Cycle {cn} OPEN:   no onset detected — skipped")
+                    self._print_onset_diagnostics(result, "OPEN", cn)
+
+                self._onset_info.append(cycle_info)
+                total_cycles += 1
+
+        self.template_manager.templates["closed"] = closed_templates
+        self.template_manager.templates["open"] = open_templates
+
+        n_closed = len(closed_templates)
+        n_open = len(open_templates)
+        print(f"\n[ONSET] Extracted {n_closed} CLOSED and {n_open} OPEN templates from {total_cycles} cycles")
+
+        self.selected_recordings_for_extraction_label.setText(
+            f"Onset detection: {len(recordings)} recording(s)"
+        )
+        self.template_count_label.setText(f"Extracted: {n_closed} closed, {n_open} open")
+
+        if n_closed > 0 or n_open > 0:
+            self.save_templates_btn.setEnabled(True)
+            self.open_template_review_btn.setEnabled(True)
+            self.template_study_btn.setEnabled(True)
+
+        # Auto-compute per-class channels from onset info
+        if self._onset_info:
+            from mindmove.model.template_study import compute_per_class_channels
+            dead_channels = self._parse_dead_channels()
+            result = compute_per_class_channels(self._onset_info, recordings, dead_channels)
+            self._per_class_channels = result
+
+            closed_str = ",".join(str(ch + 1) for ch in result["closed"])
+            open_str = ",".join(str(ch + 1) for ch in result["open"])
+            self.closed_channels_input.setText(closed_str)
+            self.open_channels_input.setText(open_str)
+
+            print(f"\n[PER-CLASS CHANNELS] Auto-computed:")
+            print(f"  CLOSED ({len(result['closed'])}): [{closed_str}]")
+            print(f"  OPEN ({len(result['open'])}): [{open_str}]")
+            if result["unassigned"]:
+                print(f"  Unassigned ({len(result['unassigned'])}): "
+                      f"[{','.join(str(ch+1) for ch in result['unassigned'])}]")
+
+            # Enable auto-detect button if in per-class mode
+            self.auto_detect_channels_btn.setEnabled(True)
 
     def _select_recording_files(self) -> None:
         """Select recording files (auto-detect format). Supports .pkl and .mat files."""
@@ -2425,6 +3495,7 @@ class TrainingProtocol(QObject):
 
         # Validate selected recordings (accept MindMove, VHI pickle, and MAT formats)
         valid_recordings = []
+        mode_validated = False  # Only show mode dialog once
         for filepath in filenames:
             try:
                 recording = self._load_recording_file(filepath)
@@ -2438,11 +3509,18 @@ class TrainingProtocol(QObject):
                 # Check for VHI format
                 vhi_keys = ["biosignal", "ground_truth"]
 
-                if all(key in recording for key in mindmove_vh_keys):
-                    valid_recordings.append(filepath)
-                elif all(key in recording for key in mindmove_kb_keys):
-                    valid_recordings.append(filepath)
-                elif all(key in recording for key in vhi_keys):
+                is_valid = (all(key in recording for key in mindmove_vh_keys) or
+                            all(key in recording for key in mindmove_kb_keys) or
+                            all(key in recording for key in vhi_keys))
+
+                if is_valid:
+                    # Validate differential mode (once, from first valid recording)
+                    if not mode_validated:
+                        rec_mode = _detect_mode_from_data(recording)
+                        if rec_mode is not None:
+                            if not self._validate_differential_mode(rec_mode):
+                                return  # User declined switch — abort entire selection
+                        mode_validated = True
                     valid_recordings.append(filepath)
                 else:
                     print(f"Invalid recording (unknown format): {filepath}")
@@ -2638,11 +3716,13 @@ class TrainingProtocol(QObject):
                 print(f"Loaded {len(recordings)} recordings from legacy format")
 
                 for i, recording in enumerate(recordings):
+                    rec_name = recording.get("_legacy_filename", f"legacy_{i+1}")
                     # Extract activations from this recording
                     self.template_manager.extract_activations_from_recording(
                         recording,
                         class_label,
-                        include_pre_activation=include_pre_activation
+                        include_pre_activation=include_pre_activation,
+                        recording_name=rec_name
                     )
                     progress = int((i + 1) / len(recordings) * 100)
                     print(f"Extraction progress: {progress}%")
@@ -2664,11 +3744,13 @@ class TrainingProtocol(QObject):
                         print(f"Failed to load: {filepath}")
                         continue
 
+                    rec_name = os.path.basename(filepath)
                     # Extract activations from this recording
                     self.template_manager.extract_activations_from_recording(
                         recording,
                         class_label,
-                        include_pre_activation=include_pre_activation
+                        include_pre_activation=include_pre_activation,
+                        recording_name=rec_name
                     )
 
                     # Update progress
@@ -2714,9 +3796,25 @@ class TrainingProtocol(QObject):
         self.activation_list_widget.clear()
 
         durations = self.template_manager.get_activation_durations(class_label)
+        metadata_list = self.template_manager.activation_metadata.get(class_label, [])
 
         for i, duration in enumerate(durations):
-            item = QListWidgetItem(f"Activation {i + 1}: {duration:.2f}s")
+            if i < len(metadata_list):
+                meta = metadata_list[i]
+                rec_name = meta.get("recording_name", "")
+                cycle_idx = meta.get("cycle_index", i + 1)
+                total = meta.get("total_cycles_in_recording", 0)
+                if rec_name:
+                    # Shorten long filenames: keep last part
+                    short_name = rec_name
+                    if len(short_name) > 40:
+                        short_name = "..." + short_name[-37:]
+                    label = f"[{short_name}] Cycle {cycle_idx}/{total} — {duration:.2f}s"
+                else:
+                    label = f"Activation {i + 1}: {duration:.2f}s"
+            else:
+                label = f"Activation {i + 1}: {duration:.2f}s"
+            item = QListWidgetItem(label)
             self.activation_list_widget.addItem(item)
 
     def _start_manual_template_selection(self, class_label: str) -> None:
@@ -2745,8 +3843,16 @@ class TrainingProtocol(QObject):
         print(f"{'='*60}\n")
 
         # Process each activation
+        metadata_list = self.template_manager.activation_metadata.get(class_label, [])
         for i, activation in enumerate(activations):
-            print(f"\nProcessing activation {i + 1}/{len(activations)}...")
+            meta_str = ""
+            if i < len(metadata_list):
+                meta = metadata_list[i]
+                rec_name = meta.get("recording_name", "")
+                cycle_idx = meta.get("cycle_index", 0)
+                if rec_name:
+                    meta_str = f" [{rec_name} — Cycle {cycle_idx}]"
+            print(f"\nProcessing activation {i + 1}/{len(activations)}{meta_str}...")
 
             # Get the GT signal for this activation (reconstruct from context)
             # For manual mode, we include manual_context_before_s before GT=1
@@ -2759,6 +3865,14 @@ class TrainingProtocol(QObject):
             if pre_samples < n_samples:
                 gt_overlay[pre_samples:] = 1
 
+            # Build activation title with metadata
+            act_title = f"Activation {i + 1}/{len(activations)}"
+            if i < len(metadata_list) and metadata_list[i].get("recording_name"):
+                meta = metadata_list[i]
+                act_title = (f"[{meta['recording_name']}] "
+                            f"Cycle {meta['cycle_index']} — "
+                            f"{i + 1}/{len(activations)}")
+
             # Call the interactive selection for this activation
             template = self._interactive_template_selection(
                 activation,
@@ -2766,7 +3880,8 @@ class TrainingProtocol(QObject):
                 channel,
                 template_samples,
                 activation_idx=i + 1,
-                total_activations=len(activations)
+                total_activations=len(activations),
+                activation_title=act_title
             )
 
             if template is not None:
@@ -2784,7 +3899,8 @@ class TrainingProtocol(QObject):
         channel: int,
         template_samples: int,
         activation_idx: int,
-        total_activations: int
+        total_activations: int,
+        activation_title: str = ""
     ) -> Optional[np.ndarray]:
         """
         Show interactive plot for a single activation and let user click to select template start.
@@ -2798,6 +3914,7 @@ class TrainingProtocol(QObject):
             template_samples: Number of samples for template
             activation_idx: Current activation number (1-indexed for display)
             total_activations: Total number of activations
+            activation_title: Optional descriptive title with recording name/cycle info
 
         Returns:
             Template array or None if skipped
@@ -2827,7 +3944,8 @@ class TrainingProtocol(QObject):
 
         # Create dialog
         dialog = QDialog(self.main_window)
-        dialog.setWindowTitle(f'Manual Selection - Activation {activation_idx}/{total_activations}')
+        title = activation_title or f"Activation {activation_idx}/{total_activations}"
+        dialog.setWindowTitle(f'Manual Selection - {title}')
         dialog.setMinimumSize(1000, 600)
         dialog.setModal(True)
 
@@ -3162,11 +4280,140 @@ class TrainingProtocol(QObject):
         dialog = TemplateReviewDialog(templates_closed, templates_open, self.main_window)
         dialog.show()
 
+    def _import_templates_from_file(self) -> None:
+        """Load a saved template set into the template_manager for re-saving or model creation."""
+        templates_dir = "data/templates"
+        if not os.path.exists(templates_dir):
+            templates_dir = "data"
+
+        filename, _ = QFileDialog.getOpenFileName(
+            self.main_window,
+            "Select Templates File",
+            templates_dir,
+            "Pickle files (*.pkl)"
+        )
+        if not filename:
+            return
+
+        try:
+            with open(filename, "rb") as f:
+                data = pickle.load(f)
+
+            templates_closed = []
+            templates_open = []
+
+            if isinstance(data, dict):
+                # Combined format
+                if "templates_open" in data and "templates_closed" in data:
+                    raw_open = data["templates_open"]
+                    raw_closed = data["templates_closed"]
+                    # Validate they're raw EMG (n_ch, n_samples), not feature matrices
+                    if len(raw_open) > 0 and hasattr(raw_open[0], 'shape') and len(raw_open[0].shape) == 2:
+                        if raw_open[0].shape[0] > 64:
+                            QMessageBox.warning(
+                                self.main_window, "Feature Templates",
+                                "This file contains feature-extracted templates.\n"
+                                "Please select a file with raw EMG templates.",
+                                QMessageBox.Ok)
+                            return
+                    templates_open = list(raw_open)
+                    templates_closed = list(raw_closed)
+
+                # Single-class format
+                elif "templates" in data and "metadata" in data:
+                    class_label = data["metadata"].get("class_label", "").lower()
+                    if "open" in class_label:
+                        templates_open = list(data["templates"])
+                    elif "closed" in class_label or "close" in class_label:
+                        templates_closed = list(data["templates"])
+                    else:
+                        QMessageBox.warning(
+                            self.main_window, "Unknown Class",
+                            f"Could not determine class from metadata: '{class_label}'.",
+                            QMessageBox.Ok)
+                        return
+                else:
+                    QMessageBox.warning(
+                        self.main_window, "Invalid File",
+                        "File format not recognized.",
+                        QMessageBox.Ok)
+                    return
+            else:
+                QMessageBox.warning(
+                    self.main_window, "Invalid File",
+                    "File format not recognized (expected dict).",
+                    QMessageBox.Ok)
+                return
+
+            n_c = len(templates_closed)
+            n_o = len(templates_open)
+            if n_c == 0 and n_o == 0:
+                QMessageBox.warning(self.main_window, "Empty",
+                                    "No templates found in file.", QMessageBox.Ok)
+                return
+
+            # Validate differential mode
+            sample = templates_closed[0] if templates_closed else templates_open[0]
+            if hasattr(sample, 'shape') and len(sample.shape) == 2:
+                tmpl_mode = sample.shape[0] <= 16
+                if not self._validate_differential_mode(tmpl_mode):
+                    return
+
+            # Clear existing and load into template_manager
+            self.template_manager.clear_all()
+            self.template_manager.templates["closed"] = templates_closed
+            self.template_manager.templates["open"] = templates_open
+
+            # Infer template duration from data
+            if sample.shape[1] > 0:
+                duration_s = sample.shape[1] / config.FSAMP
+                self.template_manager.template_duration_s = duration_s
+
+            # Update extraction section UI
+            basename = os.path.basename(filename)
+            self.template_count_label.setText(f"{n_c} closed, {n_o} open (from file)")
+            self.save_templates_btn.setEnabled(True)
+            self.template_study_btn.setEnabled(True)
+
+            # Pre-fill template set name from filename
+            name_stem = os.path.splitext(basename)[0]
+            for prefix in ["raw_templates_", "templates_"]:
+                if name_stem.startswith(prefix):
+                    name_stem = name_stem[len(prefix):]
+            self.template_set_name_line_edit.setText(name_stem)
+
+            # Also set as selected templates for Create Model section
+            self.selected_combined_templates_path = filename
+            self.selected_open_templates_path = filename
+            self.selected_closed_templates_path = filename
+            duration_s = sample.shape[1] / config.FSAMP if sample.shape[1] > 0 else 0
+            self.templates_label.setText(
+                f"{n_o} OPEN + {n_c} CLOSED ({duration_s:.1f}s) - {basename}"
+            )
+            self._update_create_model_button_state()
+
+            # No recordings for review, but templates are in the manager
+            self._guided_recordings_for_review = []
+            self._onset_info = None
+
+            print(f"\n[TRAINING] Loaded templates from file: {basename}")
+            print(f"  {n_c} CLOSED + {n_o} OPEN templates")
+            if sample.shape[1] > 0:
+                print(f"  Template shape: {sample.shape} ({duration_s:.1f}s)")
+
+        except Exception as e:
+            QMessageBox.critical(
+                self.main_window, "Error",
+                f"Failed to load templates:\n{e}", QMessageBox.Ok)
+            import traceback
+            traceback.print_exc()
+
     def _open_template_review(self) -> None:
         """Open the template review dialog showing full cycles for manual adjustment.
 
         This opens the same GuidedRecordingReviewDialog used for manual selection,
         allowing the user to review and adjust template positions visually.
+        If onset detection was used, positions and channel info are pre-loaded.
         """
         if not self._guided_recordings_for_review:
             QMessageBox.warning(
@@ -3178,20 +4425,58 @@ class TrainingProtocol(QObject):
             )
             return
 
-        print(f"\n[TRAINING] Opening template review with {len(self._guided_recordings_for_review)} recording(s)")
+        # Check if we have onset info from a previous onset detection run
+        has_onset = hasattr(self, '_onset_info') and self._onset_info
+        print(f"\n[TRAINING] Opening template review with {len(self._guided_recordings_for_review)} recording(s)"
+              f"{' (onset detection positions)' if has_onset else ''}")
 
-        # Open the review dialog (same as manual selection)
         review_dialog = GuidedRecordingReviewDialog(
-            self._guided_recordings_for_review, self.template_manager, self.main_window
+            self._guided_recordings_for_review, self.template_manager, self.main_window,
+            onset_detection=has_onset,
+            onset_info=self._onset_info if has_onset else None,
         )
         result = review_dialog.exec()
 
         if review_dialog.saved:
-            # Update template counts
             n_closed = len(self.template_manager.templates.get("closed", []))
             n_open = len(self.template_manager.templates.get("open", []))
             self.template_count_label.setText(f"Updated: {n_closed} closed, {n_open} open")
             print(f"[TRAINING] Templates updated: {n_closed} closed, {n_open} open")
+
+    def _open_template_study(self) -> None:
+        """Open the Template Study dialog to analyze template quality."""
+        templates_closed = self.template_manager.templates.get("closed", [])
+        templates_open = self.template_manager.templates.get("open", [])
+
+        # Read current defaults from the Create Model section
+        window_samples, overlap_samples = self._get_window_overlap_samples()
+        feature = self.feature_combo.currentText()
+        agg_idx = self.distance_agg_combo.currentIndex()
+        dead_text = self.dead_channels_input.text().strip()
+
+        dialog = TemplateStudyDialog(
+            templates_closed=templates_closed,
+            templates_open=templates_open,
+            default_feature=feature,
+            default_window_samples=window_samples,
+            default_overlap_samples=overlap_samples,
+            default_aggregation_idx=agg_idx,
+            default_dead_channels_text=dead_text,
+            parent=self.main_window,
+        )
+        dialog.finished.connect(lambda: self._on_template_study_closed(dialog))
+        dialog.show()
+
+    def _on_template_study_closed(self, dialog) -> None:
+        """Sync templates back from the Template Study dialog if modified."""
+        if not dialog.templates_modified:
+            return
+        self.template_manager.templates["closed"] = dialog.templates_closed
+        self.template_manager.templates["open"] = dialog.templates_open
+        n_c = len(dialog.templates_closed)
+        n_o = len(dialog.templates_open)
+        self.template_count_label.setText(f"Updated: {n_c} closed, {n_o} open")
+        print(f"[TRAINING] Templates updated from Template Study: {n_c} CLOSED + {n_o} OPEN")
 
     def _clear_extraction(self) -> None:
         """Clear all extracted activations and templates."""
@@ -3218,6 +4503,7 @@ class TrainingProtocol(QObject):
         self.plot_selected_btn.setEnabled(False)
         self.save_templates_btn.setEnabled(False)
         self.open_template_review_btn.setEnabled(False)
+        # Template Study stays enabled (can load from file)
 
     # ==================== DTW Model Creation Methods ====================
 
@@ -3248,6 +4534,17 @@ class TrainingProtocol(QObject):
                 n_closed = len(data["templates_closed"])
                 duration = data.get("metadata", {}).get("template_duration_s", "?")
                 label_text = f"{n_open} OPEN + {n_closed} CLOSED ({duration}s)"
+
+                # Validate differential mode
+                tmpl_mode = _detect_mode_from_data(data)
+                # If metadata doesn't have it, infer from raw template shape (n_channels, n_samples)
+                if tmpl_mode is None and n_open > 0:
+                    t = data["templates_open"][0]
+                    if hasattr(t, 'shape') and len(t.shape) == 2:
+                        tmpl_mode = t.shape[0] <= 16
+                if tmpl_mode is not None:
+                    if not self._validate_differential_mode(tmpl_mode):
+                        return  # User declined switch
 
                 self.selected_combined_templates_path = filename
                 self.selected_open_templates_path = filename  # For compatibility
@@ -3322,10 +4619,26 @@ class TrainingProtocol(QObject):
                 n_templates = len(data["templates"])
                 duration = data["metadata"].get("template_duration_s", "?")
                 label_text = f"{n_templates} templates ({duration}s)"
+
+                # Validate differential mode from metadata or template shape
+                tmpl_mode = _detect_mode_from_data(data)
+                if tmpl_mode is None and n_templates > 0:
+                    t = data["templates"][0]
+                    if hasattr(t, 'shape') and len(t.shape) == 2:
+                        tmpl_mode = t.shape[0] <= 16
+                if tmpl_mode is not None:
+                    if not self._validate_differential_mode(tmpl_mode):
+                        return
             # Check if it's the old format (list of templates)
             elif isinstance(data, list):
                 n_templates = len(data)
                 label_text = f"{n_templates} templates (legacy format)"
+
+                # Infer mode from template shape
+                if n_templates > 0 and hasattr(data[0], 'shape') and len(data[0].shape) == 2:
+                    tmpl_mode = data[0].shape[0] <= 16
+                    if not self._validate_differential_mode(tmpl_mode):
+                        return
             else:
                 QMessageBox.warning(
                     self.main_window,
@@ -3351,6 +4664,80 @@ class TrainingProtocol(QObject):
                 f"Failed to load template file: {e}",
                 QMessageBox.Ok,
             )
+
+    def _on_channel_mode_changed(self, index: int) -> None:
+        """Handle channel mode combo change (0=Global, 1=Per-class)."""
+        is_per_class = index == 1
+        self.closed_channels_label.setVisible(is_per_class)
+        self.closed_channels_input.setVisible(is_per_class)
+        self.open_channels_label.setVisible(is_per_class)
+        self.open_channels_input.setVisible(is_per_class)
+        self.auto_detect_channels_btn.setVisible(is_per_class)
+        # Enable auto-detect button if onset info is available
+        if is_per_class:
+            has_onset = hasattr(self, '_onset_info') and self._onset_info
+            self.auto_detect_channels_btn.setEnabled(has_onset)
+
+    def _auto_detect_per_class_channels(self) -> None:
+        """Auto-detect per-class channels from onset detection info."""
+        from mindmove.model.template_study import compute_per_class_channels
+
+        if not hasattr(self, '_onset_info') or not self._onset_info:
+            QMessageBox.warning(
+                self.main_window,
+                "No Onset Data",
+                "Run template extraction with onset detection first.",
+                QMessageBox.Ok,
+            )
+            return
+
+        # Gather recordings
+        recordings = self._get_loaded_recordings()
+        dead_channels = self._parse_dead_channels()
+
+        result = compute_per_class_channels(self._onset_info, recordings, dead_channels)
+        self._per_class_channels = result
+
+        # Populate fields (1-indexed for display)
+        closed_str = ",".join(str(ch + 1) for ch in result["closed"])
+        open_str = ",".join(str(ch + 1) for ch in result["open"])
+        self.closed_channels_input.setText(closed_str)
+        self.open_channels_input.setText(open_str)
+
+        # Print summary
+        print(f"\n[PER-CLASS CHANNELS] Auto-detected from {len(self._onset_info)} cycles:")
+        print(f"  CLOSED channels (1-indexed): [{closed_str}]")
+        print(f"  OPEN channels (1-indexed): [{open_str}]")
+        if result["unassigned"]:
+            unassigned_str = ",".join(str(ch + 1) for ch in result["unassigned"])
+            print(f"  Unassigned: [{unassigned_str}]")
+        if result["details"]:
+            print(f"  Conflict resolution details:")
+            for ch, info in sorted(result["details"].items()):
+                if "ratio_closed_over_open" in info:
+                    assigned = "CLOSED" if ch in result["closed"] else "OPEN"
+                    print(f"    CH{ch+1}: fired {info['closed_fire_count']}x CLOSED, "
+                          f"{info['open_fire_count']}x OPEN, "
+                          f"RMS ratio(C/O)={info['ratio_closed_over_open']:.2f} → {assigned}")
+
+    def _get_loaded_recordings(self) -> list:
+        """Get the list of loaded recording dicts (used by per-class channel detection)."""
+        if hasattr(self, '_guided_recordings_for_review') and self._guided_recordings_for_review:
+            return self._guided_recordings_for_review
+        return []
+
+    def _parse_per_class_channels(self, text: str) -> list:
+        """Parse channel list from text field (1-indexed input to 0-indexed)."""
+        if not text.strip():
+            return []
+        channels = []
+        for part in text.split(","):
+            part = part.strip()
+            if part.isdigit():
+                ch = int(part)
+                if 1 <= ch <= 32:
+                    channels.append(ch - 1)
+        return sorted(set(channels))
 
     def _on_window_preset_changed(self, index: int) -> None:
         """Handle window/overlap preset change."""
@@ -3473,9 +4860,16 @@ class TrainingProtocol(QObject):
         from mindmove.model.core.windowing import sliding_window
         from mindmove.model.core.algorithm import (
             compute_threshold,
+            compute_threshold_with_aggregation,
             compute_per_template_statistics,
             compute_cross_class_distances,
-            compute_threshold_presets
+            compute_cross_class_distances_with_aggregation,
+            compute_threshold_presets,
+            compute_spatial_profiles
+        )
+        from mindmove.model.template_study import (
+            compute_template_metrics_with_aggregation,
+            analyze_template_quality,
         )
 
         # Get parameters
@@ -3507,6 +4901,17 @@ class TrainingProtocol(QObject):
         else:
             smoothing_method = "NONE"
 
+        # Get per-class channel configuration
+        is_per_class = self.channel_mode_combo.currentIndex() == 1
+        active_channels_closed = None
+        active_channels_open = None
+        if is_per_class:
+            active_channels_closed = self._parse_per_class_channels(self.closed_channels_input.text())
+            active_channels_open = self._parse_per_class_channels(self.open_channels_input.text())
+            if not active_channels_closed or not active_channels_open:
+                print("[WARNING] Per-class mode selected but channels are empty — falling back to global")
+                is_per_class = False
+
         print(f"\n{'='*60}")
         print("Creating DTW Model")
         print(f"{'='*60}")
@@ -3517,6 +4922,12 @@ class TrainingProtocol(QObject):
         print(f"Dead channels (1-indexed): {dead_channels_display if dead_channels_display else 'None'}")
         print(f"Distance aggregation: {distance_aggregation}")
         print(f"Smoothing method: {smoothing_method}")
+        if is_per_class:
+            print(f"Channel mode: Per-class (spatial separation)")
+            print(f"  CLOSED channels (0-indexed): {active_channels_closed}")
+            print(f"  OPEN channels (0-indexed): {active_channels_open}")
+        else:
+            print(f"Channel mode: Global")
         print(f"Model name: {model_name}")
 
         # Load templates
@@ -3534,6 +4945,11 @@ class TrainingProtocol(QObject):
 
         print(f"  Open templates: {len(open_templates_raw)}")
         print(f"  Closed templates: {len(closed_templates_raw)}")
+
+        # Compute spatial profiles from raw templates (before feature extraction)
+        print("\nComputing spatial profiles...")
+        spatial_profile_open = compute_spatial_profiles(open_templates_raw, class_label="open")
+        spatial_profile_closed = compute_spatial_profiles(closed_templates_raw, class_label="closed")
 
         # Extract features from templates
         print("\nExtracting features...")
@@ -3575,36 +4991,134 @@ class TrainingProtocol(QObject):
             config.USE_NUMBA_DTW = False
             config.USE_TSLEARN_DTW = False
 
-        # compute_threshold returns: (mean, std, threshold)
-        mean_open, std_open, threshold_open = compute_threshold(open_templates_features)
-        mean_closed, std_closed, threshold_closed = compute_threshold(closed_templates_features)
+        # Compute intra-class distances WITH aggregation (matches Template Study)
+        # For each template, distances to all others are aggregated (e.g. avg_3_smallest)
+        # before computing mean/std → consistent with online prediction behavior
+        mean_open, std_open, threshold_open = compute_threshold_with_aggregation(
+            open_templates_features,
+            active_channels=active_channels_open if is_per_class else None,
+            distance_aggregation=distance_aggregation,
+        )
+        mean_closed, std_closed, threshold_closed = compute_threshold_with_aggregation(
+            closed_templates_features,
+            active_channels=active_channels_closed if is_per_class else None,
+            distance_aggregation=distance_aggregation,
+        )
 
         # Restore config
         config.USE_NUMBA_DTW = original_numba
         config.USE_TSLEARN_DTW = original_tslearn
 
-        print(f"  Open threshold: {threshold_open:.4f} (mean: {mean_open:.4f}, std: {std_open:.4f})")
-        print(f"  Closed threshold: {threshold_closed:.4f} (mean: {mean_closed:.4f}, std: {std_closed:.4f})")
+        print(f"  Open intra-class: mean={mean_open:.4f}, std={std_open:.4f} (mean+std={mean_open+std_open:.4f})")
+        print(f"  Closed intra-class: mean={mean_closed:.4f}, std={std_closed:.4f} (mean+std={mean_closed+std_closed:.4f})")
+        print(f"  (aggregation: {distance_aggregation})")
 
-        # Compute cross-class distances for intelligent threshold presets
+        # Compute cross-class distances with same aggregation (directional)
+        # open→closed and closed→open are computed separately (like Template Study)
         print("\nComputing cross-class distances for threshold presets...")
-        mean_cross, std_cross, cross_distances = compute_cross_class_distances(
+        cross_active_channels = None
+        if is_per_class:
+            cross_active_channels = sorted(set(active_channels_open) | set(active_channels_closed))
+        cross_result = compute_cross_class_distances_with_aggregation(
             open_templates_features,
             closed_templates_features,
-            active_channels=None  # Will use config.active_channels
+            active_channels=cross_active_channels,
+            distance_aggregation=distance_aggregation,
         )
-        print(f"  Cross-class distance: mean={mean_cross:.4f}, std={std_cross:.4f}")
-        print(f"  Number of cross-class comparisons: {len(cross_distances)}")
+        # Directional: open→closed (used for OPEN threshold), closed→open (used for CLOSED threshold)
+        # Template Study convention: inter_closed_to_open = each CLOSED template vs all OPEN
+        # In our call: A=open, B=closed → a_to_b = open→closed, b_to_a = closed→open
+        cross_open_to_closed = cross_result["a_to_b"]    # each OPEN template vs all CLOSED
+        cross_closed_to_open = cross_result["b_to_a"]    # each CLOSED template vs all OPEN
 
-        # Compute threshold presets for OPEN class
+        print(f"  OPEN->CLOSED:  mean={cross_open_to_closed['mean']:.4f}, std={cross_open_to_closed['std']:.4f}")
+        print(f"  CLOSED->OPEN:  mean={cross_closed_to_open['mean']:.4f}, std={cross_closed_to_open['std']:.4f}")
+
+        # ── Template Study metrics (single distance matrix, same as Template Study dialog) ──
+        print(f"\n{'-'*60}")
+        print("Template Study Metrics (unified distance matrix)")
+        print(f"{'-'*60}")
+        ts_metrics = compute_template_metrics_with_aggregation(
+            templates_closed=closed_templates_raw,
+            templates_open=open_templates_raw,
+            feature_name=feature_name,
+            window_length=window_samples,
+            window_increment=window_samples - overlap_samples,
+            distance_aggregation=distance_aggregation,
+            active_channels=cross_active_channels if is_per_class else None,
+        )
+        ts_ic = ts_metrics["intra_closed"]
+        ts_io = ts_metrics["intra_open"]
+        ts_ec = ts_metrics["inter_closed_to_open"]
+        ts_eo = ts_metrics["inter_open_to_closed"]
+
+        ts_ic_upper = ts_ic["mean"] + ts_ic["std"]
+        ts_io_upper = ts_io["mean"] + ts_io["std"]
+        ts_ec_lower = ts_ec["mean"] - ts_ec["std"]
+        ts_eo_lower = ts_eo["mean"] - ts_eo["std"]
+
+        ts_gap_closed = ts_ec_lower - ts_ic_upper
+        ts_gap_open = ts_eo_lower - ts_io_upper
+        ts_ok_c = "OK" if ts_gap_closed > 0 else "OVERLAP"
+        ts_ok_o = "OK" if ts_gap_open > 0 else "OVERLAP"
+
+        ts_midgap_closed = (ts_ic_upper + ts_ec_lower) / 2
+        ts_midgap_open = (ts_io_upper + ts_eo_lower) / 2
+
+        print(f"  Intra CLOSED:  mean={ts_ic['mean']:.4f}  std={ts_ic['std']:.4f}  ->  mean+std={ts_ic_upper:.4f}")
+        print(f"  Intra OPEN:    mean={ts_io['mean']:.4f}  std={ts_io['std']:.4f}  ->  mean+std={ts_io_upper:.4f}")
+        print(f"  Inter (C->O):  mean={ts_ec['mean']:.4f}  std={ts_ec['std']:.4f}  ->  mean-std={ts_ec_lower:.4f}")
+        print(f"  Inter (O->C):  mean={ts_eo['mean']:.4f}  std={ts_eo['std']:.4f}  ->  mean-std={ts_eo_lower:.4f}")
+        print(f"")
+        print(f"  Gap CLOSED: {ts_gap_closed:.4f} [{ts_ok_c}]   Mid-gap threshold: {ts_midgap_closed:.4f}")
+        print(f"  Gap OPEN:   {ts_gap_open:.4f} [{ts_ok_o}]   Mid-gap threshold: {ts_midgap_open:.4f}")
+
+        # Quality analysis
+        n_closed_tpl = len(closed_templates_raw)
+        n_open_tpl = len(open_templates_raw)
+        ts_quality = analyze_template_quality(ts_metrics, n_closed_tpl, n_open_tpl)
+        print(f"\n  {ts_quality['summary']}")
+        print(f"{'-'*60}")
+
+        # For backward compatibility, store combined cross-class stats too
+        mean_cross = cross_result["combined_mean"]
+        std_cross = cross_result["combined_std"]
+
+        # Default threshold: mid-gap using DIRECTIONAL cross-class distances
+        # OPEN threshold uses inter_open_to_closed (each OPEN vs all CLOSED)
+        # CLOSED threshold uses inter_closed_to_open (each CLOSED vs all OPEN)
+        mean_cross_open = cross_open_to_closed["mean"]
+        std_cross_open = cross_open_to_closed["std"]
+        mean_cross_closed = cross_closed_to_open["mean"]
+        std_cross_closed = cross_closed_to_open["std"]
+
+        threshold_open = ((mean_open + std_open) + (mean_cross_open - std_cross_open)) / 2
+        threshold_closed = ((mean_closed + std_closed) + (mean_cross_closed - std_cross_closed)) / 2
+        print(f"\n  Model creation thresholds (separate distance matrices):")
+        print(f"    Intra OPEN:   mean={mean_open:.4f}  std={std_open:.4f}  ->  mean+std={mean_open+std_open:.4f}")
+        print(f"    Intra CLOSED: mean={mean_closed:.4f}  std={std_closed:.4f}  ->  mean+std={mean_closed+std_closed:.4f}")
+        print(f"    Cross OPEN->CLOSED: mean={mean_cross_open:.4f}  std={std_cross_open:.4f}  ->  mean-std={mean_cross_open-std_cross_open:.4f}")
+        print(f"    Cross CLOSED->OPEN: mean={mean_cross_closed:.4f}  std={std_cross_closed:.4f}  ->  mean-std={mean_cross_closed-std_cross_closed:.4f}")
+        print(f"\n  Default thresholds (mid-gap, directional):")
+        print(f"    OPEN:   {threshold_open:.4f}  (gap: [{mean_open+std_open:.4f}, {mean_cross_open-std_cross_open:.4f}])")
+        print(f"    CLOSED: {threshold_closed:.4f}  (gap: [{mean_closed+std_closed:.4f}, {mean_cross_closed-std_cross_closed:.4f}])")
+        print(f"\n  Template Study mid-gap (for comparison):")
+        print(f"    OPEN:   {ts_midgap_open:.4f}")
+        print(f"    CLOSED: {ts_midgap_closed:.4f}")
+        if abs(threshold_open - ts_midgap_open) > 0.0001 or abs(threshold_closed - ts_midgap_closed) > 0.0001:
+            print(f"  *** MISMATCH DETECTED ***")
+            print(f"    OPEN diff:   {threshold_open - ts_midgap_open:+.4f}")
+            print(f"    CLOSED diff: {threshold_closed - ts_midgap_closed:+.4f}")
+
+        # Compute threshold presets using directional cross-class stats
         print("\nComputing threshold presets for OPEN...")
-        open_presets = compute_threshold_presets(mean_open, std_open, mean_cross, std_cross)
+        open_presets = compute_threshold_presets(mean_open, std_open, mean_cross_open, std_cross_open)
         for key, preset in open_presets.items():
             print(f"  {preset['name']}: threshold={preset['threshold']:.4f} (s={preset['s']:.2f})")
 
         # Compute threshold presets for CLOSED class
         print("\nComputing threshold presets for CLOSED...")
-        closed_presets = compute_threshold_presets(mean_closed, std_closed, mean_cross, std_cross)
+        closed_presets = compute_threshold_presets(mean_closed, std_closed, mean_cross_closed, std_cross_closed)
         for key, preset in closed_presets.items():
             print(f"  {preset['name']}: threshold={preset['threshold']:.4f} (s={preset['s']:.2f})")
 
@@ -3636,8 +5150,10 @@ class TrainingProtocol(QObject):
         now = datetime.now()
         formatted_now = now.strftime("%Y%m%d_%H%M%S")
 
-        # Get mode suffix (_mp_ for monopolar, _sd_ for single differential)
-        mode_suffix = "sd" if config.ENABLE_DIFFERENTIAL_MODE else "mp"
+        # Infer mode from actual template data, not current config
+        # Feature templates are (n_windows, n_channels) — check axis 1
+        is_differential = _infer_mode_from_templates(open_templates_raw)
+        mode_suffix = "sd" if is_differential else "mp"
 
         model_data = {
             "open_templates": open_templates_features,
@@ -3656,12 +5172,34 @@ class TrainingProtocol(QObject):
             # New: post-prediction smoothing method
             "smoothing_method": smoothing_method,
             # New: differential mode flag
-            "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
-            # Cross-class statistics for intelligent threshold presets
+            "differential_mode": is_differential,
+            # Per-class active channels (None means global mode)
+            "active_channels_open": active_channels_open if is_per_class else None,
+            "active_channels_closed": active_channels_closed if is_per_class else None,
+            # Cross-class statistics (combined, for backward compatibility)
             "mean_cross": mean_cross,
             "std_cross": std_cross,
+            # Directional cross-class statistics (matching Template Study)
+            "mean_cross_open": mean_cross_open,
+            "std_cross_open": std_cross_open,
+            "mean_cross_closed": mean_cross_closed,
+            "std_cross_closed": std_cross_closed,
             # Threshold presets (computed from intra-class and cross-class statistics)
             "threshold_presets": threshold_presets,
+            # Spatial profiles for consistency-weighted spatial correction
+            "spatial_profiles": {
+                "open": {
+                    "ref_profile": spatial_profile_open["ref_profile"],
+                    "weights": spatial_profile_open["weights"],
+                    "consistency": spatial_profile_open["consistency"],
+                } if spatial_profile_open else None,
+                "closed": {
+                    "ref_profile": spatial_profile_closed["ref_profile"],
+                    "weights": spatial_profile_closed["weights"],
+                    "consistency": spatial_profile_closed["consistency"],
+                } if spatial_profile_closed else None,
+                "threshold": 0.5,  # Default spatial similarity threshold
+            },
             "parameters": {
                 "window_samples": window_samples,
                 "overlap_samples": overlap_samples,
@@ -3677,7 +5215,7 @@ class TrainingProtocol(QObject):
                 "n_open_templates": len(open_templates_features),
                 "n_closed_templates": len(closed_templates_features),
                 "dead_channels_display": dead_channels_display,  # 1-indexed for display
-                "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
+                "differential_mode": is_differential,
             }
         }
 
@@ -3688,7 +5226,10 @@ class TrainingProtocol(QObject):
         with open(model_path, "wb") as f:
             pickle.dump(model_data, f)
 
-        print(f"Model saved to: {model_path}")
+        print(f"\nModel saved to: {model_path}")
+        print(f"  Saved thresholds (mid-gap):")
+        print(f"    OPEN:   {threshold_open:.4f}")
+        print(f"    CLOSED: {threshold_closed:.4f}")
         print(f"{'='*60}\n")
 
         # Store for UI update

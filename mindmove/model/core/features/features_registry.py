@@ -30,7 +30,9 @@ FEATURES = {
     "cardinality": {"function": compute_cardinality, "name": "Cardinality", "unit": "count"},
 
     # --- Frequency domain ---
-   
+    "mean_freq": {"function": compute_mean_frequency, "name": "Mean Frequency", "unit": "Hz"},
+    "median_freq": {"function": compute_median_frequency, "name": "Median Frequency", "unit": "Hz"},
+    "spectral_entropy": {"function": compute_spectral_entropy, "name": "Spectral Entropy", "unit": "normalized"},
 
     # --- Time-frequency domain ---
 

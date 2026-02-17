@@ -12,13 +12,14 @@ clear; clc; close all;
 %% configuration
 
 % Path to exported model (.mat file)
-% model_file = 'data/model_MindMove_Model_sd_20260202_165447_SD_test_rms.mat';
-% model_file = 'data/model_MindMove_Model_mp_20260129_183359_test_2_3.mat';
-model_file = 'model_MindMove_Model_sd_20260203_131149_protocol_test_alberto_96_32_wl_avg3_mv.mat';
+% model_file = 'model_MindMove_Model_sd_20260203_131149_protocol_test_alberto_96_32_wl_avg3_mv.mat';
+% model_file = 'model_MindMove_Model_sd_20260203_125755_protocol_test_alberto_96_32_rms_avg3_mv.mat';
+model_file = 'model_MindMove_Model_sd_20260206_121332_test_patient.mat';
 
 % Path to exported recording (.mat file)
-recording_file = 'recording_recordings_MindMove_GuidedRecording_sd_20260203_124415596790_Validation_Alberto.mat';
-
+% recording_file = 'recording_recordings_MindMove_GuidedRecording_sd_20260203_124415596790_Validation_Alberto.mat';
+recording_file = 'recording_recordings_MindMove_GuidedRecording_sd_20260206_115904408711_guided_1cycles.mat';
+% recording_file = 'recording_recordings_MindMove_GuidedRecording_sd_20260206_120739441579_guided_4cycles.mat';
 %%  STEP 1: LOAD MODEL
 
 model = load(model_file);
@@ -40,17 +41,25 @@ n_closed = size(templates_closed, 1);
 % Extract thresholds
 % threshold_open = model.threshold_base_open;
 % threshold_closed = model.threshold_base_closed;
-threshold_open = 5.5;
-threshold_closed = 6.2;
+threshold_open = 2.0;
+threshold_closed = 2.0;
+
+% Distance aggregation method from model
+if isfield(model, 'distance_aggregation')
+    distance_aggregation = char(model.distance_aggregation);
+else
+    distance_aggregation = 'average';
+end
 
 fprintf('  Model loaded: %s\n', model_file);
+fprintf('  Distance aggregation: %s\n', distance_aggregation);
 %% LOAD RECORDING
 fprintf('Loading recording...\n');
 recording = load(recording_file);
 
-emg = recording.emg(:,1:25*Fs); % prende solo i primi 20 secondi
+emg = recording.emg;%(:,1:25*Fs); % prende solo i primi 20 secondi
 % emg = recording.emg;
-gt = recording.gt(1:25*Fs);
+gt = recording.gt;%(1:25*Fs);
 [~, n_samples] = size(emg);
 
 fprintf('  Recording: %.2f seconds\n', n_samples / Fs);
@@ -84,22 +93,23 @@ for k = 1:n_updates
     time_points(k) = buffer_end / Fs;
     gt_over_time(k) = gt(buffer_end);
 
-    % buffer_features = extract_wl_features(buffer_emg, window_size, window_shift);
     buffer_features = extract_wl_features(buffer_emg, window_size, window_shift);
+    % buffer_features = extract_rms_features(buffer_emg, window_size, window_shift);
+
 
     distances_open = zeros(n_open, 1);
     for t = 1:n_open
         template = squeeze(templates_open(t, :, :));
         [distances_open(t), ~, ~] = dtw_cosine(buffer_features, template);
     end
-    dist_open_over_time(k) = mean(distances_open);
+    dist_open_over_time(k) = aggregate_distances(distances_open, distance_aggregation);
 
     distances_closed = zeros(n_closed, 1);
     for t = 1:n_closed
         template = squeeze(templates_closed(t, :, :));
         [distances_closed(t), ~, ~] = dtw_cosine(buffer_features, template);
     end
-    dist_closed_over_time(k) = mean(distances_closed);
+    dist_closed_over_time(k) = aggregate_distances(distances_closed, distance_aggregation);
 
     if mod(k, 50) == 0
         fprintf('  Progress: %d/%d (%.1f%%)\n', k, n_updates, k/n_updates*100);
@@ -109,47 +119,67 @@ end
 fprintf('Simulation complete.\n');
 
 %% VISUALIZATION
-figure('Position', [100, 100, 1200, 800]);
-
+% figure('Position', [100, 100, 1200, 800]);
+% 
 ch_to_plot = 11; % cambiare canale se necessario
+% ch_to_plot = input('Enter channel number to plot: ');
+% for ch_to_plot = 2:16
+    figure('Position', [100, 100, 1200, 800]);
 
-subplot(3, 1, 1);
-t_emg = (0:n_samples-1) / Fs;
-yyaxis left;
-plot(t_emg, emg(ch_to_plot, :), 'b', 'LineWidth', 0.5);
-ylabel('EMG Ch1 (uV)');
-yyaxis right;
-plot(t_emg, gt, 'r', 'LineWidth', 1.5);
-ylabel('Ground Truth');
-ylim([-0.1, 1.1]);
-xlabel('Time (s)');
-title('EMG Channel 1 with Ground Truth');
-legend('EMG', 'GT (0=OPEN, 1=CLOSED)', 'Location', 'best');
-grid on;
+    subplot(3, 1, 1);
+    t_emg = (0:n_samples-1) / Fs;
+    yyaxis left;
+    plot(t_emg, emg(ch_to_plot, :), 'b', 'LineWidth', 0.5);
+    ylabel(sprintf('EMG Ch %d (uV)', ch_to_plot));
+    yyaxis right;
+    plot(t_emg, gt, 'r', 'LineWidth', 1.5);
+    ylabel('Ground Truth');
+    ylim([-0.1, 1.1]);
+    xlabel('Time (s)');
+    title(sprintf('EMG Channel %d with Ground Truth', ch_to_plot));
+    legend('EMG', 'GT (0=OPEN, 1=CLOSED)', 'Location', 'best');
+    grid on;
 
-subplot(3, 1, 2);
-plot(time_points, dist_open_over_time, 'b', 'LineWidth', 1.5);
-hold on;
-yline(threshold_open, 'b--', 'LineWidth', 1.5);
-ylabel('Distance');
-xlabel('Time (s)');
-title(sprintf('Distance to OPEN Templates (threshold = %.4f)', threshold_open));
-legend('Avg Distance', 'Threshold', 'Location', 'best');
-grid on;
+    subplot(3, 1, 2);
+    plot(time_points, dist_open_over_time, 'b', 'LineWidth', 1.5);
+    hold on;
+    yline(threshold_open, 'b--', 'LineWidth', 1.5);
+    ylabel('Distance');
+    xlabel('Time (s)');
+    title(sprintf('Distance to OPEN Templates (threshold = %.4f)', threshold_open));
+    legend('Avg Distance', 'Threshold', 'Location', 'best');
+    grid on;
 
-subplot(3, 1, 3);
-plot(time_points, dist_closed_over_time, 'r', 'LineWidth', 1.5);
-hold on;
-yline(threshold_closed, 'r--', 'LineWidth', 1.5);
-ylabel('Distance');
-xlabel('Time (s)');
-title(sprintf('Distance to CLOSED Templates (threshold = %.4f)', threshold_closed));
-legend('Avg Distance', 'Threshold', 'Location', 'best');
-grid on;
+    subplot(3, 1, 3);
+    plot(time_points, dist_closed_over_time, 'r', 'LineWidth', 1.5);
+    hold on;
+    yline(threshold_closed, 'r--', 'LineWidth', 1.5);
+    ylabel('Distance');
+    xlabel('Time (s)');
+    title(sprintf('Distance to CLOSED Templates (threshold = %.4f)', threshold_closed));
+    legend('Avg Distance', 'Threshold', 'Location', 'best');
+    grid on;
 
-sgtitle('DTW Real-Time Simulation', 'FontSize', 14, 'FontWeight', 'bold');
+    sgtitle('DTW Real-Time Simulation', 'FontSize', 14, 'FontWeight', 'bold');
+
+% end
 
 %% LOCAL FUNCTIONS
+
+function d = aggregate_distances(distances, method)
+    % Aggregate template distances using the specified method.
+    % Matches Python: algorithm.py compute_distance_from_training_set_online()
+    switch method
+        case 'minimum'
+            d = min(distances);
+        case 'avg_3_smallest'
+            n_smallest = min(3, length(distances));
+            sorted_d = sort(distances);
+            d = mean(sorted_d(1:n_smallest));
+        otherwise  % 'average'
+            d = mean(distances);
+    end
+end
 
 function features = extract_rms_features(emg, window_size, window_shift)
     [nch, n_samples] = size(emg);

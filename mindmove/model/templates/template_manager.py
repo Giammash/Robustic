@@ -39,6 +39,7 @@ class TemplateManager:
     def __init__(self):
         self.templates: Dict[str, List[np.ndarray]] = {"open": [], "closed": []}
         self.all_activations: Dict[str, List[np.ndarray]] = {"open": [], "closed": []}
+        self.activation_metadata: Dict[str, List[dict]] = {"open": [], "closed": []}
         self.template_type: Literal["hold_only", "onset_hold", "onset", "manual"] = "hold_only"
         self.selection_mode: Literal["manual", "auto", "first_n"] = "manual"
 
@@ -284,7 +285,8 @@ class TemplateManager:
         self,
         recording: dict,
         class_label: str,
-        include_pre_activation: bool = False
+        include_pre_activation: bool = False,
+        recording_name: str = ""
     ) -> List[np.ndarray]:
         """
         Extract all activation segments from a recording.
@@ -296,6 +298,7 @@ class TemplateManager:
             recording: Recording dict in any supported format
             class_label: "open" or "closed"
             include_pre_activation: If True, include ONSET_OFFSET_S before activation start
+            recording_name: Name of the source recording file (for metadata tracking)
 
         Returns:
             List of EMG segments (each is n_channels x n_samples)
@@ -323,8 +326,14 @@ class TemplateManager:
             include_pre_activation=include_pre_activation
         )
 
-        # Add to all_activations
+        # Add to all_activations with metadata
         self.all_activations[class_label].extend(segments)
+        for cycle_idx in range(len(segments)):
+            self.activation_metadata[class_label].append({
+                "recording_name": recording_name,
+                "cycle_index": cycle_idx + 1,
+                "total_cycles_in_recording": len(segments),
+            })
 
         return segments
 
@@ -556,8 +565,14 @@ class TemplateManager:
         Returns:
             Path where templates were saved
         """
-        # Get mode suffix (_mp_ for monopolar, _sd_ for single differential)
-        mode_suffix = "sd" if config.ENABLE_DIFFERENTIAL_MODE else "mp"
+        # Infer mode from actual template data, not current config
+        templates_list = self.templates[class_label]
+        is_differential = (
+            templates_list[0].shape[0] <= 16
+            if templates_list and hasattr(templates_list[0], 'shape')
+            else config.ENABLE_DIFFERENTIAL_MODE
+        )
+        mode_suffix = "sd" if is_differential else "mp"
 
         if template_set_name:
             folder_name = f"templates_{mode_suffix}_{class_label}_{template_set_name}"
@@ -582,7 +597,7 @@ class TemplateManager:
                 "n_samples": self.templates[class_label][0].shape[1] if self.templates[class_label] else 0,
                 "fsamp": config.FSAMP,
                 "created_at": datetime.now().isoformat(),
-                "differential_mode": config.ENABLE_DIFFERENTIAL_MODE,
+                "differential_mode": is_differential,
             }
         }
 
@@ -592,7 +607,7 @@ class TemplateManager:
         print(f"Saved {len(self.templates[class_label])} raw templates to {raw_filepath}")
         print(f"  Template duration: {self._template_duration_s}s")
         print(f"  Template type: {self.template_type}")
-        print(f"  Differential mode: {config.ENABLE_DIFFERENTIAL_MODE}")
+        print(f"  Differential mode: {is_differential}")
 
         return base_folder
 
@@ -612,11 +627,13 @@ class TemplateManager:
         ]
 
     def clear_activations(self, class_label: Optional[str] = None) -> None:
-        """Clear extracted activations."""
+        """Clear extracted activations and their metadata."""
         if class_label:
             self.all_activations[class_label] = []
+            self.activation_metadata[class_label] = []
         else:
             self.all_activations = {"open": [], "closed": []}
+            self.activation_metadata = {"open": [], "closed": []}
 
     def clear_templates(self, class_label: Optional[str] = None) -> None:
         """Clear selected templates."""
@@ -636,7 +653,8 @@ class TemplateManager:
         min_duration_s: float = 1.5,
         pre_context_s: float = 0.5,
         max_duration_s: float = 4.0,
-        return_gt: bool = False
+        return_gt: bool = False,
+        recording_name: str = ""
     ) -> Dict[str, List[np.ndarray]]:
         """
         Extract both OPEN and CLOSED activations from the same recording.
@@ -738,9 +756,21 @@ class TemplateManager:
                 if return_gt:
                     open_gt.append(gt_binary[start_idx:end_idx])
 
-        # Store in all_activations
+        # Store in all_activations with metadata
         self.all_activations["closed"].extend(closed_activations)
+        for cycle_idx in range(len(closed_activations)):
+            self.activation_metadata["closed"].append({
+                "recording_name": recording_name,
+                "cycle_index": cycle_idx + 1,
+                "total_cycles_in_recording": len(closed_activations),
+            })
         self.all_activations["open"].extend(open_activations)
+        for cycle_idx in range(len(open_activations)):
+            self.activation_metadata["open"].append({
+                "recording_name": recording_name,
+                "cycle_index": cycle_idx + 1,
+                "total_cycles_in_recording": len(open_activations),
+            })
 
         print(f"[BIDIRECTIONAL] Extracted {len(closed_activations)} CLOSED, {len(open_activations)} OPEN activations")
         print(f"  Protocol mode: {protocol_mode}")

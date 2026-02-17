@@ -13,7 +13,7 @@ from mindmove.model.core.features.features_registry import FEATURES
 from mindmove.model.core.features import *
 from mindmove.model.core.windowing import sliding_window
 from mindmove.model.core.filtering import apply_rtfiltering
-from mindmove.model.core.algorithm import compute_distance_from_training_set_online
+from mindmove.model.core.algorithm import compute_distance_from_training_set_online, compute_spatial_similarity
 
 if TYPE_CHECKING:
     pass
@@ -37,6 +37,9 @@ class Model:
         # dead_channels stored as 0-indexed (index 0-31 for 32 channels)
         self.dead_channels = config.dead_channels
         self.active_channels = config.active_channels  # List of active channel indices (0-indexed)
+        # Per-class channels (default: same as global)
+        self.active_channels_open = config.active_channels
+        self.active_channels_closed = config.active_channels
 
         # buffer configuration (1 second buffer with sliding window)
         self.buffer_length_s = config.template_duration  # Length of the buffer sliding window in seconds
@@ -122,6 +125,13 @@ class Model:
         self.mean_cross = None
         self.std_cross = None
         self.threshold_presets = None  # dict of preset_key -> {s_open, s_closed, threshold_open, threshold_closed, name, description}
+
+        # Spatial correction (consistency-weighted spatial match)
+        self.use_spatial_correction = False  # Toggled from UI
+        self.spatial_threshold = 0.5  # Default threshold for spatial similarity
+        self.spatial_ref_open = None  # dict: ref_profile, weights, consistency
+        self.spatial_ref_closed = None  # dict: ref_profile, weights, consistency
+        self.spatial_similarity_history = []  # (timestamp, sim_open, sim_closed)
 
 
 
@@ -214,8 +224,7 @@ class Model:
 
         self.templates_open = data["open_templates"]
         self.templates_closed = data["closed_templates"]
-        # Thresholds are now correctly computed as mean + s*std (s=1 by default)
-        # Use a configurable multiplier for tuning if needed
+        # Thresholds loaded directly (may be mid-gap or mean+s*std depending on model)
         threshold_multiplier = data.get("threshold_multiplier", 1.0)
         self.THRESHOLD_OPEN = data["threshold_base_open"] * threshold_multiplier
         self.mean_open = data["mean_open"]
@@ -223,6 +232,11 @@ class Model:
         self.THRESHOLD_CLOSED = data["threshold_base_closed"] * threshold_multiplier
         self.mean_closed = data["mean_closed"]
         self.std_closed = data["std_closed"]
+        # Derive s values from loaded thresholds for slider consistency
+        self.s_open = ((self.THRESHOLD_OPEN - self.mean_open) / self.std_open
+                       if self.std_open > 0 else 1.0)
+        self.s_closed = ((self.THRESHOLD_CLOSED - self.mean_closed) / self.std_closed
+                         if self.std_closed > 0 else 1.0)
         self.feature_name = data["feature_name"]
 
         # Load new model settings (with defaults for backwards compatibility)
@@ -242,6 +256,19 @@ class Model:
         # Compute active channels from dead channels, ensuring they don't exceed num_channels
         valid_dead = [ch for ch in self.dead_channels if ch < self.num_channels]
         self.active_channels = [i for i in range(self.num_channels) if i not in valid_dead]
+
+        # Per-class active channels (spatial separation)
+        self.active_channels_open = data.get("active_channels_open", None)
+        self.active_channels_closed = data.get("active_channels_closed", None)
+        if self.active_channels_open is None or self.active_channels_closed is None:
+            # Backward compat: use global active_channels for both
+            self.active_channels_open = self.active_channels
+            self.active_channels_closed = self.active_channels
+            print(f"  - Channel mode: Global ({len(self.active_channels)} channels)")
+        else:
+            print(f"  - Channel mode: Per-class")
+            print(f"    CLOSED channels (0-indexed): {self.active_channels_closed}")
+            print(f"    OPEN channels (0-indexed): {self.active_channels_open}")
 
         # Reinitialize buffer with correct channel count
         self.emg_rt_buffer = np.zeros((self.num_channels, self.buffer_length))
@@ -272,12 +299,35 @@ class Model:
         self.std_cross = data.get("std_cross", None)
         self.threshold_presets = data.get("threshold_presets", None)
 
+        # Spatial correction profiles (consistency-weighted spatial match)
+        spatial_data = data.get("spatial_profiles", None)
+        if spatial_data is not None:
+            self.spatial_ref_open = spatial_data.get("open", None)
+            self.spatial_ref_closed = spatial_data.get("closed", None)
+            self.spatial_threshold = spatial_data.get("threshold", 0.5)
+            print(f"  - Spatial correction: available (threshold={self.spatial_threshold:.2f})")
+        else:
+            self.spatial_ref_open = None
+            self.spatial_ref_closed = None
+            print(f"  - Spatial correction: not available (legacy model)")
+
+        # Differential mode: load from model or infer from channel count
+        self.differential_mode = data.get("differential_mode", None)
+        if self.differential_mode is None:
+            # Infer from detected channel count (templates already set self.num_channels above)
+            self.differential_mode = self.num_channels <= 16
+            print(f"  - Differential mode (inferred from {self.num_channels} channels): "
+                  f"{'SD' if self.differential_mode else 'MP'}")
+        else:
+            print(f"  - Differential mode (from model): "
+                  f"{'SD' if self.differential_mode else 'MP'}")
+
         # pass
         print(f"Model loaded from: {model_path}")
         print(f"  - OPEN templates: {len(self.templates_open)}")
         print(f"  - CLOSED templates: {len(self.templates_closed)}")
-        print(f"  - OPEN threshold: {self.THRESHOLD_OPEN:.4f}")
-        print(f"  - CLOSED threshold: {self.THRESHOLD_CLOSED:.4f}")
+        print(f"  - OPEN threshold (mid-gap): {self.THRESHOLD_OPEN:.4f}  (s={self.s_open:.2f})")
+        print(f"  - CLOSED threshold (mid-gap): {self.THRESHOLD_CLOSED:.4f}  (s={self.s_closed:.2f})")
         print(f"  - Feature: {self.feature_name}")
         print(f"  - Dead channels (0-indexed): {self.dead_channels}")
         print(f"  - Active channels: {len(self.active_channels)}")
@@ -444,6 +494,7 @@ class Model:
         self.last_dtw_time = time.time()
         self.last_state_change_time = 0.0  # Reset refractory timer
         self.in_refractory = False
+        self.spatial_similarity_history = []
         print("[MODEL] History reset for new session")
 
     def set_refractory_period(self, period_s: float) -> None:
@@ -486,9 +537,20 @@ class Model:
         D_closed = [h[2] for h in self.distance_history]  # None when state was CLOSED
         states = [h[3] for h in self.distance_history]
 
+        # Per-step thresholds (backwards compatible: old entries may have only 4 elements)
+        thresholds_open_over_time = [h[4] if len(h) > 4 else self.THRESHOLD_OPEN for h in self.distance_history]
+        thresholds_closed_over_time = [h[5] if len(h) > 5 else self.THRESHOLD_CLOSED for h in self.distance_history]
+
         # Normalize timestamps to start from 0
         t0 = timestamps[0] if timestamps else 0
         timestamps = [t - t0 for t in timestamps]
+
+        # Build spatial similarity arrays (aligned with distance_history timestamps)
+        spatial_sim_open = None
+        spatial_sim_closed = None
+        if self.spatial_similarity_history:
+            spatial_sim_open = [h[1] for h in self.spatial_similarity_history]
+            spatial_sim_closed = [h[2] for h in self.spatial_similarity_history]
 
         return {
             "timestamps": timestamps,
@@ -497,6 +559,8 @@ class Model:
             "states": states,
             "threshold_open": self.THRESHOLD_OPEN,
             "threshold_closed": self.THRESHOLD_CLOSED,
+            "thresholds_open_over_time": thresholds_open_over_time,
+            "thresholds_closed_over_time": thresholds_closed_over_time,
             "mean_open": getattr(self, 'mean_open', None),
             "std_open": getattr(self, 'std_open', None),
             "mean_closed": getattr(self, 'mean_closed', None),
@@ -504,6 +568,9 @@ class Model:
             "s_open": self.s_open,
             "s_closed": self.s_closed,
             "state_transitions": self.state_transitions,
+            "spatial_sim_open": spatial_sim_open,
+            "spatial_sim_closed": spatial_sim_closed,
+            "spatial_threshold": self.spatial_threshold if self.use_spatial_correction else None,
         }
 
     def predict(self, x: Any) -> List[float]:
@@ -558,7 +625,7 @@ class Model:
             D_closed, all_distances_closed = compute_distance_from_training_set_online(
                 features_emg_buffer,
                 self.templates_closed,
-                active_channels=self.active_channels,
+                active_channels=self.active_channels_closed,
                 distance_aggregation=self.distance_aggregation,
                 return_all_distances=True
             )
@@ -568,8 +635,8 @@ class Model:
                 triggered_state = "OPEN"
 
             self.dtw_distances.append(("closed", D_closed, self.THRESHOLD_CLOSED))
-            # Store in history: (timestamp, D_open=None, D_closed, state)
-            self.distance_history.append((timestamp, None, D_closed, self.current_state))
+            # Store in history: (timestamp, D_open=None, D_closed, state, threshold_open, threshold_closed)
+            self.distance_history.append((timestamp, None, D_closed, self.current_state, self.THRESHOLD_OPEN, self.THRESHOLD_CLOSED))
             self._last_distance = D_closed
             self._last_threshold = self.THRESHOLD_CLOSED
             self._last_all_distances = all_distances_closed
@@ -580,7 +647,7 @@ class Model:
             D_open, all_distances_open = compute_distance_from_training_set_online(
                 features_emg_buffer,
                 self.templates_open,
-                active_channels=self.active_channels,
+                active_channels=self.active_channels_open,
                 distance_aggregation=self.distance_aggregation,
                 return_all_distances=True
             )
@@ -590,14 +657,42 @@ class Model:
                 triggered_state = "CLOSED"
 
             self.dtw_distances.append(("open", D_open, self.THRESHOLD_OPEN))
-            # Store in history: (timestamp, D_open, D_closed=None, state)
-            self.distance_history.append((timestamp, D_open, None, self.current_state))
+            # Store in history: (timestamp, D_open, D_closed=None, state, threshold_open, threshold_closed)
+            self.distance_history.append((timestamp, D_open, None, self.current_state, self.THRESHOLD_OPEN, self.THRESHOLD_CLOSED))
             self._last_distance = D_open
             self._last_threshold = self.THRESHOLD_OPEN
             self._last_all_distances = all_distances_open
             self._last_template_class = "OPEN"
 
         dtw_time_ms = (time.perf_counter() - dtw_start) * 1000
+
+        # --- Spatial similarity computation (every tick, independent of DTW decision) ---
+        sim_open = None
+        sim_closed = None
+        spatial_blocked = False
+
+        if self.use_spatial_correction and self.spatial_ref_open is not None and self.spatial_ref_closed is not None:
+            if self.current_state == "OPEN":
+                # Checking transition to CLOSED — compute similarity to CLOSED reference
+                sim_closed = compute_spatial_similarity(
+                    emg_buffer, self.spatial_ref_closed["ref_profile"], self.spatial_ref_closed["weights"]
+                )
+                if triggered_state == "CLOSED" and sim_closed < self.spatial_threshold:
+                    spatial_blocked = True
+                    triggered_state = "OPEN"  # Block transition
+            elif self.current_state == "CLOSED":
+                # Checking transition to OPEN — compute similarity to OPEN reference
+                sim_open = compute_spatial_similarity(
+                    emg_buffer, self.spatial_ref_open["ref_profile"], self.spatial_ref_open["weights"]
+                )
+                if triggered_state == "OPEN" and sim_open < self.spatial_threshold:
+                    spatial_blocked = True
+                    triggered_state = "CLOSED"  # Block transition
+
+            self.spatial_similarity_history.append((timestamp, sim_open, sim_closed))
+            # Keep bounded
+            if len(self.spatial_similarity_history) > 10000:
+                self.spatial_similarity_history = self.spatial_similarity_history[-5000:]
 
         # State machine logic
 
@@ -687,11 +782,15 @@ class Model:
                 print(f"\n{'='*50}")
                 print(f"  >>> HAND OPENED <<<  [{time_str}]")
                 print(f"  Distance: {self._last_distance:.4f} < Threshold: {self._last_threshold:.4f}")
+                if self.use_spatial_correction and sim_open is not None:
+                    print(f"  Spatial sim (OPEN): {sim_open:.4f} >= {self.spatial_threshold:.4f}")
                 print(f"  Refractory: {self.refractory_period_s:.1f}s")
             else:
                 print(f"\n{'='*50}")
                 print(f"  >>> HAND CLOSED <<<  [{time_str}]")
                 print(f"  Distance: {self._last_distance:.4f} < Threshold: {self._last_threshold:.4f}")
+                if self.use_spatial_correction and sim_closed is not None:
+                    print(f"  Spatial sim (CLOSED): {sim_closed:.4f} >= {self.spatial_threshold:.4f}")
                 print(f"  Refractory: {self.refractory_period_s:.1f}s")
 
             # Print top 10 closest templates
@@ -702,6 +801,13 @@ class Model:
                 for rank, idx in enumerate(sorted_idx[:n_show], 1):
                     print(f"    {rank:2d}. Template {idx+1:2d}: {self._last_all_distances[idx]:.4f}")
             print(f"{'='*50}\n")
+
+        # Print when spatial correction blocks a transition
+        if spatial_blocked:
+            target_class = "CLOSED" if self.current_state == "OPEN" else "OPEN"
+            sim_val = sim_closed if target_class == "CLOSED" else sim_open
+            print(f"[SPATIAL] Blocked {target_class} transition: "
+                  f"sim={sim_val:.4f} < {self.spatial_threshold:.4f}")
 
         # Update timing stats
         total_time_ms = (time.perf_counter() - computation_start) * 1000
@@ -735,7 +841,12 @@ class Model:
         # Print status every 40 computations (every ~2 seconds)
         if self.dtw_count % 40 == 0:
             elapsed_s = self.dtw_count * 0.05
-            print(f"[{elapsed_s:5.1f}s] {self.current_state:6s} | D={self._last_distance:.4f} T={self._last_threshold:.4f}")
+            spatial_str = ""
+            if self.use_spatial_correction:
+                sim_val = sim_closed if sim_closed is not None else sim_open
+                if sim_val is not None:
+                    spatial_str = f" | S={sim_val:.4f}"
+            print(f"[{elapsed_s:5.1f}s] {self.current_state:6s} | D={self._last_distance:.4f} T={self._last_threshold:.4f}{spatial_str}")
 
         # Print timing summary every 100 computations (every ~5 seconds)
         if self.dtw_count % 100 == 0:

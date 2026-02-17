@@ -241,6 +241,85 @@ def compute_dtw(t1, t2, active_channels=None):
         return dtw(t1, t2, active_channels=active_channels)
 
 
+def compute_dtw_multivariate(feature_arrays_1, feature_arrays_2, active_channels=None):
+    """Multivariate DTW: one shared warping path, per-feature cosine distances.
+
+    Computes DTW using the sum of cosine distances across multiple features
+    at each cell, then decomposes the total cost into per-feature contributions
+    along the optimal path.
+
+    Args:
+        feature_arrays_1: list of np.ndarray, each (n_windows, n_ch) — one per feature
+        feature_arrays_2: list of np.ndarray, each (n_windows, n_ch) — same features
+        active_channels: list of active channel indices (0-indexed). If None, uses config.active_channels
+
+    Returns:
+        dict with:
+            'total': float — total DTW distance (sum of all feature contributions)
+            'per_feature': list of float — DTW cost contribution per feature along optimal path
+    """
+    if active_channels is None:
+        active_channels = config.active_channels
+    active_channels = np.array(active_channels)
+
+    n_features = len(feature_arrays_1)
+    N = feature_arrays_1[0].shape[0]
+    M = feature_arrays_2[0].shape[0]
+
+    # Build cost matrix: sum of cosine distances across features
+    cost_mat = np.full((N + 1, M + 1), np.inf)
+    cost_mat[0, 0] = 0.0
+
+    # Per-feature distance at each cell (for decomposition along path)
+    feat_dist = np.zeros((N, M, n_features))
+
+    for i in range(1, N + 1):
+        for j in range(1, M + 1):
+            cell_cost = 0.0
+            for f in range(n_features):
+                v1 = feature_arrays_1[f][i - 1, active_channels]
+                v2 = feature_arrays_2[f][j - 1, active_channels]
+                dot = np.dot(v1, v2)
+                n1 = np.linalg.norm(v1)
+                n2 = np.linalg.norm(v2)
+                d = 1.0 - dot / (n1 * n2 + 1e-8)
+                feat_dist[i - 1, j - 1, f] = d
+                cell_cost += d
+
+            penalty = min(cost_mat[i - 1, j - 1], cost_mat[i - 1, j], cost_mat[i, j - 1])
+            cost_mat[i, j] = cell_cost + penalty
+
+    total = cost_mat[N, M]
+
+    # Traceback optimal path to decompose per-feature costs
+    path = []
+    i, j = N - 1, M - 1
+    path.append((i, j))
+    while i > 0 or j > 0:
+        if i == 0:
+            j -= 1
+        elif j == 0:
+            i -= 1
+        else:
+            candidates = [
+                (cost_mat[i, j], i - 1, j - 1),      # match
+                (cost_mat[i, j + 1], i - 1, j),       # insertion
+                (cost_mat[i + 1, j], i, j - 1),       # deletion
+            ]
+            _, i, j = min(candidates, key=lambda x: x[0])
+        path.append((i, j))
+
+    # Sum per-feature distances along path
+    per_feature = np.zeros(n_features)
+    for (pi, pj) in path:
+        per_feature += feat_dist[pi, pj, :]
+
+    return {
+        'total': total,
+        'per_feature': per_feature.tolist(),
+    }
+
+
 def compute_threshold(templates, s=1, active_channels=None, verbose=False):
     """
     Compute threshold from template inter-distances.
@@ -297,6 +376,166 @@ def tune_thresholds(mean_distance, std_distance, s=1):
     """
     threshold = mean_distance + s*std_distance
     return threshold
+
+
+def compute_threshold_with_aggregation(
+    templates,
+    active_channels=None,
+    distance_aggregation="avg_3_smallest",
+    verbose=False,
+):
+    """
+    Compute intra-class threshold using per-template distance aggregation.
+
+    Matches the methodology used in Template Study: for each template, compute
+    distances to all other same-class templates, aggregate (e.g. avg_3_smallest),
+    then compute mean/std of those aggregated values. This produces statistics
+    consistent with online prediction's distance aggregation.
+
+    Parameters
+    ----------
+    templates : list of np.ndarray
+        List of feature-extracted templates (n_windows x n_channels).
+    active_channels : list or None
+        Active channel indices (0-indexed). If None, uses config.active_channels.
+    distance_aggregation : str
+        "avg_3_smallest", "minimum", or "average".
+    verbose : bool
+        If True, print per-template aggregated distances.
+
+    Returns
+    -------
+    mean_distance : float
+    std_distance : float
+    threshold : float (mean + 1*std, for compatibility)
+    """
+    n = len(templates)
+    if n < 2:
+        return 0.0, 0.0, 0.0
+
+    # Build distance matrix
+    dist_matrix = np.zeros((n, n))
+    for i in range(n):
+        for j in range(i + 1, n):
+            d = compute_dtw(templates[i], templates[j], active_channels=active_channels)
+            dist_matrix[i, j] = d
+            dist_matrix[j, i] = d
+
+    def _aggregate(distances):
+        if len(distances) == 0:
+            return 0.0
+        if distance_aggregation == "minimum":
+            return np.min(distances)
+        elif distance_aggregation == "avg_3_smallest":
+            n_smallest = min(3, len(distances))
+            return np.mean(np.sort(distances)[:n_smallest])
+        else:  # "average"
+            return np.mean(distances)
+
+    # For each template, aggregate distances to all other same-class templates
+    per_template = []
+    for i in range(n):
+        others = [j for j in range(n) if j != i]
+        dists = np.array([dist_matrix[i, j] for j in others])
+        agg = _aggregate(dists)
+        per_template.append(agg)
+        if verbose:
+            print(f"  Template {i+1}: aggregated distance = {agg:.4f}")
+
+    per_template = np.array(per_template)
+    mean_distance = float(np.mean(per_template))
+    std_distance = float(np.std(per_template))
+    threshold = mean_distance + 1.0 * std_distance
+
+    return mean_distance, std_distance, threshold
+
+
+def compute_cross_class_distances_with_aggregation(
+    templates_class_a,
+    templates_class_b,
+    active_channels=None,
+    distance_aggregation="avg_3_smallest",
+):
+    """
+    Compute cross-class distances using per-template aggregation.
+
+    For each template in class A, compute distances to ALL templates in class B,
+    aggregate (e.g. avg_3_smallest), producing one value per template.
+    Returns both directional stats (A→B, B→A) separately, matching
+    Template Study's inter_closed_to_open / inter_open_to_closed.
+
+    Parameters
+    ----------
+    templates_class_a : list of np.ndarray
+        Templates from first class (e.g., OPEN).
+    templates_class_b : list of np.ndarray
+        Templates from second class (e.g., CLOSED).
+    active_channels : list or None
+        Active channel indices. If None, uses config.active_channels.
+    distance_aggregation : str
+        "avg_3_smallest", "minimum", or "average".
+
+    Returns
+    -------
+    dict with keys:
+        "a_to_b": {"mean": float, "std": float, "per_template": np.ndarray}
+        "b_to_a": {"mean": float, "std": float, "per_template": np.ndarray}
+        "combined_mean": float (mean of all directional aggregated values)
+        "combined_std": float
+    """
+    n_a = len(templates_class_a)
+    n_b = len(templates_class_b)
+
+    # Build cross-class distance matrix (n_a x n_b)
+    cross_matrix = np.zeros((n_a, n_b))
+    for i in range(n_a):
+        for j in range(n_b):
+            cross_matrix[i, j] = compute_dtw(
+                templates_class_a[i], templates_class_b[j],
+                active_channels=active_channels
+            )
+
+    def _aggregate(distances):
+        if len(distances) == 0:
+            return 0.0
+        if distance_aggregation == "minimum":
+            return np.min(distances)
+        elif distance_aggregation == "avg_3_smallest":
+            n_smallest = min(3, len(distances))
+            return np.mean(np.sort(distances)[:n_smallest])
+        else:  # "average"
+            return np.mean(distances)
+
+    # A→B: for each template in A, aggregate distances to all B templates
+    per_template_a_to_b = []
+    for i in range(n_a):
+        dists = cross_matrix[i, :]
+        per_template_a_to_b.append(_aggregate(dists))
+    per_template_a_to_b = np.array(per_template_a_to_b)
+
+    # B→A: for each template in B, aggregate distances to all A templates
+    per_template_b_to_a = []
+    for j in range(n_b):
+        dists = cross_matrix[:, j]
+        per_template_b_to_a.append(_aggregate(dists))
+    per_template_b_to_a = np.array(per_template_b_to_a)
+
+    all_aggregated = np.concatenate([per_template_a_to_b, per_template_b_to_a])
+
+    return {
+        "a_to_b": {
+            "mean": float(np.mean(per_template_a_to_b)),
+            "std": float(np.std(per_template_a_to_b)),
+            "per_template": per_template_a_to_b,
+        },
+        "b_to_a": {
+            "mean": float(np.mean(per_template_b_to_a)),
+            "std": float(np.std(per_template_b_to_a)),
+            "per_template": per_template_b_to_a,
+        },
+        "combined_mean": float(np.mean(all_aggregated)),
+        "combined_std": float(np.std(all_aggregated)),
+    }
 
 
 def compute_cross_class_distances(templates_class_a, templates_class_b, active_channels=None):
@@ -373,18 +612,29 @@ def compute_threshold_presets(mean_intra, std_intra, mean_cross, std_cross):
     """
     presets = {}
 
-    # 1. Current (Intra-class): Standard method, s=1
+    # 1. Mid-Gap (Default): Midpoint between intra upper tail and inter lower tail
+    # threshold = ((mean_intra + std_intra) + (mean_cross - std_cross)) / 2
+    threshold_midgap = ((mean_intra + std_intra) + (mean_cross - std_cross)) / 2
+    s_midgap = (threshold_midgap - mean_intra) / std_intra if std_intra > 0 else 1.0
+    presets["mid_gap"] = {
+        "threshold": threshold_midgap,
+        "s": s_midgap,
+        "name": "Mid-Gap (Default)",
+        "description": "Midpoint between intra+std and inter-std (center of gap)"
+    }
+
+    # 2. Intra-class: Standard method, s=1
     # threshold = mean_intra + 1 * std_intra
     threshold_current = mean_intra + 1.0 * std_intra
     s_current = 1.0
     presets["current"] = {
         "threshold": threshold_current,
         "s": s_current,
-        "name": "Current (Intra-class)",
+        "name": "Intra-class (mean+std)",
         "description": "Standard method: mean + 1*std within class"
     }
 
-    # 2. Cross-class Validation: Midpoint between intra and cross-class means
+    # 3. Cross-class Validation: Midpoint between intra and cross-class means
     # This gives equal weight to both within-class consistency and between-class separation
     threshold_cross = (mean_intra + mean_cross) / 2
     # Compute equivalent s value: threshold = mean_intra + s*std_intra
@@ -674,6 +924,8 @@ def compute_calibration_distances(
     dtw_interval_s: float = 0.05,
     active_channels: list = None,
     distance_aggregation: str = "average",
+    active_channels_open: list = None,
+    active_channels_closed: list = None,
 ):
     """
     Compute continuous DTW distances over a recording for offline calibration.
@@ -703,8 +955,13 @@ def compute_calibration_distances(
         Interval between DTW computations in seconds (default 0.05 = 50ms).
     active_channels : list or None
         Active channel indices. If None, uses config.active_channels.
+        Used for both classes unless per-class channels are specified.
     distance_aggregation : str
         Method for aggregating distances ("average", "minimum", "avg_3_smallest").
+    active_channels_open : list or None
+        Per-class active channels for OPEN distance. Overrides active_channels for OPEN.
+    active_channels_closed : list or None
+        Per-class active channels for CLOSED distance. Overrides active_channels for CLOSED.
 
     Returns
     -------
@@ -755,15 +1012,18 @@ def compute_calibration_distances(
         windowed = sliding_window(emg_buffer, window_length, increment)
         features = feature_fn(windowed)
 
-        # Compute DTW to both template sets
+        # Compute DTW to both template sets (use per-class channels if specified)
+        ch_open = active_channels_open if active_channels_open is not None else active_channels
+        ch_closed = active_channels_closed if active_channels_closed is not None else active_channels
+
         D_open = compute_distance_from_training_set_online(
             features, templates_open,
-            active_channels=active_channels,
+            active_channels=ch_open,
             distance_aggregation=distance_aggregation
         )
         D_closed = compute_distance_from_training_set_online(
             features, templates_closed,
-            active_channels=active_channels,
+            active_channels=ch_closed,
             distance_aggregation=distance_aggregation
         )
 
@@ -1001,3 +1261,114 @@ def find_transition_based_thresholds(
         "n_opening_transitions": len(opening_transitions),
         "n_closing_transitions": len(closing_transitions),
     }
+
+
+def compute_spatial_profiles(
+    templates_raw: list,
+    class_label: str = "",
+) -> dict:
+    """
+    Compute per-class spatial reference profile and consistency weights from raw templates.
+
+    For each template, takes the second half (the active portion after onset) and
+    computes RMS per channel. Then across all templates:
+    - ref_profile: mean per-channel RMS (the average spatial shape)
+    - consistency: mean/std per channel (channels that fire reliably get high weight)
+    - weights: consistency normalized to sum to 1
+
+    Args:
+        templates_raw: List of raw EMG templates, each shape (n_channels, n_samples)
+        class_label: Label for printing ("open" or "closed")
+
+    Returns:
+        Dict with:
+            - "ref_profile": np.ndarray (n_channels,) — mean RMS per channel
+            - "weights": np.ndarray (n_channels,) — normalized consistency weights
+            - "consistency": np.ndarray (n_channels,) — raw consistency (mean/std)
+            - "per_template_rms": np.ndarray (n_templates, n_channels)
+    """
+    if not templates_raw:
+        return None
+
+    n_ch = templates_raw[0].shape[0]
+    n_templates = len(templates_raw)
+
+    # Compute per-channel RMS from second half of each template
+    per_template_rms = np.zeros((n_templates, n_ch))
+    for i, template in enumerate(templates_raw):
+        n_samples = template.shape[1]
+        half = n_samples // 2
+        second_half = template[:, half:]  # (n_ch, n_samples/2)
+        per_template_rms[i] = np.sqrt(np.mean(second_half ** 2, axis=1))
+
+    # Mean and std across templates for each channel
+    mean_rms = np.mean(per_template_rms, axis=0)  # (n_ch,)
+    std_rms = np.std(per_template_rms, axis=0)     # (n_ch,)
+
+    # Consistency = mean / std (like SNR: high = reliable)
+    epsilon = 1e-10
+    consistency = mean_rms / (std_rms + epsilon)
+
+    # Normalize weights to sum to 1
+    weights = consistency / (np.sum(consistency) + epsilon)
+
+    if class_label:
+        print(f"\n[SPATIAL] {class_label.upper()} reference profile ({n_templates} templates):")
+        # Show top 5 most consistent channels
+        sorted_idx = np.argsort(consistency)[::-1]
+        for rank, ch in enumerate(sorted_idx[:5], 1):
+            print(f"  {rank}. CH{ch+1}: mean_rms={mean_rms[ch]:.4f}, "
+                  f"consistency={consistency[ch]:.2f}, weight={weights[ch]:.4f}")
+
+    return {
+        "ref_profile": mean_rms,
+        "weights": weights,
+        "consistency": consistency,
+        "per_template_rms": per_template_rms,
+    }
+
+
+def compute_spatial_similarity(
+    emg_buffer: np.ndarray,
+    ref_profile: np.ndarray,
+    weights: np.ndarray,
+) -> float:
+    """
+    Compute weighted cosine similarity between current EMG spatial pattern
+    and a class reference profile.
+
+    Args:
+        emg_buffer: Current EMG buffer, shape (n_channels, n_samples)
+        ref_profile: Reference spatial profile (mean RMS per channel), shape (n_channels,)
+        weights: Consistency weights per channel, shape (n_channels,)
+
+    Returns:
+        Weighted cosine similarity (0 to 1, higher = better match)
+    """
+    # Compute per-channel RMS of current buffer
+    current_rms = np.sqrt(np.mean(emg_buffer ** 2, axis=1))  # (n_ch,)
+
+    # Normalize both to unit vectors
+    current_norm = np.linalg.norm(current_rms)
+    ref_norm = np.linalg.norm(ref_profile)
+
+    if current_norm < 1e-10 or ref_norm < 1e-10:
+        return 0.0  # No signal or no reference
+
+    current_unit = current_rms / current_norm
+    ref_unit = ref_profile / ref_norm
+
+    # Weighted cosine similarity
+    # Weight each channel's contribution by its consistency
+    weighted_dot = np.sum(weights * current_unit * ref_unit)
+
+    # Normalize by sqrt of weighted norms to keep in [0, 1] range
+    weighted_norm_current = np.sqrt(np.sum(weights * current_unit ** 2))
+    weighted_norm_ref = np.sqrt(np.sum(weights * ref_unit ** 2))
+
+    if weighted_norm_current < 1e-10 or weighted_norm_ref < 1e-10:
+        return 0.0
+
+    similarity = weighted_dot / (weighted_norm_current * weighted_norm_ref)
+
+    return float(np.clip(similarity, 0.0, 1.0))
