@@ -571,6 +571,28 @@ def simulate_realtime_dtw(
                             triggered_state = "CLOSED" if D_closed_corr < threshold_closed else "OPEN"
                         else:
                             triggered_state = "OPEN" if D_open_corr < threshold_open else "CLOSED"
+                    elif spatial_mode in ("relu_ext_scaling", "relu_ext_contrast"):
+                        # Extended ReLU: f_ext > 1 above threshold (reward for high similarity)
+                        b = spatial_relu_baseline
+                        t = max(spatial_threshold, 1e-6)
+                        k = max(spatial_sharpness, 0.1)
+                        def _f_ext(s):
+                            if s >= t:
+                                rt = (s - t) / max(1.0 - t, 1e-6)
+                                return (1.0 / b) ** (rt ** (1.0 / k))
+                            return b ** ((1.0 - s / t) ** (1.0 / k))
+                        f_c = _f_ext(sim_closed_val)
+                        f_o = _f_ext(sim_open_val)
+                        if spatial_mode == "relu_ext_scaling":
+                            D_closed_corr = D_closed / max(f_c, 0.01)
+                            D_open_corr   = D_open   / max(f_o, 0.01)
+                        else:  # relu_ext_contrast
+                            D_closed_corr = D_closed * f_o / max(f_c, 0.01)
+                            D_open_corr   = D_open   * f_c / max(f_o, 0.01)
+                        if current_state == "OPEN":
+                            triggered_state = "CLOSED" if D_closed_corr < threshold_closed else "OPEN"
+                        else:
+                            triggered_state = "OPEN" if D_open_corr < threshold_open else "CLOSED"
 
             sim_open_list.append(sim_open_val)
             sim_closed_list.append(sim_closed_val)

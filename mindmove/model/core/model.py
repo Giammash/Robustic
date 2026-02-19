@@ -132,7 +132,7 @@ class Model:
         self.spatial_mode = "off"  # "off", "gate", "scaling", "contrast"
         self.spatial_threshold = 0.5  # Default threshold for gate/relu_scaling modes
         self.spatial_sharpness = 3.0  # Exponent k for scaling/contrast modes
-        self.spatial_relu_baseline = 0.2  # Baseline b for relu_scaling: f(0)=b, f(threshold)=1
+        self.spatial_relu_baseline = 0.3  # Baseline b for relu_scaling: f(0)=b, f(threshold)=1
         self.spatial_ref_open = None  # dict: ref_profile, weights, consistency
         self.spatial_ref_closed = None  # dict: ref_profile, weights, consistency
         self.spatial_similarity_history = []  # (timestamp, sim_open, sim_closed)
@@ -798,7 +798,7 @@ class Model:
 
             # --- Spatial correction (threshold mode only) ---
             if self.spatial_mode != "off" and self.spatial_ref_open is not None and self.spatial_ref_closed is not None:
-                need_both = (self.spatial_mode in ("contrast", "relu_contrast"))
+                need_both = (self.spatial_mode in ("contrast", "relu_contrast", "relu_ext_contrast"))
 
                 if self.current_state == "OPEN":
                     sim_closed = self._spatial_sim(emg_buffer, self.spatial_ref_closed)
@@ -836,12 +836,43 @@ class Model:
                             triggered_state = "CLOSED"
                     elif self.spatial_mode == "relu_contrast":
                         # D * f(sim_current) / f(sim_target)
-                        # f saturates at 1 above threshold → no penalty/reward for high sims
+                        # f saturates at 1 above threshold → no penalty for high sims
                         b = self.spatial_relu_baseline
                         t = max(self.spatial_threshold, 1e-6)
                         k = max(self.spatial_sharpness, 0.1)
-                        def _f(s): return 1.0 if s >= t else b ** ((1.0 - s / t) ** (1.0 / k))
+                        def _f(s):
+                            return 1.0 if s >= t else b ** ((1.0 - s / t) ** (1.0 / k))
                         D_corrected = D_closed * _f(sim_open) / max(_f(sim_closed), 0.01)
+                        if D_corrected >= self.THRESHOLD_CLOSED:
+                            triggered_state = "OPEN"
+                        elif D_corrected < self.THRESHOLD_CLOSED:
+                            triggered_state = "CLOSED"
+                    elif self.spatial_mode == "relu_ext_scaling":
+                        # D / f_ext(sim_target); f_ext > 1 above threshold (reward for high sim)
+                        b = self.spatial_relu_baseline
+                        t = max(self.spatial_threshold, 1e-6)
+                        k = max(self.spatial_sharpness, 0.1)
+                        def _f_ext(s):
+                            if s >= t:
+                                rt = (s - t) / max(1.0 - t, 1e-6)
+                                return (1.0 / b) ** (rt ** (1.0 / k))
+                            return b ** ((1.0 - s / t) ** (1.0 / k))
+                        D_corrected = D_closed / max(_f_ext(sim_closed), 0.01)
+                        if D_corrected >= self.THRESHOLD_CLOSED:
+                            triggered_state = "OPEN"
+                        elif D_corrected < self.THRESHOLD_CLOSED:
+                            triggered_state = "CLOSED"
+                    elif self.spatial_mode == "relu_ext_contrast":
+                        # D * f_ext(sim_current) / f_ext(sim_target); f_ext > 1 above threshold
+                        b = self.spatial_relu_baseline
+                        t = max(self.spatial_threshold, 1e-6)
+                        k = max(self.spatial_sharpness, 0.1)
+                        def _f_ext(s):
+                            if s >= t:
+                                rt = (s - t) / max(1.0 - t, 1e-6)
+                                return (1.0 / b) ** (rt ** (1.0 / k))
+                            return b ** ((1.0 - s / t) ** (1.0 / k))
+                        D_corrected = D_closed * _f_ext(sim_open) / max(_f_ext(sim_closed), 0.01)
                         if D_corrected >= self.THRESHOLD_CLOSED:
                             triggered_state = "OPEN"
                         elif D_corrected < self.THRESHOLD_CLOSED:
@@ -881,11 +912,43 @@ class Model:
                         elif D_corrected < self.THRESHOLD_OPEN:
                             triggered_state = "OPEN"
                     elif self.spatial_mode == "relu_contrast":
+                        # f saturates at 1 above threshold → no penalty for high sims
                         b = self.spatial_relu_baseline
                         t = max(self.spatial_threshold, 1e-6)
                         k = max(self.spatial_sharpness, 0.1)
-                        def _f(s): return 1.0 if s >= t else b ** ((1.0 - s / t) ** (1.0 / k))
+                        def _f(s):
+                            return 1.0 if s >= t else b ** ((1.0 - s / t) ** (1.0 / k))
                         D_corrected = D_open * _f(sim_closed) / max(_f(sim_open), 0.01)
+                        if D_corrected >= self.THRESHOLD_OPEN:
+                            triggered_state = "CLOSED"
+                        elif D_corrected < self.THRESHOLD_OPEN:
+                            triggered_state = "OPEN"
+                    elif self.spatial_mode == "relu_ext_scaling":
+                        # D / f_ext(sim_target); f_ext > 1 above threshold (reward for high sim)
+                        b = self.spatial_relu_baseline
+                        t = max(self.spatial_threshold, 1e-6)
+                        k = max(self.spatial_sharpness, 0.1)
+                        def _f_ext(s):
+                            if s >= t:
+                                rt = (s - t) / max(1.0 - t, 1e-6)
+                                return (1.0 / b) ** (rt ** (1.0 / k))
+                            return b ** ((1.0 - s / t) ** (1.0 / k))
+                        D_corrected = D_open / max(_f_ext(sim_open), 0.01)
+                        if D_corrected >= self.THRESHOLD_OPEN:
+                            triggered_state = "CLOSED"
+                        elif D_corrected < self.THRESHOLD_OPEN:
+                            triggered_state = "OPEN"
+                    elif self.spatial_mode == "relu_ext_contrast":
+                        # D * f_ext(sim_current) / f_ext(sim_target); f_ext > 1 above threshold
+                        b = self.spatial_relu_baseline
+                        t = max(self.spatial_threshold, 1e-6)
+                        k = max(self.spatial_sharpness, 0.1)
+                        def _f_ext(s):
+                            if s >= t:
+                                rt = (s - t) / max(1.0 - t, 1e-6)
+                                return (1.0 / b) ** (rt ** (1.0 / k))
+                            return b ** ((1.0 - s / t) ** (1.0 / k))
+                        D_corrected = D_open * _f_ext(sim_closed) / max(_f_ext(sim_open), 0.01)
                         if D_corrected >= self.THRESHOLD_OPEN:
                             triggered_state = "CLOSED"
                         elif D_corrected < self.THRESHOLD_OPEN:
@@ -1012,6 +1075,7 @@ class Model:
                   f"sim={sim_val:.4f} < {self.spatial_threshold:.4f}")
 
         # Update timing stats
+        dtw_time_ms = (time.perf_counter() - dtw_start) * 1000
         total_time_ms = (time.perf_counter() - computation_start) * 1000
 
         # Store timing info for statistics

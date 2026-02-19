@@ -122,7 +122,7 @@ class SimulationWorker(QObject):
             print(f"  Aggregation: {distance_aggregation}")
             print(f"  Window/increment: {config.window_length}/{config.increment} samples")
             spatial_info = ""
-            if spatial_mode in ("gate", "relu_scaling", "relu_contrast"):
+            if spatial_mode in ("gate", "relu_scaling", "relu_contrast", "relu_ext_scaling", "relu_ext_contrast"):
                 spatial_info = f" (threshold={spatial_threshold:.2f}, b={spatial_relu_baseline:.2f}, k={spatial_sharpness:.1f})"
             elif spatial_mode in ("scaling", "contrast"):
                 spatial_info = f" (k={spatial_sharpness:.1f})"
@@ -1873,6 +1873,8 @@ class OnlineProtocol(QObject):
         self.spatial_mode_combo.addItem("Contrast", "contrast")
         self.spatial_mode_combo.addItem("ReLU Scaling", "relu_scaling")
         self.spatial_mode_combo.addItem("ReLU Contrast", "relu_contrast")
+        self.spatial_mode_combo.addItem("ReLU Scaling (ext)", "relu_ext_scaling")
+        self.spatial_mode_combo.addItem("ReLU Contrast (ext)", "relu_ext_contrast")
         self.spatial_mode_combo.setCurrentIndex(0)
         self.spatial_mode_combo.setToolTip(
             "Off: no spatial correction\n"
@@ -1880,8 +1882,9 @@ class OnlineProtocol(QObject):
             "Distance Scaling: D / sim^k — power-law penalty\n"
             "Contrast: D * (sim_current / sim_target)^k — ratio between classes\n"
             "ReLU Scaling: D / f(sim_target) — exponential penalty, saturates at 1 above threshold\n"
-            "ReLU Contrast: D * f(sim_current) / f(sim_target) — combines ratio reward/penalty "
-            "with ReLU saturation (best of both worlds)"
+            "ReLU Contrast: D * f(sim_current) / f(sim_target) — combines ratio with ReLU saturation\n"
+            "ReLU+ Scaling: like ReLU Scaling but f > 1 above threshold (rewards high similarity)\n"
+            "ReLU+ Contrast: like ReLU Contrast but f > 1 above threshold (amplifies ratio)"
         )
         self.spatial_mode_combo.currentIndexChanged.connect(self._on_spatial_mode_changed)
         row1.addWidget(self.spatial_mode_combo)
@@ -1948,7 +1951,7 @@ class OnlineProtocol(QObject):
         self.spatial_relu_baseline_spinbox.setMinimum(0.01)
         self.spatial_relu_baseline_spinbox.setMaximum(0.99)
         self.spatial_relu_baseline_spinbox.setSingleStep(0.05)
-        self.spatial_relu_baseline_spinbox.setValue(0.2)
+        self.spatial_relu_baseline_spinbox.setValue(0.3)
         self.spatial_relu_baseline_spinbox.setDecimals(2)
         self.spatial_relu_baseline_spinbox.setToolTip(
             "Minimum value of f(sim) at sim=0.\n"
@@ -2002,11 +2005,11 @@ class OnlineProtocol(QObject):
         mode = self.spatial_mode_combo.currentData()
 
         # Show/hide threshold slider (gate = block threshold; relu modes = saturation point)
-        self.spatial_threshold_row.setVisible(mode in ("gate", "relu_scaling", "relu_contrast"))
+        self.spatial_threshold_row.setVisible(mode in ("gate", "relu_scaling", "relu_contrast", "relu_ext_scaling", "relu_ext_contrast"))
         # Show/hide sharpness spinbox (power-law modes + relu modes)
-        self.spatial_sharpness_row.setVisible(mode in ("scaling", "contrast", "relu_scaling", "relu_contrast"))
+        self.spatial_sharpness_row.setVisible(mode in ("scaling", "contrast", "relu_scaling", "relu_contrast", "relu_ext_scaling", "relu_ext_contrast"))
         # Show/hide baseline spinbox (relu modes only)
-        self.spatial_relu_baseline_row.setVisible(mode in ("relu_scaling", "relu_contrast"))
+        self.spatial_relu_baseline_row.setVisible(mode in ("relu_scaling", "relu_contrast", "relu_ext_scaling", "relu_ext_contrast"))
 
         if self.model_interface.model is not None:
             model = self.model_interface.model
