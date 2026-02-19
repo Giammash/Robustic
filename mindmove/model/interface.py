@@ -186,10 +186,14 @@ class MindMoveInterface(QObject):
         if self.model and hasattr(self.model, 'set_threshold_closed_direct'):
             self.model.set_threshold_closed_direct(threshold)
 
-    def reset_history(self) -> None:
-        """Reset history buffers for new acquisition session."""
+    def reset_history(self, initial_state: str = None) -> None:
+        """Reset history buffers for new acquisition session.
+
+        Args:
+            initial_state: Starting state ("OPEN" or "CLOSED"). If None, keeps current state.
+        """
         if self.model and hasattr(self.model, 'reset_history'):
-            self.model.reset_history()
+            self.model.reset_history(initial_state=initial_state)
 
     def get_distance_history(self):
         """Get distance history for plotting."""

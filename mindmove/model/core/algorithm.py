@@ -1293,82 +1293,197 @@ def compute_spatial_profiles(
     n_ch = templates_raw[0].shape[0]
     n_templates = len(templates_raw)
 
-    # Compute per-channel RMS from second half of each template
-    per_template_rms = np.zeros((n_templates, n_ch))
+    # Compute per-channel RMS from second half of each template.
+    # Two normalizations are computed:
+    #   - L2-normalized (unit vector): used for computation — robust to single-channel
+    #     outliers, consistent with how similarity is computed at runtime, and gives
+    #     the mean direction (Fréchet mean on the unit sphere) when averaged.
+    #   - Max-normalized (dominant channel = 1.0): stored separately for plotting only.
+    per_template_rms = np.zeros((n_templates, n_ch))       # L2-normalized (for computation)
+    per_template_rms_maxnorm = np.zeros((n_templates, n_ch))  # max-normalized (for plotting)
     for i, template in enumerate(templates_raw):
         n_samples = template.shape[1]
         half = n_samples // 2
         second_half = template[:, half:]  # (n_ch, n_samples/2)
-        per_template_rms[i] = np.sqrt(np.mean(second_half ** 2, axis=1))
+        rms = np.sqrt(np.mean(second_half ** 2, axis=1))
 
-    # Mean and std across templates for each channel
-    mean_rms = np.mean(per_template_rms, axis=0)  # (n_ch,)
+        # L2 normalization (unit vector)
+        l2 = np.linalg.norm(rms)
+        per_template_rms[i] = rms / l2 if l2 > 1e-10 else rms
+
+        # Max normalization (for plotting)
+        mx = np.max(rms)
+        per_template_rms_maxnorm[i] = rms / mx if mx > 1e-10 else rms
+
+    # Mean and std across templates (L2-normalized units)
+    mean_rms = np.mean(per_template_rms, axis=0)  # (n_ch,) — mean unit vector (ref_profile)
     std_rms = np.std(per_template_rms, axis=0)     # (n_ch,)
 
-    # Consistency = mean / std (like SNR: high = reliable)
+    # Amplitude-weighted reliability score: mean² / (mean + std)
+    # = mean * (mean / (mean + std))
+    # Combines two goals:
+    #   - dominant channels (high mean) stay prominent
+    #   - variable channels (high std relative to mean) are penalized
+    # A quiet-but-consistent channel stays low; a loud-but-variable one is dampened.
     epsilon = 1e-10
-    consistency = mean_rms / (std_rms + epsilon)
+    consistency = mean_rms ** 2 / (mean_rms + std_rms + epsilon)
 
     # Normalize weights to sum to 1
     weights = consistency / (np.sum(consistency) + epsilon)
 
     if class_label:
-        print(f"\n[SPATIAL] {class_label.upper()} reference profile ({n_templates} templates):")
-        # Show top 5 most consistent channels
+        print(f"\n[SPATIAL] {class_label.upper()} reference profile ({n_templates} templates, max-normalized):")
         sorted_idx = np.argsort(consistency)[::-1]
         for rank, ch in enumerate(sorted_idx[:5], 1):
-            print(f"  {rank}. CH{ch+1}: mean_rms={mean_rms[ch]:.4f}, "
-                  f"consistency={consistency[ch]:.2f}, weight={weights[ch]:.4f}")
+            print(f"  {rank}. CH{ch+1}: mean_rel={mean_rms[ch]:.3f}, "
+                  f"std_rel={std_rms[ch]:.3f}, score={consistency[ch]:.4f}, weight={weights[ch]:.4f}")
 
     return {
-        "ref_profile": mean_rms,
+        "ref_profile": mean_rms,                                          # L2-normalized mean (used in computation)
+        "ref_profile_maxnorm": np.mean(per_template_rms_maxnorm, axis=0), # max-normalized mean (for plotting only)
         "weights": weights,
         "consistency": consistency,
-        "per_template_rms": per_template_rms,
+        "per_template_rms": per_template_rms,                             # L2-normalized (for std/weights)
+        "per_template_rms_maxnorm": per_template_rms_maxnorm,             # max-normalized (for plot error bars)
     }
+
+
+def compute_spatial_sharpness(
+    templates_raw_open: list,
+    templates_raw_closed: list,
+    profile_open: dict,
+    profile_closed: dict,
+    target_ratio: float = 0.5,
+) -> float:
+    """
+    Auto-compute the sharpness exponent k for spatial correction.
+
+    Computes "matching" similarity (templates vs own class profile) and
+    "non-matching" similarity (templates vs opposite class profile), then
+    chooses k so that: sim_nonmatch^k = target_ratio * sim_match^k
+
+    k = log(target_ratio) / log(sim_nonmatch / sim_match)
+
+    Args:
+        templates_raw_open: List of raw OPEN templates, each (n_channels, n_samples)
+        templates_raw_closed: List of raw CLOSED templates, each (n_channels, n_samples)
+        profile_open: Spatial profile dict for OPEN (ref_profile, weights)
+        profile_closed: Spatial profile dict for CLOSED (ref_profile, weights)
+        target_ratio: Desired ratio of non-matching to matching effect (default 0.5)
+
+    Returns:
+        Optimal k value (clamped to [1.0, 10.0])
+    """
+    if not templates_raw_open or not templates_raw_closed:
+        return 3.0
+    if profile_open is None or profile_closed is None:
+        return 3.0
+
+    sims_match = []
+    sims_nonmatch = []
+
+    # OPEN templates: match = vs OPEN profile, nonmatch = vs CLOSED profile
+    for template in templates_raw_open:
+        sim_m = compute_spatial_similarity(template, profile_open["ref_profile"], profile_open["weights"])
+        sim_nm = compute_spatial_similarity(template, profile_closed["ref_profile"], profile_closed["weights"])
+        sims_match.append(sim_m)
+        sims_nonmatch.append(sim_nm)
+
+    # CLOSED templates: match = vs CLOSED profile, nonmatch = vs OPEN profile
+    for template in templates_raw_closed:
+        sim_m = compute_spatial_similarity(template, profile_closed["ref_profile"], profile_closed["weights"])
+        sim_nm = compute_spatial_similarity(template, profile_open["ref_profile"], profile_open["weights"])
+        sims_match.append(sim_m)
+        sims_nonmatch.append(sim_nm)
+
+    mean_match = float(np.mean(sims_match))
+    mean_nonmatch = float(np.mean(sims_nonmatch))
+
+    print(f"\n[SPATIAL] Auto-sharpness computation:")
+    print(f"  Mean matching similarity:     {mean_match:.4f}")
+    print(f"  Mean non-matching similarity: {mean_nonmatch:.4f}")
+    print(f"  Separation ratio:             {mean_nonmatch/mean_match:.4f}")
+
+    # k = log(target_ratio) / log(sim_nonmatch / sim_match)
+    ratio = mean_nonmatch / mean_match
+    if ratio >= 1.0:
+        # No spatial separation — fall back to default
+        print(f"  No spatial separation detected (ratio >= 1). Using default k=3.0")
+        return 3.0
+
+    k = np.log(target_ratio) / np.log(ratio)
+    k = float(np.clip(k, 1.0, 10.0))
+
+    # Show effect at computed k
+    match_effect = mean_match ** k
+    nonmatch_effect = mean_nonmatch ** k
+    print(f"  Auto k={k:.1f} (target_ratio={target_ratio})")
+    print(f"  Effect: match^k={match_effect:.4f}, nonmatch^k={nonmatch_effect:.4f} (ratio={nonmatch_effect/match_effect:.4f})")
+
+    return k
 
 
 def compute_spatial_similarity(
     emg_buffer: np.ndarray,
     ref_profile: np.ndarray,
     weights: np.ndarray,
+    per_template_rms: np.ndarray = None,
+    n_best: int = 3,
 ) -> float:
     """
     Compute weighted cosine similarity between current EMG spatial pattern
     and a class reference profile.
 
+    Two modes:
+      - Mean profile (default): similarity against the class mean profile (ref_profile).
+      - Per-template (per_template_rms provided): compute similarity against each
+        template individually, return average of the top n_best highest similarities.
+        Analogous to avg_3_smallest DTW aggregation.
+
     Args:
         emg_buffer: Current EMG buffer, shape (n_channels, n_samples)
-        ref_profile: Reference spatial profile (mean RMS per channel), shape (n_channels,)
+        ref_profile: Mean reference spatial profile, shape (n_channels,)
         weights: Consistency weights per channel, shape (n_channels,)
+        per_template_rms: L2-normalized per-template RMS, shape (n_templates, n_channels).
+                          If provided, uses per-template mode.
+        n_best: Number of top similarities to average in per-template mode.
 
     Returns:
-        Weighted cosine similarity (0 to 1, higher = better match)
+        Weighted cosine similarity in [0, 1], higher = better match
     """
-    # Compute per-channel RMS of current buffer
-    current_rms = np.sqrt(np.mean(emg_buffer ** 2, axis=1))  # (n_ch,)
+    # Use only the second half of the buffer — mirrors how ref_profile is built
+    half = emg_buffer.shape[1] // 2
+    active = emg_buffer[:, half:]
+    current_rms = np.sqrt(np.mean(active ** 2, axis=1))  # (n_ch,)
 
-    # Normalize both to unit vectors
     current_norm = np.linalg.norm(current_rms)
-    ref_norm = np.linalg.norm(ref_profile)
-
-    if current_norm < 1e-10 or ref_norm < 1e-10:
-        return 0.0  # No signal or no reference
-
-    current_unit = current_rms / current_norm
-    ref_unit = ref_profile / ref_norm
-
-    # Weighted cosine similarity
-    # Weight each channel's contribution by its consistency
-    weighted_dot = np.sum(weights * current_unit * ref_unit)
-
-    # Normalize by sqrt of weighted norms to keep in [0, 1] range
-    weighted_norm_current = np.sqrt(np.sum(weights * current_unit ** 2))
-    weighted_norm_ref = np.sqrt(np.sum(weights * ref_unit ** 2))
-
-    if weighted_norm_current < 1e-10 or weighted_norm_ref < 1e-10:
+    if current_norm < 1e-10:
         return 0.0
 
-    similarity = weighted_dot / (weighted_norm_current * weighted_norm_ref)
+    current_unit = current_rms / current_norm
 
-    return float(np.clip(similarity, 0.0, 1.0))
+    def _weighted_cosine(current_u, ref_u):
+        """Weighted cosine similarity between two unit vectors."""
+        ref_u_norm = np.linalg.norm(ref_u)
+        if ref_u_norm < 1e-10:
+            return 0.0
+        ref_unit = ref_u / ref_u_norm
+        dot = np.sum(weights * current_u * ref_unit)
+        wn_curr = np.sqrt(np.sum(weights * current_u ** 2))
+        wn_ref  = np.sqrt(np.sum(weights * ref_unit  ** 2))
+        if wn_curr < 1e-10 or wn_ref < 1e-10:
+            return 0.0
+        return float(np.clip(dot / (wn_curr * wn_ref), 0.0, 1.0))
+
+    if per_template_rms is not None and len(per_template_rms) > 0:
+        # Per-template mode: plain cosine similarity (dot product of unit vectors).
+        # Weights encode cross-template consistency — irrelevant for individual
+        # template comparisons where we just want the angle between two unit vectors.
+        # per_template_rms rows and current_unit are already L2-normalized.
+        sims = np.clip(per_template_rms @ current_unit, 0.0, 1.0)  # (n_templates,)
+        k = min(n_best, len(sims))
+        top_k = np.sort(sims)[-k:]  # k highest
+        return float(np.mean(top_k))
+    else:
+        # Mean-profile mode (default)
+        return _weighted_cosine(current_unit, ref_profile)

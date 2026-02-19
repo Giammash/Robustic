@@ -315,6 +315,15 @@ def simulate_realtime_dtw(
     spatial_ref_closed: dict = None,
     spatial_threshold: float = 0.5,
     use_spatial_correction: bool = False,
+    spatial_mode: str = "off",
+    spatial_sharpness: float = 3.0,
+    spatial_relu_baseline: float = 0.2,
+    initial_state: str = "CLOSED",
+    decision_mode: str = "threshold",
+    decision_nn_weights: dict = None,
+    decision_catboost_model: dict = None,
+    spatial_similarity_mode: str = "mean",
+    spatial_n_best: int = 3,
 ) -> dict:
     """
     Simulate real-time DTW processing using the same buffer logic as the online model.
@@ -333,6 +342,16 @@ def simulate_realtime_dtw(
     """
     if refractory_period_s is None:
         refractory_period_s = 0.0
+
+    # Initialize ML decision models if applicable
+    decision_nn = None
+    decision_catboost = None
+    if decision_mode == "nn" and decision_nn_weights is not None:
+        from mindmove.model.core.decision_network import DecisionNetworkInference
+        decision_nn = DecisionNetworkInference(decision_nn_weights)
+    elif decision_mode == "catboost" and decision_catboost_model is not None:
+        from mindmove.model.core.decision_network import CatBoostDecisionInference
+        decision_catboost = CatBoostDecisionInference(decision_catboost_model)
 
     n_channels, n_samples = emg_data.shape
 
@@ -354,12 +373,15 @@ def simulate_realtime_dtw(
     sim_open_list = []
     sim_closed_list = []
     spatial_blocked_list = []  # True/False per tick
+    ml_prob_list = []  # p(CLOSED) per tick from NN/CatBoost, None in threshold mode
+    D_open_corrected_list = []   # spatially-corrected D_open (scaling/contrast only, else None)
+    D_closed_corrected_list = [] # spatially-corrected D_closed (scaling/contrast only, else None)
 
     # Filtered signal reconstruction (only the "new" 50ms from each filtered buffer)
     filtered_signal_chunks = []
 
     # State machine
-    current_state = "CLOSED"
+    current_state = initial_state
     last_predictions = []
 
     # Refractory period
@@ -441,37 +463,121 @@ def simulate_realtime_dtw(
 
             # State machine logic
             current_time_s = end_idx / config.FSAMP
-            if current_state == "OPEN":
-                triggered_state = "CLOSED" if D_closed < threshold_closed else "OPEN"
-            else:
-                triggered_state = "OPEN" if D_open < threshold_open else "CLOSED"
 
-            # Spatial correction gating
+            # Spatial similarity computation (always compute both if refs available)
             sim_open_val = None
             sim_closed_val = None
             spatial_blocked = False
 
-            if use_spatial_correction and spatial_ref_open is not None and spatial_ref_closed is not None:
-                # Use the filtered buffer for spatial similarity
+            has_spatial_refs = spatial_ref_open is not None and spatial_ref_closed is not None
+            if has_spatial_refs:
                 buf = emg_filtered if config.ENABLE_FILTERING else emg_buffer
-                if current_state == "OPEN":
-                    sim_closed_val = compute_spatial_similarity(
-                        buf, spatial_ref_closed["ref_profile"], spatial_ref_closed["weights"]
-                    )
-                    if triggered_state == "CLOSED" and sim_closed_val < spatial_threshold:
-                        spatial_blocked = True
-                        triggered_state = "OPEN"
+                _per_tpl_open   = (spatial_ref_open.get("per_template_rms",   None)
+                                   if spatial_similarity_mode == "per_template" else None)
+                _per_tpl_closed = (spatial_ref_closed.get("per_template_rms", None)
+                                   if spatial_similarity_mode == "per_template" else None)
+                sim_open_val = compute_spatial_similarity(
+                    buf, spatial_ref_open["ref_profile"], spatial_ref_open["weights"],
+                    per_template_rms=_per_tpl_open, n_best=spatial_n_best,
+                )
+                sim_closed_val = compute_spatial_similarity(
+                    buf, spatial_ref_closed["ref_profile"], spatial_ref_closed["weights"],
+                    per_template_rms=_per_tpl_closed, n_best=spatial_n_best,
+                )
+
+            p_closed = None
+            D_open_corr = None
+            D_closed_corr = None
+            if decision_mode == "nn" and decision_nn is not None:
+                # --- Neural Network decision ---
+                if decision_nn.has_spatial and sim_open_val is not None:
+                    nn_features = np.array([D_open, D_closed, sim_open_val, sim_closed_val], dtype=np.float32)
                 else:
-                    sim_open_val = compute_spatial_similarity(
-                        buf, spatial_ref_open["ref_profile"], spatial_ref_open["weights"]
-                    )
-                    if triggered_state == "OPEN" and sim_open_val < spatial_threshold:
-                        spatial_blocked = True
-                        triggered_state = "CLOSED"
+                    nn_features = np.array([D_open, D_closed], dtype=np.float32)
+                p_closed = float(decision_nn.predict(nn_features))
+                triggered_state = "CLOSED" if p_closed > 0.5 else "OPEN"
+            elif decision_mode == "catboost" and decision_catboost is not None:
+                if getattr(decision_catboost, 'transition_mode', False):
+                    # --- CatBoost transition-mode: state-conditioned features ---
+                    if current_state == "OPEN":
+                        sim_t = sim_closed_val  # check CLOSED target
+                        p_transition = decision_catboost.predict_transition(D_closed, sim_t)
+                        triggered_state = "CLOSED" if p_transition > 0.5 else "OPEN"
+                        p_closed = p_transition
+                    else:
+                        sim_t = sim_open_val  # check OPEN target
+                        p_transition = decision_catboost.predict_transition(D_open, sim_t)
+                        triggered_state = "OPEN" if p_transition > 0.5 else "CLOSED"
+                        p_closed = 1.0 - p_transition  # invert: high = CLOSED maintained
+                else:
+                    # --- CatBoost posture-classifier (legacy) ---
+                    if decision_catboost.has_spatial and sim_open_val is not None:
+                        cb_features = np.array([D_open, D_closed, sim_open_val, sim_closed_val], dtype=np.float32)
+                    else:
+                        cb_features = np.array([D_open, D_closed], dtype=np.float32)
+                    p_closed = float(decision_catboost.predict(cb_features))
+                    triggered_state = "CLOSED" if p_closed > 0.5 else "OPEN"
+            else:
+                # --- Threshold decision ---
+                if current_state == "OPEN":
+                    triggered_state = "CLOSED" if D_closed < threshold_closed else "OPEN"
+                else:
+                    triggered_state = "OPEN" if D_open < threshold_open else "CLOSED"
+
+                # Spatial correction (threshold mode only)
+                if spatial_mode != "off" and has_spatial_refs:
+                    k = spatial_sharpness
+                    if spatial_mode == "gate":
+                        if current_state == "OPEN":
+                            if triggered_state == "CLOSED" and sim_closed_val < spatial_threshold:
+                                spatial_blocked = True
+                                triggered_state = "OPEN"
+                        else:
+                            if triggered_state == "OPEN" and sim_open_val < spatial_threshold:
+                                spatial_blocked = True
+                                triggered_state = "CLOSED"
+                    elif spatial_mode == "scaling":
+                        sim_c = max(sim_closed_val, 0.1)
+                        sim_o = max(sim_open_val, 0.1)
+                        D_closed_corr = D_closed / (sim_c ** k)
+                        D_open_corr   = D_open   / (sim_o ** k)
+                        if current_state == "OPEN":
+                            triggered_state = "CLOSED" if D_closed_corr < threshold_closed else "OPEN"
+                        else:
+                            triggered_state = "OPEN" if D_open_corr < threshold_open else "CLOSED"
+                    elif spatial_mode == "contrast":
+                        sim_c = max(sim_closed_val, 0.1)
+                        sim_o = max(sim_open_val, 0.1)
+                        D_closed_corr = D_closed * ((sim_o / sim_c) ** k)
+                        D_open_corr   = D_open   * ((sim_c / sim_o) ** k)
+                        if current_state == "OPEN":
+                            triggered_state = "CLOSED" if D_closed_corr < threshold_closed else "OPEN"
+                        else:
+                            triggered_state = "OPEN" if D_open_corr < threshold_open else "CLOSED"
+                    elif spatial_mode in ("relu_scaling", "relu_contrast"):
+                        b = spatial_relu_baseline
+                        t = max(spatial_threshold, 1e-6)
+                        k = max(spatial_sharpness, 0.1)
+                        def _f(s): return 1.0 if s >= t else b ** ((1.0 - s / t) ** (1.0 / k))
+                        f_c = _f(sim_closed_val)
+                        f_o = _f(sim_open_val)
+                        if spatial_mode == "relu_scaling":
+                            D_closed_corr = D_closed / max(f_c, 0.01)
+                            D_open_corr   = D_open   / max(f_o, 0.01)
+                        else:  # relu_contrast
+                            D_closed_corr = D_closed * f_o / max(f_c, 0.01)
+                            D_open_corr   = D_open   * f_c / max(f_o, 0.01)
+                        if current_state == "OPEN":
+                            triggered_state = "CLOSED" if D_closed_corr < threshold_closed else "OPEN"
+                        else:
+                            triggered_state = "OPEN" if D_open_corr < threshold_open else "CLOSED"
 
             sim_open_list.append(sim_open_val)
             sim_closed_list.append(sim_closed_val)
             spatial_blocked_list.append(spatial_blocked)
+            ml_prob_list.append(p_closed)
+            D_open_corrected_list.append(D_open_corr)
+            D_closed_corrected_list.append(D_closed_corr)
 
             # Refractory period check
             if in_refractory:
@@ -567,7 +673,13 @@ def simulate_realtime_dtw(
         'sim_open': sim_open_list,
         'sim_closed': sim_closed_list,
         'spatial_blocked': spatial_blocked_list,
-        'spatial_threshold': spatial_threshold if use_spatial_correction else None,
+        'spatial_threshold': spatial_threshold if spatial_mode != "off" else None,
+        'spatial_mode': spatial_mode,
+        # ML probability (p(CLOSED) per tick, None values when threshold mode)
+        'ml_probabilities': ml_prob_list,
+        # Spatially-corrected distances (scaling/contrast modes only, else None per tick)
+        'D_open_corrected': D_open_corrected_list,
+        'D_closed_corrected': D_closed_corrected_list,
     }
 
 
@@ -578,6 +690,7 @@ def apply_state_machine(
     threshold_open: float,
     threshold_closed: float,
     refractory_period_s: float = 0.0,
+    initial_state: str = "CLOSED",
 ) -> list:
     """
     Re-run the state machine on pre-computed distances.
@@ -585,7 +698,7 @@ def apply_state_machine(
     This is cheap (no DTW), so it can be re-run with different smoothing/refractory
     settings without re-computing distances.
     """
-    current_state = "CLOSED"
+    current_state = initial_state
     last_predictions = []
     last_state_change_time = -refractory_period_s
     in_refractory = False

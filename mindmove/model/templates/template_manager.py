@@ -840,14 +840,20 @@ class TemplateManager:
         timings_emg = recording.get('timings_emg')
         recording_start_time = timings_emg[0] if timings_emg is not None and len(timings_emg) > 0 else None
 
-        # Debug: print audio cue info
-        print(f"[DEBUG] cycle_boundaries count: {len(cycle_boundaries)}")
-        print(f"[DEBUG] recording_start_time: {recording_start_time}")
-        if cycle_boundaries:
-            for i, cb in enumerate(cycle_boundaries):
+        # Pre-build flat lists of ALL cue sample indices from all user cycles.
+        # This handles multi-rep recordings where cycle_boundaries has one entry per
+        # user-initiated cycle but extract_complete_cycles produces one entry per
+        # repetition — index-based mapping would fail for rep 2+ of each cycle.
+        all_close_cue_samples = []  # absolute sample indices
+        all_open_cue_samples = []
+        if recording_start_time is not None:
+            for cb in cycle_boundaries:
                 cct = cb.get('close_cue_time')
-                oct = cb.get('open_cue_time')
-                print(f"[DEBUG] Cycle {i+1}: close_cue_time={cct}, open_cue_time={oct}")
+                oct_val = cb.get('open_cue_time')
+                if cct is not None:
+                    all_close_cue_samples.append(int((cct - recording_start_time) * config.FSAMP))
+                if oct_val is not None:
+                    all_open_cue_samples.append(int((oct_val - recording_start_time) * config.FSAMP))
 
         # Find all transitions from the binarized GT
         gt_diff = np.diff(gt_binary, prepend=gt_binary[0])
@@ -875,8 +881,14 @@ class TemplateManager:
                 # Calculate cycle boundaries
                 # Start: pre_open_s before the falling edge (use pre_close_s for consistency)
                 cycle_start = max(0, fall_idx - pre_close_samples)
-                # End: post_close_s after the rising edge (use post_open_s for consistency)
-                cycle_end = min(len(gt_binary), rise_idx + post_open_samples)
+                # End: post_close_s after the rising edge, but never past the next
+                # falling edge — same multi-rep bleed protection as standard mode.
+                next_falls_after_rise = falling_edges[falling_edges > rise_idx]
+                if len(next_falls_after_rise) > 0:
+                    safe_end = next_falls_after_rise[0]
+                else:
+                    safe_end = len(gt_binary)
+                cycle_end = min(safe_end, rise_idx + post_open_samples)
 
                 # Extract EMG and GT for this cycle
                 cycle_emg = emg[:, cycle_start:cycle_end]
@@ -887,26 +899,24 @@ class TemplateManager:
                 open_start_relative = fall_idx - cycle_start   # Where GT goes 1→0 (first transition)
                 close_start_relative = rise_idx - cycle_start  # Where GT goes 0→1 (second transition)
 
-                # Try to get audio cue times from cycle metadata
+                # Find audio cue indices by nearest-match (same logic as standard mode)
+                cue_tolerance = int(1.0 * config.FSAMP)
                 close_cue_idx = None
                 open_cue_idx = None
 
-                if cycle_num <= len(cycle_boundaries) and recording_start_time is not None:
-                    cycle_meta = cycle_boundaries[cycle_num - 1]
-                    close_cue_time = cycle_meta.get('close_cue_time')
-                    open_cue_time = cycle_meta.get('open_cue_time')
+                for abs_cue in all_close_cue_samples:
+                    if abs(abs_cue - rise_idx) <= cue_tolerance:
+                        rel = abs_cue - cycle_start
+                        if 0 <= rel < cycle_emg.shape[1]:
+                            close_cue_idx = rel
+                        break
 
-                    if close_cue_time is not None:
-                        close_cue_abs_idx = int((close_cue_time - recording_start_time) * config.FSAMP)
-                        close_cue_idx = close_cue_abs_idx - cycle_start
-                        if close_cue_idx < 0 or close_cue_idx >= cycle_emg.shape[1]:
-                            close_cue_idx = None
-
-                    if open_cue_time is not None:
-                        open_cue_abs_idx = int((open_cue_time - recording_start_time) * config.FSAMP)
-                        open_cue_idx = open_cue_abs_idx - cycle_start
-                        if open_cue_idx < 0 or open_cue_idx >= cycle_emg.shape[1]:
-                            open_cue_idx = None
+                for abs_cue in all_open_cue_samples:
+                    if abs(abs_cue - fall_idx) <= cue_tolerance:
+                        rel = abs_cue - cycle_start
+                        if 0 <= rel < cycle_emg.shape[1]:
+                            open_cue_idx = rel
+                        break
 
                 cycles.append({
                     'emg': cycle_emg,
@@ -934,8 +944,16 @@ class TemplateManager:
                 # Calculate cycle boundaries
                 # Start: pre_close_s before the rising edge
                 cycle_start = max(0, rise_idx - pre_close_samples)
-                # End: post_open_s after the falling edge
-                cycle_end = min(len(gt_binary), fall_idx + post_open_samples)
+                # End: post_open_s after the falling edge, but never past the next
+                # rising edge — with multi-rep recordings, a short HOLD_OPEN between
+                # reps means the next CLOSING could start before post_open_s expires,
+                # causing onset detection to pick up the wrong movement.
+                next_rises_after_fall = rising_edges[rising_edges > fall_idx]
+                if len(next_rises_after_fall) > 0:
+                    safe_end = next_rises_after_fall[0]
+                else:
+                    safe_end = len(gt_binary)
+                cycle_end = min(safe_end, fall_idx + post_open_samples)
 
                 # Extract EMG and GT for this cycle
                 cycle_emg = emg[:, cycle_start:cycle_end]
@@ -945,28 +963,25 @@ class TemplateManager:
                 close_start_relative = rise_idx - cycle_start
                 open_start_relative = fall_idx - cycle_start
 
-                # Try to get audio cue times from cycle metadata
+                # Find audio cue indices by matching to the nearest cue within ±1s
+                # of each GT transition. This works for any number of reps per cycle.
+                cue_tolerance = int(1.0 * config.FSAMP)
                 close_cue_idx = None
                 open_cue_idx = None
 
-                if cycle_num <= len(cycle_boundaries) and recording_start_time is not None:
-                    cycle_meta = cycle_boundaries[cycle_num - 1]
-                    close_cue_time = cycle_meta.get('close_cue_time')
-                    open_cue_time = cycle_meta.get('open_cue_time')
+                for abs_cue in all_close_cue_samples:
+                    if abs(abs_cue - rise_idx) <= cue_tolerance:
+                        rel = abs_cue - cycle_start
+                        if 0 <= rel < cycle_emg.shape[1]:
+                            close_cue_idx = rel
+                        break
 
-                    if close_cue_time is not None:
-                        # Convert absolute timestamp to sample index relative to recording start
-                        close_cue_abs_idx = int((close_cue_time - recording_start_time) * config.FSAMP)
-                        # Convert to relative index within this cycle view
-                        close_cue_idx = close_cue_abs_idx - cycle_start
-                        if close_cue_idx < 0 or close_cue_idx >= cycle_emg.shape[1]:
-                            close_cue_idx = None  # Out of bounds
-
-                    if open_cue_time is not None:
-                        open_cue_abs_idx = int((open_cue_time - recording_start_time) * config.FSAMP)
-                        open_cue_idx = open_cue_abs_idx - cycle_start
-                        if open_cue_idx < 0 or open_cue_idx >= cycle_emg.shape[1]:
-                            open_cue_idx = None  # Out of bounds
+                for abs_cue in all_open_cue_samples:
+                    if abs(abs_cue - fall_idx) <= cue_tolerance:
+                        rel = abs_cue - cycle_start
+                        if 0 <= rel < cycle_emg.shape[1]:
+                            open_cue_idx = rel
+                        break
 
                 cycles.append({
                     'emg': cycle_emg,

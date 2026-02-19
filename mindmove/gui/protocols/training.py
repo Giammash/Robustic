@@ -1876,10 +1876,13 @@ class TemplateStudyDialog(QDialog):
             self.figure.clear()
 
             if spatial_closed is not None or spatial_open is not None:
-                ax_dtw = self.figure.add_subplot(121)
-                ax_spatial = self.figure.add_subplot(122)
+                # Layout: DTW matrix (left) | two spatial subplots stacked (right)
+                import matplotlib.gridspec as gridspec
+                gs = gridspec.GridSpec(2, 2, figure=self.figure, width_ratios=[1.2, 1])
+                ax_dtw = self.figure.add_subplot(gs[:, 0])
+                ax_profile = self.figure.add_subplot(gs[0, 1])
+                ax_weights = self.figure.add_subplot(gs[1, 1])
 
-                # Plot spatial profiles as grouped bar chart
                 n_ch = 0
                 if spatial_closed is not None:
                     n_ch = len(spatial_closed["weights"])
@@ -1888,21 +1891,54 @@ class TemplateStudyDialog(QDialog):
 
                 channels = np.arange(n_ch)
                 bar_width = 0.35
+                xtick_labels = [str(c + 1) for c in channels]
 
+                # --- Top: mean spatial pattern ---
+                # Bars = max-normalized (interpretable: dominant channel = 1.0, with std)
+                # Line = L2-normalized (actual ref_profile used in computation, rescaled to [0,1])
                 if spatial_closed is not None:
-                    ax_spatial.bar(channels - bar_width / 2, spatial_closed["weights"],
+                    ax_profile.bar(channels - bar_width / 2, spatial_closed["ref_profile_maxnorm"],
+                                   bar_width, label="CLOSED (max-norm)", color="#d44", alpha=0.6,
+                                   yerr=spatial_closed["per_template_rms_maxnorm"].std(axis=0),
+                                   error_kw=dict(elinewidth=1.0, capsize=2, ecolor='#a00'))
+                    l2_closed = spatial_closed["ref_profile"]
+                    l2_closed_scaled = l2_closed / (l2_closed.max() + 1e-10)
+                    ax_profile.plot(channels - bar_width / 2, l2_closed_scaled,
+                                    color='#900', linewidth=1.5, marker='o', markersize=3,
+                                    label="CLOSED (L2-norm, scaled)", zorder=5)
+                if spatial_open is not None:
+                    ax_profile.bar(channels + bar_width / 2, spatial_open["ref_profile_maxnorm"],
+                                   bar_width, label="OPEN (max-norm)", color="#48b", alpha=0.6,
+                                   yerr=spatial_open["per_template_rms_maxnorm"].std(axis=0),
+                                   error_kw=dict(elinewidth=1.0, capsize=2, ecolor='#247'))
+                    l2_open = spatial_open["ref_profile"]
+                    l2_open_scaled = l2_open / (l2_open.max() + 1e-10)
+                    ax_profile.plot(channels + bar_width / 2, l2_open_scaled,
+                                    color='#136', linewidth=1.5, marker='o', markersize=3,
+                                    label="OPEN (L2-norm, scaled)", zorder=5)
+                ax_profile.set_ylabel("Relative RMS")
+                ax_profile.set_title("Mean Spatial Pattern (bars=max-norm, line=L2-norm)")
+                ax_profile.set_xticks(channels)
+                ax_profile.set_xticklabels(xtick_labels, fontsize=7)
+                ax_profile.set_ylim(0, 1.15)
+                ax_profile.axhline(1.0, color='gray', linewidth=0.8, linestyle='--', alpha=0.5)
+                ax_profile.legend(fontsize=7)
+                ax_profile.grid(axis='y', alpha=0.3)
+
+                # --- Bottom: consistency weights ---
+                if spatial_closed is not None:
+                    ax_weights.bar(channels - bar_width / 2, spatial_closed["weights"],
                                    bar_width, label="CLOSED", color="#d44", alpha=0.8)
                 if spatial_open is not None:
-                    ax_spatial.bar(channels + bar_width / 2, spatial_open["weights"],
+                    ax_weights.bar(channels + bar_width / 2, spatial_open["weights"],
                                    bar_width, label="OPEN", color="#48b", alpha=0.8)
-
-                ax_spatial.set_xlabel("Channel")
-                ax_spatial.set_ylabel("Consistency Weight")
-                ax_spatial.set_title("Spatial Profile (consistency weights)")
-                ax_spatial.set_xticks(channels)
-                ax_spatial.set_xticklabels([str(c + 1) for c in channels], fontsize=7)
-                ax_spatial.legend(fontsize=8)
-                ax_spatial.grid(axis='y', alpha=0.3)
+                ax_weights.set_xlabel("Channel")
+                ax_weights.set_ylabel("Weight")
+                ax_weights.set_title("Consistency Weights (voting power)")
+                ax_weights.set_xticks(channels)
+                ax_weights.set_xticklabels(xtick_labels, fontsize=7)
+                ax_weights.legend(fontsize=8)
+                ax_weights.grid(axis='y', alpha=0.3)
             else:
                 ax_dtw = self.figure.add_subplot(111)
 
@@ -2542,7 +2578,7 @@ class TrainingProtocol(QObject):
         # Add all features from registry
         from mindmove.model.core.features.features_registry import FEATURES
         self.feature_combo.addItems(list(FEATURES.keys()))
-        self.feature_combo.setCurrentText("wl")  # Default to waveform length
+        self.feature_combo.setCurrentText("rms")  # Default to RMS
         layout.addWidget(self.feature_label, 3, 0, 1, 1)
         layout.addWidget(self.feature_combo, 3, 1, 1, 2)
 
@@ -2624,25 +2660,40 @@ class TrainingProtocol(QObject):
             "5 Consecutive",
             "None"
         ])
+        self.smoothing_combo.setCurrentIndex(1)  # Default: 5 Consecutive
         self.smoothing_combo.setToolTip("Method to smooth state transitions")
         layout.addWidget(self.smoothing_label, 10, 0, 1, 1)
         layout.addWidget(self.smoothing_combo, 10, 1, 1, 2)
 
-        # Row 11: Model name (reuse existing widget, just reposition)
-        layout.addWidget(self.main_window.ui.label_8, 11, 0, 1, 1)
-        layout.addWidget(self.training_model_label_line_edit, 11, 1, 1, 2)
+        # Row 11: Decision model selector
+        self.decision_model_label = QLabel("Decision Model:")
+        self.decision_model_combo = QComboBox()
+        self.decision_model_combo.addItems(["None", "CatBoost", "Neural Network", "Both"])
+        self.decision_model_combo.setCurrentIndex(1)  # Default: CatBoost
+        self.decision_model_combo.setToolTip(
+            "Train a ML decision model alongside the DTW classifier.\n"
+            "CatBoost: Gradient boosting (deterministic, no GPU needed)\n"
+            "Neural Network: Small NN (requires PyTorch)\n"
+            "None: Use only threshold-based decisions"
+        )
+        layout.addWidget(self.decision_model_label, 11, 0, 1, 1)
+        layout.addWidget(self.decision_model_combo, 11, 1, 1, 2)
 
-        # Row 12: Create Model button
+        # Row 12: Model name (reuse existing widget, just reposition)
+        layout.addWidget(self.main_window.ui.label_8, 12, 0, 1, 1)
+        layout.addWidget(self.training_model_label_line_edit, 12, 1, 1, 2)
+
+        # Row 13: Create Model button
         self.create_model_btn = QPushButton("Create Model")
         self.create_model_btn.clicked.connect(self._create_dtw_model)
         self.create_model_btn.setEnabled(False)
-        layout.addWidget(self.create_model_btn, 12, 0, 1, 3)
+        layout.addWidget(self.create_model_btn, 13, 0, 1, 3)
 
-        # Row 13: Progress bar
+        # Row 14: Progress bar
         self.model_creation_progress_bar = self.main_window.ui.trainingProgressBar
         self.model_creation_progress_bar.setVisible(True)
         self.model_creation_progress_bar.setValue(0)
-        layout.addWidget(self.model_creation_progress_bar, 13, 0, 1, 3)
+        layout.addWidget(self.model_creation_progress_bar, 14, 0, 1, 3)
 
     def _setup_template_extraction_ui(self) -> None:
         """Setup UI connections for template extraction group box."""
@@ -4793,6 +4844,9 @@ class TrainingProtocol(QObject):
         self.create_model_btn.setEnabled(False)
         self.model_creation_progress_bar.setValue(0)
 
+        # Store decision model choice (read from UI before thread starts)
+        self._decision_model_choice = self.decision_model_combo.currentText()
+
         # Start model creation in a thread
         self.create_model_thread = PyQtThread(
             target=self._create_dtw_model_thread,
@@ -4843,7 +4897,7 @@ class TrainingProtocol(QObject):
         if stats['outliers']:
             print(f"\n  Potential outliers (consider removing):")
             for idx, avg, sigma in stats['outliers']:
-                print(f"    Template {idx}: avg={avg:.4f} ({sigma:.1f}σ above mean)")
+                print(f"    Template {idx}: avg={avg:.4f} ({sigma:.1f} sigma above mean)")
         else:
             print(f"\n  No outliers detected (all templates consistent)")
 
@@ -4951,19 +5005,28 @@ class TrainingProtocol(QObject):
         spatial_profile_open = compute_spatial_profiles(open_templates_raw, class_label="open")
         spatial_profile_closed = compute_spatial_profiles(closed_templates_raw, class_label="closed")
 
+        # Auto-compute spatial sharpness exponent
+        from mindmove.model.core.algorithm import compute_spatial_sharpness
+        spatial_sharpness_k = compute_spatial_sharpness(
+            open_templates_raw, closed_templates_raw,
+            spatial_profile_open, spatial_profile_closed,
+        )
+
         # Extract features from templates
         print("\nExtracting features...")
         feature_fn = FEATURES[feature_name]["function"]
+        increment_samples = max(1, window_samples - overlap_samples)
+        print(f"  Window shift (increment): {increment_samples} samples")
 
         open_templates_features = []
         for template in open_templates_raw:
-            windowed = sliding_window(template, window_samples, overlap_samples)
+            windowed = sliding_window(template, window_samples, increment_samples)
             features = feature_fn(windowed)
             open_templates_features.append(features)
 
         closed_templates_features = []
         for template in closed_templates_raw:
-            windowed = sliding_window(template, window_samples, overlap_samples)
+            windowed = sliding_window(template, window_samples, increment_samples)
             features = feature_fn(windowed)
             closed_templates_features.append(features)
 
@@ -5145,6 +5208,75 @@ class TrainingProtocol(QObject):
         closed_stats = compute_per_template_statistics(closed_templates_features, n_worst=3)
         self._print_template_statistics(closed_stats, "CLOSED", len(closed_templates_features))
 
+        # ── Train decision models from templates ──
+        # Uses template-vs-template distances with perfect labels (no recording needed).
+        decision_nn_weights = None
+        decision_catboost_model = None
+        decision_choice = getattr(self, '_decision_model_choice', 'None')
+        train_catboost = decision_choice in ("CatBoost", "Both")
+        train_nn = decision_choice in ("Neural Network", "Both")
+
+        if train_catboost or train_nn:
+            # Spatial refs for decision model features
+            spatial_ref_open_dict = None
+            spatial_ref_closed_dict = None
+            if spatial_profile_open and spatial_profile_closed:
+                spatial_ref_open_dict = {
+                    "ref_profile": spatial_profile_open["ref_profile"],
+                    "weights": spatial_profile_open["weights"],
+                }
+                spatial_ref_closed_dict = {
+                    "ref_profile": spatial_profile_closed["ref_profile"],
+                    "weights": spatial_profile_closed["weights"],
+                }
+
+        if train_catboost:
+            print(f"\n{'='*60}")
+            print("Training CatBoost decision model (template-based)...")
+            print(f"{'='*60}")
+            try:
+                from mindmove.model.core.decision_network import train_transition_catboost_from_templates
+                decision_catboost_model = train_transition_catboost_from_templates(
+                    templates_open_features=open_templates_features,
+                    templates_closed_features=closed_templates_features,
+                    distance_aggregation=distance_aggregation,
+                    templates_open_raw=open_templates_raw,
+                    templates_closed_raw=closed_templates_raw,
+                    spatial_ref_open=spatial_ref_open_dict,
+                    spatial_ref_closed=spatial_ref_closed_dict,
+                    verbose=True,
+                )
+            except Exception as e:
+                print(f"[WARNING] CatBoost training failed: {e}")
+                import traceback
+                traceback.print_exc()
+
+        if train_nn:
+            print(f"\n{'='*60}")
+            print("Training Neural Network decision model (template-based)...")
+            print(f"{'='*60}")
+            try:
+                from mindmove.model.core.decision_network import train_decision_network_from_templates
+                decision_nn_weights = train_decision_network_from_templates(
+                    templates_open_features=open_templates_features,
+                    templates_closed_features=closed_templates_features,
+                    distance_aggregation=distance_aggregation,
+                    templates_open_raw=open_templates_raw,
+                    templates_closed_raw=closed_templates_raw,
+                    spatial_ref_open=spatial_ref_open_dict,
+                    spatial_ref_closed=spatial_ref_closed_dict,
+                    verbose=True,
+                )
+            except ImportError:
+                print("[INFO] PyTorch not installed — skipping NN training")
+            except Exception as e:
+                print(f"[WARNING] NN training failed: {e}")
+                import traceback
+                traceback.print_exc()
+
+        if not train_catboost and not train_nn:
+            print("\n[INFO] No decision model selected — using threshold-based decisions only")
+
         # Save model
         print("\nSaving model...")
         now = datetime.now()
@@ -5192,23 +5324,30 @@ class TrainingProtocol(QObject):
                     "ref_profile": spatial_profile_open["ref_profile"],
                     "weights": spatial_profile_open["weights"],
                     "consistency": spatial_profile_open["consistency"],
+                    "per_template_rms": spatial_profile_open["per_template_rms"],
                 } if spatial_profile_open else None,
                 "closed": {
                     "ref_profile": spatial_profile_closed["ref_profile"],
                     "weights": spatial_profile_closed["weights"],
                     "consistency": spatial_profile_closed["consistency"],
+                    "per_template_rms": spatial_profile_closed["per_template_rms"],
                 } if spatial_profile_closed else None,
                 "threshold": 0.5,  # Default spatial similarity threshold
+                "sharpness": spatial_sharpness_k,  # Auto-computed exponent for scaling/contrast
             },
             "parameters": {
                 "window_samples": window_samples,
                 "overlap_samples": overlap_samples,
+                "increment_samples": increment_samples,
                 "window_ms": window_samples / config.FSAMP * 1000,
                 "overlap_ms": overlap_samples / config.FSAMP * 1000,
                 "dtw_algorithm": dtw_algorithm,
                 "fsamp": config.FSAMP,
                 "num_channels": config.num_channels,
             },
+            # Decision models (trained on guided recording)
+            "decision_nn_weights": decision_nn_weights,
+            "decision_catboost_model": decision_catboost_model,
             "metadata": {
                 "created_at": now.isoformat(),
                 "model_name": model_name,

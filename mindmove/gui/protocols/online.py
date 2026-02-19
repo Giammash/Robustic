@@ -25,36 +25,90 @@ from mindmove.model.interface import MindMoveInterface
 from mindmove.config import config
 
 
+class RealtimePlaybackWorker(QObject):
+    """Streams a recorded EMG file chunk-by-chunk at real-time (or scaled) speed.
+
+    Each chunk is emitted via chunk_ready so the main thread can feed it to the
+    model and the VisPy plot, exactly like live data.
+    """
+    chunk_ready = Signal(np.ndarray)  # (n_ch, chunk_size) pre-filtered EMG
+    progress    = Signal(float)       # current playback time in seconds
+    finished    = Signal()
+    error       = Signal(str)
+
+    def __init__(self, emg_data: np.ndarray, speed: float = 1.0, chunk_size: int = 64):
+        super().__init__()
+        self.emg_data   = emg_data          # (n_ch, n_total_samples) already filtered
+        self.speed      = max(speed, 0.01)
+        self.chunk_size = chunk_size
+        self._stop      = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            n_ch, n_total = self.emg_data.shape
+            sleep_s = self.chunk_size / config.FSAMP / self.speed
+
+            i = 0
+            while i < n_total and not self._stop:
+                chunk = self.emg_data[:, i:i + self.chunk_size]
+                if chunk.shape[1] == 0:
+                    break
+                self.chunk_ready.emit(chunk)
+                self.progress.emit(i / config.FSAMP)
+                i += self.chunk_size
+                time.sleep(sleep_s)
+
+            if not self._stop:
+                self.finished.emit()
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            self.error.emit(str(e))
+
+
 class SimulationWorker(QObject):
-    """Worker class for running offline simulation (+ optional calibration) in a separate thread."""
-    finished = Signal(dict, object)  # (simulation results, calibration_thresholds or None)
+    """Worker class for running offline simulation in a separate thread."""
+    finished = Signal(dict)
     progress = Signal(str)
     error = Signal(str)
 
-    def __init__(self, emg_data, model, gt_data=None):
+    def __init__(self, emg_data, model, initial_state="CLOSED"):
         super().__init__()
         self.emg_data = emg_data
         self.model = model
-        self.gt_data = gt_data  # Optional: real GT for calibration
+        self.initial_state = initial_state
 
     def run(self):
-        """Run offline simulation using the loaded model's parameters.
-        If gt_data is provided, also compute calibration thresholds."""
+        """Run offline simulation using the loaded model's parameters."""
         try:
             from mindmove.model.offline_test import simulate_realtime_dtw
 
             templates_open = self.model.templates_open
             templates_closed = self.model.templates_closed
+
+            if templates_open is None or templates_closed is None:
+                self.error.emit(
+                    "Model has no templates loaded (templates_open or templates_closed is None). "
+                    "Please load a valid model file."
+                )
+                return
             threshold_open = self.model.THRESHOLD_OPEN
             threshold_closed = self.model.THRESHOLD_CLOSED
             feature_name = self.model.feature_name
             distance_aggregation = self.model.distance_aggregation
 
             # Spatial correction settings
-            use_spatial = getattr(self.model, 'use_spatial_correction', False)
+            spatial_mode = getattr(self.model, 'spatial_mode', 'off')
             spatial_ref_open = getattr(self.model, 'spatial_ref_open', None)
             spatial_ref_closed = getattr(self.model, 'spatial_ref_closed', None)
             spatial_threshold = getattr(self.model, 'spatial_threshold', 0.5)
+            spatial_sharpness = getattr(self.model, 'spatial_sharpness', 3.0)
+            spatial_relu_baseline = getattr(self.model, 'spatial_relu_baseline', 0.2)
+            spatial_similarity_mode = getattr(self.model, 'spatial_similarity_mode', 'mean')
+            spatial_n_best = getattr(self.model, 'spatial_n_best', 3)
 
             # Sync config with model parameters so simulate_realtime_dtw uses correct values
             config.window_length = self.model.window_length
@@ -67,12 +121,26 @@ class SimulationWorker(QObject):
             print(f"  Thresholds: OPEN={threshold_open:.4f}, CLOSED={threshold_closed:.4f}")
             print(f"  Aggregation: {distance_aggregation}")
             print(f"  Window/increment: {config.window_length}/{config.increment} samples")
-            if use_spatial:
-                print(f"  Spatial correction: ON (threshold={spatial_threshold:.2f})")
+            spatial_info = ""
+            if spatial_mode in ("gate", "relu_scaling", "relu_contrast"):
+                spatial_info = f" (threshold={spatial_threshold:.2f}, b={spatial_relu_baseline:.2f}, k={spatial_sharpness:.1f})"
+            elif spatial_mode in ("scaling", "contrast"):
+                spatial_info = f" (k={spatial_sharpness:.1f})"
+            print(f"  Spatial mode: {spatial_mode}{spatial_info}")
+            print(f"  Initial state: {self.initial_state}")
+
+            # Decision mode
+            decision_mode = getattr(self.model, 'decision_mode', 'threshold')
+            decision_nn_weights = None
+            decision_catboost_model = None
+            if decision_mode == "nn" and self.model.decision_nn is not None:
+                decision_nn_weights = self.model.decision_nn.get_weights_dict()
+                print(f"  Decision mode: nn (accuracy={self.model.decision_nn.accuracy:.1%})")
+            elif decision_mode == "catboost" and self.model.decision_catboost is not None:
+                decision_catboost_model = self.model.decision_catboost.get_model_dict()
+                print(f"  Decision mode: catboost (accuracy={self.model.decision_catboost.accuracy:.1%})")
             else:
-                print(f"  Spatial correction: OFF")
-            if self.gt_data is not None:
-                print(f"  GT available: yes ({len(self.gt_data)} samples) — will compute calibration thresholds")
+                print(f"  Decision mode: threshold")
 
             results = simulate_realtime_dtw(
                 emg_data=self.emg_data,
@@ -86,45 +154,18 @@ class SimulationWorker(QObject):
                 spatial_ref_open=spatial_ref_open,
                 spatial_ref_closed=spatial_ref_closed,
                 spatial_threshold=spatial_threshold,
-                use_spatial_correction=use_spatial,
+                spatial_mode=spatial_mode,
+                spatial_sharpness=spatial_sharpness,
+                spatial_relu_baseline=spatial_relu_baseline,
+                initial_state=self.initial_state,
+                decision_mode=decision_mode,
+                decision_nn_weights=decision_nn_weights,
+                decision_catboost_model=decision_catboost_model,
+                spatial_similarity_mode=spatial_similarity_mode,
+                spatial_n_best=spatial_n_best,
             )
 
-            # If GT available, compute calibration thresholds from the simulation distances
-            calibration_thresholds = None
-            if self.gt_data is not None:
-                try:
-                    from mindmove.model.core.algorithm import find_plateau_thresholds
-
-                    gt = self.gt_data
-                    if hasattr(gt, 'flatten'):
-                        gt = gt.flatten()
-                    gt = np.array(gt, dtype=float)
-
-                    timestamps = results['timestamps']
-                    D_open = results['D_open']
-                    D_closed = results['D_closed']
-
-                    # Interpolate GT to DTW timestamps
-                    gt_time = np.arange(len(gt)) / config.FSAMP
-                    gt_at_dtw = np.interp(timestamps, gt_time, gt)
-                    gt_at_dtw = (gt_at_dtw > 0.5).astype(float)
-
-                    print(f"\n[OFFLINE TEST] Computing calibration thresholds from GT...")
-                    calibration_thresholds = find_plateau_thresholds(
-                        D_open, D_closed, gt_at_dtw,
-                        confidence_k=1.0,
-                    )
-                    print(f"  OPEN plateau: {calibration_thresholds['open_plateau']:.4f}, "
-                          f"threshold: {calibration_thresholds['threshold_open']:.4f}")
-                    print(f"  CLOSED plateau: {calibration_thresholds['closed_plateau']:.4f}, "
-                          f"threshold: {calibration_thresholds['threshold_closed']:.4f}")
-                except Exception as e:
-                    print(f"[OFFLINE TEST] Warning: calibration threshold computation failed: {e}")
-                    import traceback
-                    traceback.print_exc()
-                    calibration_thresholds = None
-
-            self.finished.emit(results, calibration_thresholds)
+            self.finished.emit(results)
 
         except Exception as e:
             import traceback
@@ -144,16 +185,14 @@ class OfflineTestReviewDialog(QDialog):
     """
 
     def __init__(self, emg_data, results, gt_data=None, ref_predictions=None,
-                 calibration_thresholds=None, model_thresholds=None,
-                 recording_type="unknown", parent=None):
+                 recording_type="unknown", time_offset=0.0, parent=None):
         super().__init__(parent)
         self.emg_data = emg_data
         self.results = results
         self.gt_data = gt_data  # Real GT from guided recording (array at FSAMP rate)
         self.ref_predictions = ref_predictions  # Previous online predictions (numeric array at DTW rate)
-        self.calibration_thresholds = calibration_thresholds  # dict with plateau/threshold or None
-        self.model_thresholds = model_thresholds  # {"threshold_open": ..., "threshold_closed": ...}
         self.recording_type = recording_type
+        self.time_offset = time_offset  # Seconds to add to all timestamps (for sliced recordings)
 
         self.setWindowTitle("Offline Test Review")
         self.setMinimumSize(1200, 800)
@@ -182,13 +221,8 @@ class OfflineTestReviewDialog(QDialog):
             f"DTW steps: {n_dtw}",
             f"Duration: {duration:.1f}s",
             f"Avg DTW: {avg_time:.2f}ms",
-            f"Model thr OPEN: {results['threshold_open']:.4f}  CLOSED: {results['threshold_closed']:.4f}",
+            f"Thr OPEN: {results['threshold_open']:.4f}  CLOSED: {results['threshold_closed']:.4f}",
         ]
-        if self.calibration_thresholds:
-            ct = self.calibration_thresholds
-            stats_parts.append(
-                f"Calib thr OPEN: {ct['threshold_open']:.4f}  CLOSED: {ct['threshold_closed']:.4f}"
-            )
 
         stats = QLabel("  |  ".join(stats_parts))
         stats.setStyleSheet("font-family: monospace; font-size: 10px; color: #555;")
@@ -225,13 +259,12 @@ class OfflineTestReviewDialog(QDialog):
         predictions = results['predictions']
 
         n_ch, n_samples = emg.shape
-        time_emg = np.arange(n_samples) / config.FSAMP
+        time_emg = np.arange(n_samples) / config.FSAMP + self.time_offset
+        timestamps = np.array(timestamps) + self.time_offset
 
         has_spatial = results.get('spatial_threshold') is not None
         has_gt = self.gt_data is not None
         has_ref = self.ref_predictions is not None
-        has_calibration = self.calibration_thresholds is not None
-
         # Determine subplot layout
         height_ratios = [3, 1.5, 1.5]  # EMG, D_open, D_closed
         if has_spatial:
@@ -260,17 +293,21 @@ class OfflineTestReviewDialog(QDialog):
             ax.legend(loc='upper right', fontsize=7)
         plot_idx += 1
 
+        # Corrected distances (scaling/contrast modes — None list otherwise)
+        D_open_corr = results.get('D_open_corrected', [])
+        D_closed_corr = results.get('D_closed_corrected', [])
+        has_corrected = any(v is not None for v in D_open_corr)
+
         # --- Plot 2: Distance to OPEN ---
         ax = axs[plot_idx]
-        ax.plot(timestamps, D_open, 'g-', linewidth=1, label='D_open')
+        ax.plot(timestamps, D_open, 'g-', linewidth=1, alpha=0.5 if has_corrected else 1.0,
+                label='D_open (raw)')
+        if has_corrected:
+            corr_arr = np.array([v if v is not None else np.nan for v in D_open_corr])
+            ax.plot(timestamps, corr_arr, color='darkgreen', linewidth=1.5,
+                    linestyle='--', label='D_open (corrected)')
         ax.axhline(threshold_open, color='r', linestyle='--', linewidth=2,
-                   label=f'Model thr: {threshold_open:.4f}')
-        if has_calibration:
-            ct = self.calibration_thresholds
-            ax.axhline(ct['open_plateau'], color='b', linestyle=':', linewidth=1.5,
-                       label=f'Plateau: {ct["open_plateau"]:.4f}')
-            ax.axhline(ct['threshold_open'], color='magenta', linestyle='-.', linewidth=1.5,
-                       label=f'Calib thr: {ct["threshold_open"]:.4f}')
+                   label=f'Thr: {threshold_open:.4f}')
         ax.set_ylabel("DTW Distance")
         ax.set_title("Distance to OPEN templates")
         ax.legend(loc='upper right', fontsize=7)
@@ -279,15 +316,14 @@ class OfflineTestReviewDialog(QDialog):
 
         # --- Plot 3: Distance to CLOSED ---
         ax = axs[plot_idx]
-        ax.plot(timestamps, D_closed, 'orange', linewidth=1, label='D_closed')
+        ax.plot(timestamps, D_closed, 'orange', linewidth=1, alpha=0.5 if has_corrected else 1.0,
+                label='D_closed (raw)')
+        if has_corrected:
+            corr_arr = np.array([v if v is not None else np.nan for v in D_closed_corr])
+            ax.plot(timestamps, corr_arr, color='darkorange', linewidth=1.5,
+                    linestyle='--', label='D_closed (corrected)')
         ax.axhline(threshold_closed, color='r', linestyle='--', linewidth=2,
-                   label=f'Model thr: {threshold_closed:.4f}')
-        if has_calibration:
-            ct = self.calibration_thresholds
-            ax.axhline(ct['closed_plateau'], color='b', linestyle=':', linewidth=1.5,
-                       label=f'Plateau: {ct["closed_plateau"]:.4f}')
-            ax.axhline(ct['threshold_closed'], color='magenta', linestyle='-.', linewidth=1.5,
-                       label=f'Calib thr: {ct["threshold_closed"]:.4f}')
+                   label=f'Thr: {threshold_closed:.4f}')
         ax.set_ylabel("DTW Distance")
         ax.set_title("Distance to CLOSED templates")
         ax.legend(loc='upper right', fontsize=7)
@@ -299,7 +335,8 @@ class OfflineTestReviewDialog(QDialog):
             ax = axs[plot_idx]
             sim_open_data = results.get('sim_open', [])
             sim_closed_data = results.get('sim_closed', [])
-            spatial_thr = results['spatial_threshold']
+            spatial_thr = results.get('spatial_threshold')
+            spatial_mode = results.get('spatial_mode', 'off')
 
             if sim_open_data:
                 sim_open_plot = [s if s is not None else float('nan') for s in sim_open_data]
@@ -310,17 +347,20 @@ class OfflineTestReviewDialog(QDialog):
                 ax.plot(timestamps[:len(sim_closed_plot)], sim_closed_plot,
                         'orange', linewidth=1, alpha=0.8, label='Sim CLOSED')
 
-            ax.axhline(spatial_thr, color='r', linestyle='--', linewidth=1.5,
-                        label=f'Spatial thr: {spatial_thr:.2f}')
+            # Show threshold line only for gate mode
+            if spatial_mode == "gate" and spatial_thr is not None:
+                ax.axhline(spatial_thr, color='r', linestyle='--', linewidth=1.5,
+                            label=f'Gate thr: {spatial_thr:.2f}')
 
-            # Mark blocked transitions
+            # Mark blocked transitions (gate mode)
             blocked = results.get('spatial_blocked', [])
             for i, b in enumerate(blocked):
                 if b and i < len(timestamps):
                     ax.axvline(timestamps[i], color='red', alpha=0.3, linewidth=2)
 
+            mode_label = {"gate": "Gate", "scaling": "Distance Scaling", "contrast": "Contrast"}.get(spatial_mode, spatial_mode)
             ax.set_ylabel("Spatial Sim")
-            ax.set_title("Spatial Similarity (consistency-weighted)")
+            ax.set_title(f"Spatial Similarity [{mode_label}]")
             ax.set_ylim(-0.05, 1.05)
             ax.legend(loc='upper right', fontsize=7)
             ax.grid(True, alpha=0.3)
@@ -328,6 +368,15 @@ class OfflineTestReviewDialog(QDialog):
 
         # --- Plot 5: State Comparison ---
         ax = axs[plot_idx]
+
+        # ML probability overlay (grey, behind everything)
+        ml_probs = results.get('ml_probabilities', [])
+        if ml_probs and any(p is not None for p in ml_probs):
+            prob_arr = np.array([p if p is not None else np.nan for p in ml_probs], dtype=float)
+            ax.fill_between(timestamps, 0, prob_arr, step='post',
+                            color='gray', alpha=0.25, label='ML probability')
+            ax.plot(timestamps, prob_arr, color='gray', linewidth=0.8,
+                    alpha=0.5, drawstyle='steps-post')
 
         # New offline prediction (purple)
         pred_numeric = [1 if p == "CLOSED" else 0 for p in predictions]
@@ -340,7 +389,7 @@ class OfflineTestReviewDialog(QDialog):
             if hasattr(gt, 'flatten'):
                 gt = gt.flatten()
             gt = np.array(gt, dtype=float)
-            gt_time = np.arange(len(gt)) / config.FSAMP
+            gt_time = np.arange(len(gt)) / config.FSAMP + self.time_offset
             # Interpolate GT to DTW timestamps for overlay
             gt_at_dtw = np.interp(timestamps, gt_time, gt)
             ax.step(timestamps, gt_at_dtw, 'green', linewidth=1.5, where='post', alpha=0.7,
@@ -712,7 +761,9 @@ class OnlineProtocol(QObject):
         self.offline_test_gt = None  # Real GT from guided recording
         self.offline_test_ref_predictions = None  # Previous online predictions (numeric)
         self.offline_test_recording_type = None  # "guided", "prediction", "emg_only"
-        self.offline_test_calibration_thresholds = None  # Calibration results (if GT available)
+        self._offline_test_dialogs: list = []  # Keep references so windows stay open
+        self._playback_thread = None
+        self._playback_worker = None
 
         # Buffers
         self.emg_buffer: list[np.ndarray] = []
@@ -821,8 +872,9 @@ class OnlineProtocol(QObject):
             self.online_record_toggle_push_button.setText("Stop Recording")
             self.online_load_model_push_button.setEnabled(False)
 
-            # Reset model history for new session
-            self.model_interface.reset_history()
+            # Reset model history for new session with selected initial state
+            initial_state = self.initial_state_combo.currentText()
+            self.model_interface.reset_history(initial_state=initial_state)
 
             # connect signals
             self.main_window.device.ready_read_signal.connect(self.online_emg_update)
@@ -835,7 +887,7 @@ class OnlineProtocol(QObject):
             self.unity_output_buffer = []
 
             print("\n" + "=" * 70)
-            print("RECORDING STARTED - History reset")
+            print(f"RECORDING STARTED - History reset (initial state: {initial_state})")
             print("=" * 70 + "\n")
         else:
             # Stopping recording
@@ -1005,23 +1057,49 @@ class OnlineProtocol(QObject):
         has_spatial = (model is not None
                        and model.spatial_ref_open is not None
                        and model.spatial_ref_closed is not None)
-        self.spatial_correction_checkbox.setEnabled(has_spatial)
+        # Always reset combo to "off" — new Model object always starts with spatial_mode="off",
+        # so keeping the old combo value would desync UI from the model.
+        self.spatial_mode_combo.blockSignals(True)
+        self.spatial_mode_combo.setCurrentIndex(0)
+        self.spatial_mode_combo.blockSignals(False)
+        self.spatial_threshold_row.setVisible(False)
+        self.spatial_sharpness_row.setVisible(False)
+        self.spatial_relu_baseline_row.setVisible(False)
+
+        self.spatial_mode_combo.setEnabled(has_spatial)
         if has_spatial:
             self.spatial_status_label.setText("(available)")
             self.spatial_status_label.setStyleSheet("color: #2a7;")
-            # Sync threshold slider with model
             self.spatial_threshold_slider.setValue(int(model.spatial_threshold * 100))
+            self.spatial_sharpness_spinbox.setValue(model.spatial_sharpness)
         else:
-            self.spatial_status_label.setText("(not available — legacy model)")
+            self.spatial_status_label.setText("(not available)")
             self.spatial_status_label.setStyleSheet("color: #999;")
-            self.spatial_correction_checkbox.setChecked(False)
+
+        # Update ML model availability status
+        has_catboost = (model is not None and model.decision_catboost is not None)
+        has_nn = (model is not None and model.decision_nn is not None)
+        parts = []
+        if has_catboost:
+            cb_mode = "transition" if getattr(model.decision_catboost, 'transition_mode', False) else "posture"
+            parts.append(f"CatBoost {model.decision_catboost.accuracy:.1%} [{cb_mode}]")
+        if has_nn:
+            parts.append(f"NN {model.decision_nn.accuracy:.1%}")
+        if parts:
+            self.decision_model_status_label.setText("(" + ", ".join(parts) + ")")
+            self.decision_model_status_label.setStyleSheet("color: #2a7;")
+        else:
+            self.decision_model_status_label.setText("(no ML models available)")
+            self.decision_model_status_label.setStyleSheet("color: #999;")
+            self.decision_model_combo.setCurrentIndex(0)  # fall back to threshold
 
         # Update threshold display after loading
         self._update_threshold_display()
 
-        # Enable offline test button if recording is also loaded
+        # Enable offline test buttons if recording is also loaded
         if self.offline_test_emg is not None:
             self.run_offline_test_button.setEnabled(True)
+            self.play_realtime_button.setEnabled(True)
 
     def _update_threshold_display(self) -> None:
         """Update the threshold sliders and labels after model load."""
@@ -1131,6 +1209,9 @@ class OnlineProtocol(QObject):
         )
         self.online_record_toggle_push_button.clicked.connect(self._toggle_recording)
 
+        # Add initial state selector next to recording toggle
+        self._setup_initial_state_selector()
+
         # Add unified offline test UI (programmatically)
         self._setup_offline_test_ui()
 
@@ -1145,6 +1226,25 @@ class OnlineProtocol(QObject):
 
         # Add plot options checkbox
         self._setup_plot_options()
+
+    def _setup_initial_state_selector(self) -> None:
+        """Add initial state combo box to the commands group box."""
+        state_widget = QWidget()
+        state_layout = QHBoxLayout()
+        state_layout.setContentsMargins(0, 0, 0, 0)
+        state_layout.addWidget(QLabel("Initial State:"))
+        self.initial_state_combo = QComboBox()
+        self.initial_state_combo.addItems(["OPEN", "CLOSED"])
+        self.initial_state_combo.setCurrentIndex(0)  # Default OPEN
+        self.initial_state_combo.setFixedWidth(90)
+        state_layout.addWidget(self.initial_state_combo)
+        state_layout.addStretch()
+        state_widget.setLayout(state_layout)
+
+        # Add to the commands group box
+        cmd_layout = self.online_commands_group_box.layout()
+        if cmd_layout is not None:
+            cmd_layout.addWidget(state_widget)
 
     def _setup_offline_test_ui(self) -> None:
         """Setup unified offline test UI (replaces separate calibration + simulation)."""
@@ -1163,27 +1263,107 @@ class OnlineProtocol(QObject):
         rec_layout.addStretch()
         layout.addLayout(rec_layout)
 
-        # Run button
+        # Time range row
+        range_layout = QHBoxLayout()
+        range_layout.addWidget(QLabel("Range:"))
+        self.offline_test_start_spinbox = QDoubleSpinBox()
+        self.offline_test_start_spinbox.setMinimum(0.0)
+        self.offline_test_start_spinbox.setMaximum(9999.0)
+        self.offline_test_start_spinbox.setValue(0.0)
+        self.offline_test_start_spinbox.setSuffix(" s")
+        self.offline_test_start_spinbox.setDecimals(1)
+        self.offline_test_start_spinbox.setFixedWidth(90)
+        self.offline_test_start_spinbox.setToolTip("Start time of the recording slice to analyse.")
+        self.offline_test_start_spinbox.setEnabled(False)
+        range_layout.addWidget(self.offline_test_start_spinbox)
+
+        range_layout.addWidget(QLabel("→"))
+
+        self.offline_test_end_spinbox = QDoubleSpinBox()
+        self.offline_test_end_spinbox.setMinimum(0.0)
+        self.offline_test_end_spinbox.setMaximum(9999.0)
+        self.offline_test_end_spinbox.setValue(0.0)
+        self.offline_test_end_spinbox.setSuffix(" s")
+        self.offline_test_end_spinbox.setDecimals(1)
+        self.offline_test_end_spinbox.setFixedWidth(90)
+        self.offline_test_end_spinbox.setToolTip("End time of the recording slice to analyse.")
+        self.offline_test_end_spinbox.setEnabled(False)
+        range_layout.addWidget(self.offline_test_end_spinbox)
+
+        self.offline_test_duration_label = QLabel("")
+        self.offline_test_duration_label.setStyleSheet("color: #888;")
+        range_layout.addWidget(self.offline_test_duration_label)
+        range_layout.addStretch()
+        layout.addLayout(range_layout)
+
+        # Run button + initial state selector
+        run_layout = QHBoxLayout()
         self.run_offline_test_button = QPushButton("Run Offline Test")
         self.run_offline_test_button.setEnabled(False)
         self.run_offline_test_button.clicked.connect(self._run_offline_test)
-        layout.addWidget(self.run_offline_test_button)
+        run_layout.addWidget(self.run_offline_test_button)
 
-        # Calibration results display (only visible when GT available and test completed)
-        self.calibration_results_label = QLabel("")
-        self.calibration_results_label.setStyleSheet(
-            "font-family: monospace; color: #333333; background-color: #f5f5f5; padding: 8px; border-radius: 4px;"
+        run_layout.addWidget(QLabel("Start:"))
+        self.offline_test_initial_state_combo = QComboBox()
+        self.offline_test_initial_state_combo.addItems(["OPEN", "CLOSED"])
+        self.offline_test_initial_state_combo.setCurrentIndex(0)  # Default OPEN
+        self.offline_test_initial_state_combo.setFixedWidth(90)
+        run_layout.addWidget(self.offline_test_initial_state_combo)
+        run_layout.addStretch()
+        layout.addLayout(run_layout)
+
+        # Real-time playback row
+        playback_layout = QHBoxLayout()
+        self.play_realtime_button = QPushButton("▶ Play Real-time")
+        self.play_realtime_button.setEnabled(False)
+        self.play_realtime_button.setToolTip(
+            "Stream the recording through the model at real-time speed.\n"
+            "Updates the EMG plot and sends predictions to Unity, just like live data."
         )
-        self.calibration_results_label.setWordWrap(True)
-        self.calibration_results_label.setVisible(False)
-        layout.addWidget(self.calibration_results_label)
+        self.play_realtime_button.clicked.connect(self._run_realtime_playback)
+        playback_layout.addWidget(self.play_realtime_button)
 
-        # Apply calibration thresholds button (only visible when calibration available)
-        self.apply_calibration_button = QPushButton("Apply Calibration Thresholds to Sliders")
-        self.apply_calibration_button.setEnabled(False)
-        self.apply_calibration_button.setVisible(False)
-        self.apply_calibration_button.clicked.connect(self._apply_calibration)
-        layout.addWidget(self.apply_calibration_button)
+        self.stop_playback_button = QPushButton("■ Stop")
+        self.stop_playback_button.setEnabled(False)
+        self.stop_playback_button.clicked.connect(self._stop_realtime_playback)
+        playback_layout.addWidget(self.stop_playback_button)
+
+        playback_layout.addWidget(QLabel("Speed:"))
+        self.playback_speed_spinbox = QDoubleSpinBox()
+        self.playback_speed_spinbox.setMinimum(0.1)
+        self.playback_speed_spinbox.setMaximum(10.0)
+        self.playback_speed_spinbox.setSingleStep(0.5)
+        self.playback_speed_spinbox.setValue(1.0)
+        self.playback_speed_spinbox.setSuffix("×")
+        self.playback_speed_spinbox.setDecimals(1)
+        self.playback_speed_spinbox.setFixedWidth(75)
+        playback_layout.addWidget(self.playback_speed_spinbox)
+
+        self._playback_time_label = QLabel("")
+        self._playback_time_label.setStyleSheet("color: #888; font-family: monospace;")
+        playback_layout.addWidget(self._playback_time_label)
+        playback_layout.addStretch()
+        layout.addLayout(playback_layout)
+
+        # Decision model selector
+        decision_layout = QHBoxLayout()
+        decision_layout.addWidget(QLabel("Decision Model:"))
+        self.decision_model_combo = QComboBox()
+        self.decision_model_combo.addItems(["Threshold", "CatBoost", "Neural Network"])
+        self.decision_model_combo.setEnabled(True)
+        self.decision_model_combo.setToolTip(
+            "Threshold: manual sliders + optional spatial correction\n"
+            "CatBoost: gradient boosting trained from templates (deterministic)\n"
+            "Neural Network: small NN trained from templates (requires PyTorch)"
+        )
+        self.decision_model_combo.currentIndexChanged.connect(self._on_decision_model_changed)
+        decision_layout.addWidget(self.decision_model_combo)
+
+        self.decision_model_status_label = QLabel("")
+        self.decision_model_status_label.setStyleSheet("color: #999;")
+        decision_layout.addWidget(self.decision_model_status_label)
+        decision_layout.addStretch()
+        layout.addLayout(decision_layout)
 
         self.offline_test_group_box.setLayout(layout)
 
@@ -1254,7 +1434,6 @@ class OnlineProtocol(QObject):
             self.offline_test_recording = data
             self.offline_test_emg = emg
             self.offline_test_recording_type = recording_type
-            self.offline_test_calibration_thresholds = None  # Reset previous calibration
 
             # Update UI
             n_ch, n_samples = emg.shape
@@ -1273,15 +1452,20 @@ class OnlineProtocol(QObject):
             )
             self.offline_test_recording_label.setStyleSheet("color: #333;")
 
-            # Hide previous calibration results
-            self.calibration_results_label.setVisible(False)
-            self.apply_calibration_button.setVisible(False)
-            self.apply_calibration_button.setEnabled(False)
+            # Configure time range spinboxes
+            self.offline_test_start_spinbox.setMaximum(duration_s)
+            self.offline_test_end_spinbox.setMaximum(duration_s)
+            self.offline_test_start_spinbox.setValue(0.0)
+            self.offline_test_end_spinbox.setValue(duration_s)
+            self.offline_test_duration_label.setText(f"of {duration_s:.1f}s total")
+            self.offline_test_start_spinbox.setEnabled(True)
+            self.offline_test_end_spinbox.setEnabled(True)
 
-            # Enable run button only if model is loaded
+            # Enable run/play buttons only if model is loaded
             model_loaded = (self.model_interface is not None and
                             self.model_interface.model_is_loaded)
             self.run_offline_test_button.setEnabled(model_loaded)
+            self.play_realtime_button.setEnabled(model_loaded)
 
             if not model_loaded:
                 self.offline_test_recording_label.setText(
@@ -1316,9 +1500,48 @@ class OnlineProtocol(QObject):
 
         model = self.model_interface.model
 
+        initial_state = self.offline_test_initial_state_combo.currentText()
+
+        # --- Slice EMG and annotations by time range ---
+        start_s = self.offline_test_start_spinbox.value()
+        end_s = self.offline_test_end_spinbox.value()
+        if end_s <= start_s:
+            end_s = start_s + 1.0
+
+        n_total = self.offline_test_emg.shape[1]
+        start_sample = max(0, min(int(start_s * config.FSAMP), n_total - 1))
+        end_sample = max(start_sample + 1, min(int(end_s * config.FSAMP), n_total))
+        emg_slice = self.offline_test_emg[:, start_sample:end_sample]
+
+        # Slice GT (at FSAMP rate)
+        gt_slice = None
+        if self.offline_test_gt is not None:
+            gt_arr = self.offline_test_gt
+            gt_slice = gt_arr[start_sample:min(end_sample, len(gt_arr))]
+
+        # Slice ref_predictions (at DTW rate — proportional to total duration)
+        ref_slice = None
+        if self.offline_test_ref_predictions is not None:
+            ref = self.offline_test_ref_predictions
+            n_ref = len(ref)
+            total_dur_s = n_total / config.FSAMP
+            if total_dur_s > 0:
+                ref_start = max(0, int((start_s / total_dur_s) * n_ref))
+                ref_end = min(n_ref, int((end_s / total_dur_s) * n_ref))
+                ref_slice = ref[ref_start:ref_end] if ref_end > ref_start else None
+
+        # Store slices so _on_offline_test_finished can access them
+        self._offline_test_emg_slice = emg_slice
+        self._offline_test_gt_slice = gt_slice
+        self._offline_test_ref_slice = ref_slice
+        self._offline_test_start_s = start_s
+
+        print(f"[OFFLINE TEST] Time range: {start_s:.1f}s – {end_s:.1f}s "
+              f"({emg_slice.shape[1]} samples)")
+
         self._offline_test_thread = QThread()
         self._offline_test_worker = SimulationWorker(
-            self.offline_test_emg, model, gt_data=self.offline_test_gt
+            emg_slice, model, initial_state=initial_state,
         )
         self._offline_test_worker.moveToThread(self._offline_test_thread)
         self._offline_test_thread.started.connect(self._offline_test_worker.run)
@@ -1329,7 +1552,7 @@ class OnlineProtocol(QObject):
         self._offline_test_thread.finished.connect(self._offline_test_thread.deleteLater)
         self._offline_test_thread.start()
 
-    def _on_offline_test_finished(self, results: dict, calibration_thresholds) -> None:
+    def _on_offline_test_finished(self, results: dict) -> None:
         """Handle offline test completion."""
         self.run_offline_test_button.setEnabled(True)
         self.run_offline_test_button.setText("Run Offline Test")
@@ -1343,82 +1566,172 @@ class OnlineProtocol(QObject):
         print(f"\n[OFFLINE TEST] Complete: {n_dtw} DTW steps, avg {avg_time:.2f}ms")
         print(f"  Predictions: {n_closed} CLOSED, {n_open} OPEN")
 
-        # Store calibration thresholds if available
-        self.offline_test_calibration_thresholds = calibration_thresholds
+        # Show review dialog (standalone — keep all open simultaneously)
+        emg_for_dialog = getattr(self, '_offline_test_emg_slice', self.offline_test_emg)
+        gt_for_dialog = getattr(self, '_offline_test_gt_slice', self.offline_test_gt)
+        ref_for_dialog = getattr(self, '_offline_test_ref_slice', self.offline_test_ref_predictions)
 
-        # Show calibration results UI if GT was available
-        if calibration_thresholds is not None:
-            ct = calibration_thresholds
-            self.calibration_results_label.setText(
-                f"OPEN plateau:     {ct['open_plateau']:.4f}    "
-                f"threshold: {ct['threshold_open']:.4f} (plateau + 1.0 x std)\n"
-                f"CLOSED plateau:   {ct['closed_plateau']:.4f}    "
-                f"threshold: {ct['threshold_closed']:.4f} (plateau + 1.0 x std)"
-            )
-            self.calibration_results_label.setStyleSheet(
-                "font-family: monospace; color: #333333; background-color: #f5f5f5; padding: 8px; border-radius: 4px;"
-            )
-            self.calibration_results_label.setVisible(True)
-            self.apply_calibration_button.setVisible(True)
-            self.apply_calibration_button.setEnabled(True)
-        else:
-            self.calibration_results_label.setVisible(False)
-            self.apply_calibration_button.setVisible(False)
-            self.apply_calibration_button.setEnabled(False)
-
-        # Get model thresholds for comparison in the review dialog
-        model_thresholds = None
-        thresholds_data = self.model_interface.get_current_thresholds()
-        if thresholds_data and thresholds_data.get("threshold_open") is not None:
-            model_thresholds = {
-                "threshold_open": thresholds_data["threshold_open"],
-                "threshold_closed": thresholds_data["threshold_closed"],
-            }
-
-        # Show review dialog
-        self._offline_test_review_dialog = OfflineTestReviewDialog(
-            emg_data=self.offline_test_emg,
+        dialog = OfflineTestReviewDialog(
+            emg_data=emg_for_dialog,
             results=results,
-            gt_data=self.offline_test_gt,
-            ref_predictions=self.offline_test_ref_predictions,
-            calibration_thresholds=calibration_thresholds,
-            model_thresholds=model_thresholds,
+            gt_data=gt_for_dialog,
+            ref_predictions=ref_for_dialog,
             recording_type=self.offline_test_recording_type or "unknown",
-            parent=self.main_window,
+            time_offset=getattr(self, '_offline_test_start_s', 0.0),
+            parent=None,  # No parent → truly standalone window
         )
-        self._offline_test_review_dialog.show()
+        # Remove any dialogs that have been closed to free memory
+        self._offline_test_dialogs = [d for d in self._offline_test_dialogs
+                                       if not d.isHidden()]
+        self._offline_test_dialogs.append(dialog)
+        dialog.show()
 
     def _on_offline_test_error(self, error_msg: str) -> None:
         """Handle offline test error."""
         self.run_offline_test_button.setEnabled(True)
         self.run_offline_test_button.setText("Run Offline Test")
-        self.calibration_results_label.setText(f"Error: {error_msg}")
-        self.calibration_results_label.setStyleSheet(
-            "font-family: monospace; color: red; background-color: #fff0f0; padding: 8px; border-radius: 4px;"
-        )
-        self.calibration_results_label.setVisible(True)
         QMessageBox.critical(self.main_window, "Offline Test Error",
                              f"Offline test failed:\n{error_msg}", QMessageBox.Ok)
         print(f"[OFFLINE TEST ERROR] {error_msg}")
 
-    def _apply_calibration(self) -> None:
-        """Apply calibrated thresholds to sliders."""
-        if not self.offline_test_calibration_thresholds:
+    # ------------------------------------------------------------------
+    # Real-time playback
+    # ------------------------------------------------------------------
+
+    def _run_realtime_playback(self) -> None:
+        """Stream the loaded recording through the model at real-time speed."""
+        if self.offline_test_emg is None:
+            return
+        if self.model_interface is None or self.model_interface.model is None:
+            QMessageBox.warning(self.main_window, "No Model",
+                                "Please load a model first.", QMessageBox.Ok)
             return
 
-        threshold_open = self.offline_test_calibration_thresholds['threshold_open']
-        threshold_closed = self.offline_test_calibration_thresholds['threshold_closed']
+        # Slice by time range (same logic as _run_offline_test)
+        start_s = self.offline_test_start_spinbox.value()
+        end_s   = self.offline_test_end_spinbox.value()
+        if end_s <= start_s:
+            end_s = start_s + 1.0
+        n_total = self.offline_test_emg.shape[1]
+        start_sample = max(0, min(int(start_s * config.FSAMP), n_total - 1))
+        end_sample   = max(start_sample + 1, min(int(end_s * config.FSAMP), n_total))
+        emg_slice = self.offline_test_emg[:, start_sample:end_sample]
 
-        # Set thresholds directly
-        self.model_interface.set_threshold_open_direct(threshold_open)
-        self.model_interface.set_threshold_closed_direct(threshold_closed)
+        speed = self.playback_speed_spinbox.value()
 
-        # Update slider display
-        self._update_threshold_display()
+        # Reset model state for fresh playback
+        initial_state = self.offline_test_initial_state_combo.currentText()
+        self.model_interface.reset_history(initial_state=initial_state)
 
-        print(f"\n[CALIBRATION] Applied thresholds:")
-        print(f"  OPEN:   {threshold_open:.4f}")
-        print(f"  CLOSED: {threshold_closed:.4f}\n")
+        duration_s = emg_slice.shape[1] / config.FSAMP
+        print(f"\n[PLAYBACK] Starting real-time playback")
+        print(f"  EMG: {emg_slice.shape}, duration: {duration_s:.1f}s at {speed:.1f}× speed")
+        print(f"  Initial state: {initial_state}")
+
+        # Update UI
+        self.play_realtime_button.setEnabled(False)
+        self.run_offline_test_button.setEnabled(False)
+        self.stop_playback_button.setEnabled(True)
+        self._playback_time_label.setText("▶ 0.0s")
+
+        self._playback_thread = QThread()
+        self._playback_worker = RealtimePlaybackWorker(emg_slice, speed=speed)
+        self._playback_worker.moveToThread(self._playback_thread)
+        self._playback_thread.started.connect(self._playback_worker.run)
+        self._playback_worker.chunk_ready.connect(self._on_playback_chunk)
+        self._playback_worker.progress.connect(self._on_playback_progress)
+        self._playback_worker.finished.connect(self._on_playback_finished)
+        self._playback_worker.error.connect(self._on_playback_error)
+        self._playback_worker.finished.connect(self._playback_thread.quit)
+        self._playback_worker.error.connect(self._playback_thread.quit)
+        self._playback_thread.finished.connect(self._playback_thread.deleteLater)
+        self._playback_thread.start()
+
+    def _on_playback_chunk(self, emg_chunk: np.ndarray) -> None:
+        """Called in the main thread for each streamed EMG chunk."""
+        # Update the VisPy real-time plot (same scaling as live mode)
+        try:
+            if (hasattr(self.main_window, 'plot')
+                    and self.main_window.plot is not None
+                    and self.main_window.plot_enabled_check_box.isChecked()):
+                self.main_window.plot.set_plot_data(emg_chunk / 1000)
+        except Exception:
+            pass  # Plot update is best-effort; don't crash playback
+
+        # Run model prediction
+        self.model_interface.predict(emg_chunk)
+        result = self.model_interface.get_last_result()
+
+        if result:
+            state = result['state']
+            joint_value = int(state)
+            unity_data = [joint_value] * 10
+            self.main_window.virtual_hand_interface.output_message_signal.emit(
+                str(unity_data).encode("utf-8")
+            )
+
+    def _on_playback_progress(self, t: float) -> None:
+        self._playback_time_label.setText(f"▶ {t:.1f}s")
+
+    def _on_playback_finished(self) -> None:
+        self.play_realtime_button.setEnabled(True)
+        self.stop_playback_button.setEnabled(False)
+        self.run_offline_test_button.setEnabled(True)
+        self._playback_time_label.setText("■ Done")
+        print("[PLAYBACK] Finished")
+
+    def _on_playback_error(self, error_msg: str) -> None:
+        self.play_realtime_button.setEnabled(True)
+        self.stop_playback_button.setEnabled(False)
+        self.run_offline_test_button.setEnabled(True)
+        self._playback_time_label.setText("")
+        QMessageBox.critical(self.main_window, "Playback Error",
+                             f"Playback failed:\n{error_msg}", QMessageBox.Ok)
+        print(f"[PLAYBACK ERROR] {error_msg}")
+
+    def _stop_realtime_playback(self) -> None:
+        if self._playback_worker is not None:
+            self._playback_worker.stop()
+        self.stop_playback_button.setEnabled(False)
+        self._playback_time_label.setText("■ Stopped")
+        print("[PLAYBACK] Stopped by user")
+
+    def _on_decision_model_changed(self, index: int) -> None:
+        """Handle decision model combo change."""
+        model = self.model_interface.model if self.model_interface else None
+        choice = self.decision_model_combo.currentText()
+
+        if choice == "CatBoost":
+            if model is None or model.decision_catboost is None:
+                QMessageBox.information(self.main_window, "Not Available",
+                    "No CatBoost model in the loaded model file.\n"
+                    "Recreate the model with 'Decision Model: CatBoost' selected.")
+                self.decision_model_combo.setCurrentIndex(0)
+                return
+            if model:
+                model.decision_mode = "catboost"
+            self.threshold_group_box.setEnabled(False)
+            self.spatial_group_box.setEnabled(False)
+            print(f"[DECISION] CatBoost (accuracy={model.decision_catboost.accuracy:.1%})")
+        elif choice == "Neural Network":
+            if model is None or model.decision_nn is None:
+                QMessageBox.information(self.main_window, "Not Available",
+                    "No Neural Network model in the loaded model file.\n"
+                    "Recreate the model with 'Decision Model: Neural Network' selected.")
+                self.decision_model_combo.setCurrentIndex(0)
+                return
+            if model:
+                model.decision_mode = "nn"
+            self.threshold_group_box.setEnabled(False)
+            self.spatial_group_box.setEnabled(False)
+            print(f"[DECISION] Neural Network (accuracy={model.decision_nn.accuracy:.1%})")
+        else:  # Threshold
+            if model:
+                model.decision_mode = "threshold"
+            self.threshold_group_box.setEnabled(True)
+            self.spatial_group_box.setEnabled(True)
+            print(f"[DECISION] Threshold mode")
+
 
     def _setup_threshold_slider(self) -> None:
         """Setup threshold tuning sliders UI (direct threshold control)."""
@@ -1545,22 +1858,33 @@ class OnlineProtocol(QObject):
         self.model_interface.set_refractory_period(value)
 
     def _setup_spatial_correction_ui(self) -> None:
-        """Setup spatial correction controls (consistency-weighted spatial match)."""
+        """Setup spatial correction controls with mode selector."""
         self.spatial_group_box = QGroupBox("Spatial Correction")
 
         layout = QVBoxLayout()
 
-        # Enable checkbox
+        # Mode selector
         row1 = QHBoxLayout()
-        self.spatial_correction_checkbox = QCheckBox("Enable spatial correction")
-        self.spatial_correction_checkbox.setChecked(False)
-        self.spatial_correction_checkbox.setToolTip(
-            "When enabled, state transitions require both DTW distance < threshold\n"
-            "AND spatial pattern similarity > spatial threshold.\n"
-            "Helps reject co-contractions and false triggers."
+        row1.addWidget(QLabel("Mode:"))
+        self.spatial_mode_combo = QComboBox()
+        self.spatial_mode_combo.addItem("Off", "off")
+        self.spatial_mode_combo.addItem("Gate (threshold)", "gate")
+        self.spatial_mode_combo.addItem("Distance Scaling", "scaling")
+        self.spatial_mode_combo.addItem("Contrast", "contrast")
+        self.spatial_mode_combo.addItem("ReLU Scaling", "relu_scaling")
+        self.spatial_mode_combo.addItem("ReLU Contrast", "relu_contrast")
+        self.spatial_mode_combo.setCurrentIndex(0)
+        self.spatial_mode_combo.setToolTip(
+            "Off: no spatial correction\n"
+            "Gate: block transitions if spatial similarity < threshold\n"
+            "Distance Scaling: D / sim^k — power-law penalty\n"
+            "Contrast: D * (sim_current / sim_target)^k — ratio between classes\n"
+            "ReLU Scaling: D / f(sim_target) — exponential penalty, saturates at 1 above threshold\n"
+            "ReLU Contrast: D * f(sim_current) / f(sim_target) — combines ratio reward/penalty "
+            "with ReLU saturation (best of both worlds)"
         )
-        self.spatial_correction_checkbox.stateChanged.connect(self._on_spatial_correction_toggled)
-        row1.addWidget(self.spatial_correction_checkbox)
+        self.spatial_mode_combo.currentIndexChanged.connect(self._on_spatial_mode_changed)
+        row1.addWidget(self.spatial_mode_combo)
 
         self.spatial_status_label = QLabel("(not available)")
         self.spatial_status_label.setStyleSheet("color: #999;")
@@ -1568,8 +1892,10 @@ class OnlineProtocol(QObject):
         row1.addStretch()
         layout.addLayout(row1)
 
-        # Threshold slider
+        # Threshold slider (only for gate mode)
+        self.spatial_threshold_row = QWidget()
         row2 = QHBoxLayout()
+        row2.setContentsMargins(0, 0, 0, 0)
         row2.addWidget(QLabel("Threshold:"))
 
         self.spatial_threshold_slider = QSlider(Qt.Horizontal)
@@ -1578,8 +1904,7 @@ class OnlineProtocol(QObject):
         self.spatial_threshold_slider.setValue(50)  # Default 0.50
         self.spatial_threshold_slider.setToolTip(
             "Minimum spatial similarity required to allow a state transition.\n"
-            "Higher = more strict (fewer false triggers, but may miss real ones).\n"
-            "Lower = more permissive."
+            "Higher = more strict, Lower = more permissive."
         )
         self.spatial_threshold_slider.valueChanged.connect(self._on_spatial_threshold_changed)
         row2.addWidget(self.spatial_threshold_slider)
@@ -1587,7 +1912,84 @@ class OnlineProtocol(QObject):
         self.spatial_threshold_label = QLabel("0.50")
         self.spatial_threshold_label.setMinimumWidth(40)
         row2.addWidget(self.spatial_threshold_label)
-        layout.addLayout(row2)
+        self.spatial_threshold_row.setLayout(row2)
+        self.spatial_threshold_row.setVisible(False)  # Hidden by default (shown for gate mode)
+        layout.addWidget(self.spatial_threshold_row)
+
+        # Sharpness spinbox (for scaling and contrast modes)
+        self.spatial_sharpness_row = QWidget()
+        row3 = QHBoxLayout()
+        row3.setContentsMargins(0, 0, 0, 0)
+        row3.addWidget(QLabel("Sharpness (k):"))
+        self.spatial_sharpness_spinbox = QDoubleSpinBox()
+        self.spatial_sharpness_spinbox.setMinimum(1.0)
+        self.spatial_sharpness_spinbox.setMaximum(10.0)
+        self.spatial_sharpness_spinbox.setSingleStep(0.5)
+        self.spatial_sharpness_spinbox.setValue(3.0)  # Default k=3
+        self.spatial_sharpness_spinbox.setDecimals(1)
+        self.spatial_sharpness_spinbox.setToolTip(
+            "Exponent for nonlinear spatial correction.\n"
+            "k=1: linear (weak), k=3: moderate, k=5+: aggressive.\n"
+            "Scaling: D / sim^k  |  Contrast: D * (sim_current/sim_target)^k"
+        )
+        self.spatial_sharpness_spinbox.valueChanged.connect(self._on_spatial_sharpness_changed)
+        row3.addWidget(self.spatial_sharpness_spinbox)
+        row3.addStretch()
+        self.spatial_sharpness_row.setLayout(row3)
+        self.spatial_sharpness_row.setVisible(False)  # Hidden by default
+        layout.addWidget(self.spatial_sharpness_row)
+
+        # Baseline for ReLU scaling (f(0) = baseline, f(threshold) = 1)
+        self.spatial_relu_baseline_row = QWidget()
+        row_rb = QHBoxLayout()
+        row_rb.setContentsMargins(0, 0, 0, 0)
+        row_rb.addWidget(QLabel("Baseline (b):"))
+        self.spatial_relu_baseline_spinbox = QDoubleSpinBox()
+        self.spatial_relu_baseline_spinbox.setMinimum(0.01)
+        self.spatial_relu_baseline_spinbox.setMaximum(0.99)
+        self.spatial_relu_baseline_spinbox.setSingleStep(0.05)
+        self.spatial_relu_baseline_spinbox.setValue(0.2)
+        self.spatial_relu_baseline_spinbox.setDecimals(2)
+        self.spatial_relu_baseline_spinbox.setToolTip(
+            "Minimum value of f(sim) at sim=0.\n"
+            "f(sim) = b^(1 - sim/threshold): concave-up exponential.\n"
+            "Lower b → more aggressive penalty for low similarities."
+        )
+        self.spatial_relu_baseline_spinbox.valueChanged.connect(self._on_spatial_relu_baseline_changed)
+        row_rb.addWidget(self.spatial_relu_baseline_spinbox)
+        row_rb.addStretch()
+        self.spatial_relu_baseline_row.setLayout(row_rb)
+        self.spatial_relu_baseline_row.setVisible(False)
+        layout.addWidget(self.spatial_relu_baseline_row)
+
+        # Spatial similarity profile mode (mean vs per-template top-k)
+        self.spatial_profile_row = QWidget()
+        row4 = QHBoxLayout()
+        row4.setContentsMargins(0, 0, 0, 0)
+        row4.addWidget(QLabel("Profile:"))
+        self.spatial_profile_combo = QComboBox()
+        self.spatial_profile_combo.addItem("Mean profile", "mean")
+        self.spatial_profile_combo.addItem("Per-template top-k", "per_template")
+        self.spatial_profile_combo.setToolTip(
+            "Mean profile: similarity against the class mean spatial profile.\n"
+            "Per-template top-k: compute similarity against each template, "
+            "average the k highest (analogous to avg_3_smallest DTW)."
+        )
+        self.spatial_profile_combo.currentIndexChanged.connect(self._on_spatial_profile_mode_changed)
+        row4.addWidget(self.spatial_profile_combo)
+
+        self.spatial_nbest_spinbox = QSpinBox()
+        self.spatial_nbest_spinbox.setMinimum(1)
+        self.spatial_nbest_spinbox.setMaximum(20)
+        self.spatial_nbest_spinbox.setValue(3)
+        self.spatial_nbest_spinbox.setPrefix("k=")
+        self.spatial_nbest_spinbox.setToolTip("Number of top similarities to average.")
+        self.spatial_nbest_spinbox.setVisible(False)
+        self.spatial_nbest_spinbox.valueChanged.connect(self._on_spatial_nbest_changed)
+        row4.addWidget(self.spatial_nbest_spinbox)
+        row4.addStretch()
+        self.spatial_profile_row.setLayout(row4)
+        layout.addWidget(self.spatial_profile_row)
 
         self.spatial_group_box.setLayout(layout)
 
@@ -1595,18 +1997,36 @@ class OnlineProtocol(QObject):
         if self.online_commands_group_box.layout():
             self.online_commands_group_box.layout().addWidget(self.spatial_group_box)
 
-    def _on_spatial_correction_toggled(self, state: int) -> None:
-        """Toggle spatial correction on/off."""
-        enabled = state == Qt.Checked.value if hasattr(Qt.Checked, 'value') else state == 2
+    def _on_spatial_mode_changed(self, index: int) -> None:
+        """Handle spatial correction mode change."""
+        mode = self.spatial_mode_combo.currentData()
+
+        # Show/hide threshold slider (gate = block threshold; relu modes = saturation point)
+        self.spatial_threshold_row.setVisible(mode in ("gate", "relu_scaling", "relu_contrast"))
+        # Show/hide sharpness spinbox (power-law modes + relu modes)
+        self.spatial_sharpness_row.setVisible(mode in ("scaling", "contrast", "relu_scaling", "relu_contrast"))
+        # Show/hide baseline spinbox (relu modes only)
+        self.spatial_relu_baseline_row.setVisible(mode in ("relu_scaling", "relu_contrast"))
+
         if self.model_interface.model is not None:
-            self.model_interface.model.use_spatial_correction = enabled
-            status = "ON" if enabled else "OFF"
-            print(f"[SPATIAL] Spatial correction: {status}")
+            model = self.model_interface.model
+            if mode == "off":
+                model.spatial_mode = "off"
+                model.use_spatial_correction = False
+            else:
+                if model.spatial_ref_open is None or model.spatial_ref_closed is None:
+                    self.spatial_mode_combo.setCurrentIndex(0)  # Reset to off
+                    QMessageBox.information(self.main_window, "Not Available",
+                                            "This model has no spatial profiles. Spatial correction unavailable.")
+                    return
+                model.spatial_mode = mode
+                model.use_spatial_correction = True
+            print(f"[SPATIAL] Mode: {mode}")
         else:
-            if enabled:
-                self.spatial_correction_checkbox.setChecked(False)
+            if mode != "off":
+                self.spatial_mode_combo.setCurrentIndex(0)
                 QMessageBox.information(self.main_window, "No Model",
-                                        "Load a model first before enabling spatial correction.")
+                                        "Load a model first.")
 
     def _on_spatial_threshold_changed(self, value: int) -> None:
         """Update spatial similarity threshold from slider."""
@@ -1615,6 +2035,32 @@ class OnlineProtocol(QObject):
         if self.model_interface.model is not None:
             self.model_interface.model.spatial_threshold = threshold
             print(f"[SPATIAL] Threshold: {threshold:.2f}")
+
+    def _on_spatial_sharpness_changed(self, value: float) -> None:
+        """Update spatial sharpness exponent."""
+        if self.model_interface.model is not None:
+            self.model_interface.model.spatial_sharpness = value
+            print(f"[SPATIAL] Sharpness (k): {value:.1f}")
+
+    def _on_spatial_relu_baseline_changed(self, value: float) -> None:
+        """Update ReLU scaling baseline."""
+        if self.model_interface.model is not None:
+            self.model_interface.model.spatial_relu_baseline = value
+            print(f"[SPATIAL] ReLU baseline (b): {value:.2f}")
+
+    def _on_spatial_profile_mode_changed(self, index: int) -> None:
+        """Switch between mean-profile and per-template spatial similarity."""
+        mode = self.spatial_profile_combo.currentData()
+        self.spatial_nbest_spinbox.setVisible(mode == "per_template")
+        if self.model_interface.model is not None:
+            self.model_interface.model.spatial_similarity_mode = mode
+            print(f"[SPATIAL] Profile mode: {mode}")
+
+    def _on_spatial_nbest_changed(self, value: int) -> None:
+        """Update top-k for per-template spatial similarity."""
+        if self.model_interface.model is not None:
+            self.model_interface.model.spatial_n_best = value
+            print(f"[SPATIAL] Per-template k: {value}")
 
     def _setup_plot_options(self) -> None:
         """Setup plot options UI."""

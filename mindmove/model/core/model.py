@@ -14,6 +14,7 @@ from mindmove.model.core.features import *
 from mindmove.model.core.windowing import sliding_window
 from mindmove.model.core.filtering import apply_rtfiltering
 from mindmove.model.core.algorithm import compute_distance_from_training_set_online, compute_spatial_similarity
+from mindmove.model.core.decision_network import DecisionNetworkInference, CatBoostDecisionInference
 
 if TYPE_CHECKING:
     pass
@@ -128,10 +129,21 @@ class Model:
 
         # Spatial correction (consistency-weighted spatial match)
         self.use_spatial_correction = False  # Toggled from UI
-        self.spatial_threshold = 0.5  # Default threshold for spatial similarity
+        self.spatial_mode = "off"  # "off", "gate", "scaling", "contrast"
+        self.spatial_threshold = 0.5  # Default threshold for gate/relu_scaling modes
+        self.spatial_sharpness = 3.0  # Exponent k for scaling/contrast modes
+        self.spatial_relu_baseline = 0.2  # Baseline b for relu_scaling: f(0)=b, f(threshold)=1
         self.spatial_ref_open = None  # dict: ref_profile, weights, consistency
         self.spatial_ref_closed = None  # dict: ref_profile, weights, consistency
         self.spatial_similarity_history = []  # (timestamp, sim_open, sim_closed)
+        # Per-template spatial similarity mode
+        self.spatial_similarity_mode = "mean"   # "mean" or "per_template"
+        self.spatial_n_best = 3                 # top-k for per_template mode
+
+        # Decision mode: "threshold" (manual), "nn" (neural network), or "catboost" (gradient boosting)
+        self.decision_mode = "threshold"
+        self.decision_nn = None  # DecisionNetworkInference instance (or None)
+        self.decision_catboost = None  # CatBoostDecisionInference instance (or None)
 
 
 
@@ -284,8 +296,14 @@ class Model:
         params = data.get("parameters", {})
         if params:
             self.window_length = params.get("window_samples", config.window_length)
-            self.increment = params.get("overlap_samples", config.increment)
-            print(f"  - Window/overlap (from model): {self.window_length}/{self.increment} samples")
+            if "increment_samples" in params:
+                # New format: explicit increment saved
+                self.increment = params["increment_samples"]
+            else:
+                # Old format: compute increment from overlap
+                overlap_samples = params.get("overlap_samples", 0)
+                self.increment = max(1, self.window_length - overlap_samples)
+            print(f"  - Window: {self.window_length}, increment: {self.increment} samples (from model)")
         else:
             # Fallback to config for backwards compatibility
             self.window_length = config.window_length
@@ -305,11 +323,46 @@ class Model:
             self.spatial_ref_open = spatial_data.get("open", None)
             self.spatial_ref_closed = spatial_data.get("closed", None)
             self.spatial_threshold = spatial_data.get("threshold", 0.5)
-            print(f"  - Spatial correction: available (threshold={self.spatial_threshold:.2f})")
+            self.spatial_sharpness = spatial_data.get("sharpness", 3.0)
+            # Per-template RMS (for per-template similarity mode; None on legacy models)
+            n_open_tpl  = len(self.spatial_ref_open.get("per_template_rms",  [])) if self.spatial_ref_open  else 0
+            n_closed_tpl = len(self.spatial_ref_closed.get("per_template_rms", [])) if self.spatial_ref_closed else 0
+            has_per_tpl = n_open_tpl > 0 and n_closed_tpl > 0
+            print(f"  - Spatial correction: available (threshold={self.spatial_threshold:.2f}, "
+                  f"auto-k={self.spatial_sharpness:.1f}, "
+                  f"per-template={'yes' if has_per_tpl else 'no (legacy)'})")
         else:
             self.spatial_ref_open = None
             self.spatial_ref_closed = None
             print(f"  - Spatial correction: not available (legacy model)")
+
+        # Decision network (optional)
+        nn_weights = data.get("decision_nn_weights", None)
+        if nn_weights is not None:
+            self.decision_nn = DecisionNetworkInference(nn_weights)
+            print(f"  - Decision NN: available (accuracy={self.decision_nn.accuracy:.1%}, "
+                  f"{self.decision_nn.n_inputs} inputs, "
+                  f"{'with' if self.decision_nn.has_spatial else 'without'} spatial)")
+        else:
+            self.decision_nn = None
+            print(f"  - Decision NN: not available")
+
+        # CatBoost model (optional)
+        catboost_data = data.get("decision_catboost_model", None)
+        if catboost_data is not None:
+            try:
+                self.decision_catboost = CatBoostDecisionInference(catboost_data)
+                mode_str = "transition" if self.decision_catboost.transition_mode else "posture"
+                print(f"  - CatBoost: available (accuracy={self.decision_catboost.accuracy:.1%}, "
+                      f"{self.decision_catboost.n_trees} trees, "
+                      f"{'with' if self.decision_catboost.has_spatial else 'without'} spatial, "
+                      f"mode={mode_str})")
+            except Exception as e:
+                self.decision_catboost = None
+                print(f"  - CatBoost: failed to load ({e})")
+        else:
+            self.decision_catboost = None
+            print(f"  - CatBoost: not available")
 
         # Differential mode: load from model or infer from channel count
         self.differential_mode = data.get("differential_mode", None)
@@ -483,8 +536,12 @@ class Model:
         """Check if this model has threshold presets available."""
         return self.threshold_presets is not None and len(self.threshold_presets) > 0
 
-    def reset_history(self) -> None:
-        """Reset all history buffers for a new acquisition session."""
+    def reset_history(self, initial_state: str = None) -> None:
+        """Reset all history buffers for a new acquisition session.
+
+        Args:
+            initial_state: Starting state ("OPEN" or "CLOSED"). If None, keeps current state.
+        """
         self.distance_history = []
         self.state_transitions = []
         self.dtw_distances = []
@@ -494,6 +551,8 @@ class Model:
         self.last_dtw_time = time.time()
         self.last_state_change_time = 0.0  # Reset refractory timer
         self.in_refractory = False
+        if initial_state is not None:
+            self.current_state = initial_state
         self.spatial_similarity_history = []
         print("[MODEL] History reset for new session")
 
@@ -570,8 +629,18 @@ class Model:
             "state_transitions": self.state_transitions,
             "spatial_sim_open": spatial_sim_open,
             "spatial_sim_closed": spatial_sim_closed,
-            "spatial_threshold": self.spatial_threshold if self.use_spatial_correction else None,
+            "spatial_threshold": self.spatial_threshold if self.spatial_mode != "off" else None,
+            "spatial_mode": self.spatial_mode,
         }
+
+    def _spatial_sim(self, emg_buffer: np.ndarray, ref: dict) -> float:
+        """Compute spatial similarity using the currently selected mode."""
+        per_tpl = (ref.get("per_template_rms", None)
+                   if self.spatial_similarity_mode == "per_template" else None)
+        return compute_spatial_similarity(
+            emg_buffer, ref["ref_profile"], ref["weights"],
+            per_template_rms=per_tpl, n_best=self.spatial_n_best,
+        )
 
     def predict(self, x: Any) -> List[float]:
         """
@@ -615,81 +684,214 @@ class Model:
 
         # --- DTW computation timing ---
         dtw_start = time.perf_counter()
-
-        # DTW distances (use model's active_channels and distance_aggregation)
-        # Only compute distance to OPPOSITE state templates (efficient)
         timestamp = time.time()
 
-        if self.current_state == "OPEN":
-            # Check if should switch to CLOSED
-            D_closed, all_distances_closed = compute_distance_from_training_set_online(
-                features_emg_buffer,
-                self.templates_closed,
-                active_channels=self.active_channels_closed,
-                distance_aggregation=self.distance_aggregation,
-                return_all_distances=True
-            )
-            if D_closed < self.THRESHOLD_CLOSED:
-                triggered_state = "CLOSED"
-            else:
-                triggered_state = "OPEN"
-
-            self.dtw_distances.append(("closed", D_closed, self.THRESHOLD_CLOSED))
-            # Store in history: (timestamp, D_open=None, D_closed, state, threshold_open, threshold_closed)
-            self.distance_history.append((timestamp, None, D_closed, self.current_state, self.THRESHOLD_OPEN, self.THRESHOLD_CLOSED))
-            self._last_distance = D_closed
-            self._last_threshold = self.THRESHOLD_CLOSED
-            self._last_all_distances = all_distances_closed
-            self._last_template_class = "CLOSED"
-
-        elif self.current_state == "CLOSED":
-            # Check if should switch to OPEN
-            D_open, all_distances_open = compute_distance_from_training_set_online(
-                features_emg_buffer,
-                self.templates_open,
-                active_channels=self.active_channels_open,
-                distance_aggregation=self.distance_aggregation,
-                return_all_distances=True
-            )
-            if D_open < self.THRESHOLD_OPEN:
-                triggered_state = "OPEN"
-            else:
-                triggered_state = "CLOSED"
-
-            self.dtw_distances.append(("open", D_open, self.THRESHOLD_OPEN))
-            # Store in history: (timestamp, D_open, D_closed=None, state, threshold_open, threshold_closed)
-            self.distance_history.append((timestamp, D_open, None, self.current_state, self.THRESHOLD_OPEN, self.THRESHOLD_CLOSED))
-            self._last_distance = D_open
-            self._last_threshold = self.THRESHOLD_OPEN
-            self._last_all_distances = all_distances_open
-            self._last_template_class = "OPEN"
-
-        dtw_time_ms = (time.perf_counter() - dtw_start) * 1000
-
-        # --- Spatial similarity computation (every tick, independent of DTW decision) ---
+        # DTW distances
         sim_open = None
         sim_closed = None
         spatial_blocked = False
 
-        if self.use_spatial_correction and self.spatial_ref_open is not None and self.spatial_ref_closed is not None:
-            if self.current_state == "OPEN":
-                # Checking transition to CLOSED — compute similarity to CLOSED reference
-                sim_closed = compute_spatial_similarity(
-                    emg_buffer, self.spatial_ref_closed["ref_profile"], self.spatial_ref_closed["weights"]
-                )
-                if triggered_state == "CLOSED" and sim_closed < self.spatial_threshold:
-                    spatial_blocked = True
-                    triggered_state = "OPEN"  # Block transition
-            elif self.current_state == "CLOSED":
-                # Checking transition to OPEN — compute similarity to OPEN reference
-                sim_open = compute_spatial_similarity(
-                    emg_buffer, self.spatial_ref_open["ref_profile"], self.spatial_ref_open["weights"]
-                )
-                if triggered_state == "OPEN" and sim_open < self.spatial_threshold:
-                    spatial_blocked = True
-                    triggered_state = "CLOSED"  # Block transition
+        if self.decision_mode in ("nn", "catboost") and (
+            (self.decision_mode == "nn" and self.decision_nn is not None) or
+            (self.decision_mode == "catboost" and self.decision_catboost is not None)
+        ):
+            # --- ML decision mode (NN or CatBoost) ---
+            # Compute BOTH distances (ML model sees the full picture)
+            D_open, all_distances_open = compute_distance_from_training_set_online(
+                features_emg_buffer, self.templates_open,
+                active_channels=self.active_channels_open,
+                distance_aggregation=self.distance_aggregation,
+                return_all_distances=True
+            )
+            D_closed, all_distances_closed = compute_distance_from_training_set_online(
+                features_emg_buffer, self.templates_closed,
+                active_channels=self.active_channels_closed,
+                distance_aggregation=self.distance_aggregation,
+                return_all_distances=True
+            )
 
-            self.spatial_similarity_history.append((timestamp, sim_open, sim_closed))
+            # Compute spatial similarities if model uses them
+            ml_model = self.decision_nn if self.decision_mode == "nn" else self.decision_catboost
+            if ml_model.has_spatial and self.spatial_ref_open is not None and self.spatial_ref_closed is not None:
+                sim_open  = self._spatial_sim(emg_buffer, self.spatial_ref_open)
+                sim_closed = self._spatial_sim(emg_buffer, self.spatial_ref_closed)
+
+            # CatBoost transition-mode: state-conditioned features (target class only)
+            if (self.decision_mode == "catboost"
+                    and getattr(self.decision_catboost, 'transition_mode', False)):
+                if self.current_state == "OPEN":
+                    # Checking whether to transition to CLOSED
+                    sim_t = sim_closed if ml_model.has_spatial and sim_closed is not None else None
+                    p_transition = self.decision_catboost.predict_transition(D_closed, sim_t)
+                    triggered_state = "CLOSED" if p_transition > 0.5 else "OPEN"
+                    p_closed = p_transition  # high = want CLOSED
+                else:
+                    # Checking whether to transition to OPEN
+                    sim_t = sim_open if ml_model.has_spatial and sim_open is not None else None
+                    p_transition = self.decision_catboost.predict_transition(D_open, sim_t)
+                    triggered_state = "OPEN" if p_transition > 0.5 else "CLOSED"
+                    p_closed = 1.0 - p_transition  # invert: high = CLOSED maintained
+            else:
+                # Posture-classifier mode (NN or legacy CatBoost): symmetric [D_open, D_closed, ...]
+                if ml_model.has_spatial and sim_open is not None:
+                    ml_features = np.array([D_open, D_closed, sim_open, sim_closed], dtype=np.float32)
+                else:
+                    ml_features = np.array([D_open, D_closed], dtype=np.float32)
+                p_closed = ml_model.predict(ml_features)
+                triggered_state = "CLOSED" if p_closed > 0.5 else "OPEN"
+
+            # Store for history/plotting
+            self.distance_history.append((timestamp, D_open, D_closed, self.current_state, self.THRESHOLD_OPEN, self.THRESHOLD_CLOSED))
+            if self.current_state == "OPEN":
+                self._last_distance = D_closed
+                self._last_threshold = self.THRESHOLD_CLOSED
+                self._last_all_distances = all_distances_closed
+                self._last_template_class = "CLOSED"
+                self.dtw_distances.append(("closed", D_closed, self.THRESHOLD_CLOSED))
+            else:
+                self._last_distance = D_open
+                self._last_threshold = self.THRESHOLD_OPEN
+                self._last_all_distances = all_distances_open
+                self._last_template_class = "OPEN"
+                self.dtw_distances.append(("open", D_open, self.THRESHOLD_OPEN))
+
+            if sim_open is not None or sim_closed is not None:
+                self.spatial_similarity_history.append((timestamp, sim_open, sim_closed))
+
+        else:
+            # --- Threshold decision mode (original) ---
+            if self.current_state == "OPEN":
+                D_closed, all_distances_closed = compute_distance_from_training_set_online(
+                    features_emg_buffer, self.templates_closed,
+                    active_channels=self.active_channels_closed,
+                    distance_aggregation=self.distance_aggregation,
+                    return_all_distances=True
+                )
+                if D_closed < self.THRESHOLD_CLOSED:
+                    triggered_state = "CLOSED"
+                else:
+                    triggered_state = "OPEN"
+                self.dtw_distances.append(("closed", D_closed, self.THRESHOLD_CLOSED))
+                self.distance_history.append((timestamp, None, D_closed, self.current_state, self.THRESHOLD_OPEN, self.THRESHOLD_CLOSED))
+                self._last_distance = D_closed
+                self._last_threshold = self.THRESHOLD_CLOSED
+                self._last_all_distances = all_distances_closed
+                self._last_template_class = "CLOSED"
+
+            elif self.current_state == "CLOSED":
+                D_open, all_distances_open = compute_distance_from_training_set_online(
+                    features_emg_buffer, self.templates_open,
+                    active_channels=self.active_channels_open,
+                    distance_aggregation=self.distance_aggregation,
+                    return_all_distances=True
+                )
+                if D_open < self.THRESHOLD_OPEN:
+                    triggered_state = "OPEN"
+                else:
+                    triggered_state = "CLOSED"
+                self.dtw_distances.append(("open", D_open, self.THRESHOLD_OPEN))
+                self.distance_history.append((timestamp, D_open, None, self.current_state, self.THRESHOLD_OPEN, self.THRESHOLD_CLOSED))
+                self._last_distance = D_open
+                self._last_threshold = self.THRESHOLD_OPEN
+                self._last_all_distances = all_distances_open
+                self._last_template_class = "OPEN"
+
+            # --- Spatial correction (threshold mode only) ---
+            if self.spatial_mode != "off" and self.spatial_ref_open is not None and self.spatial_ref_closed is not None:
+                need_both = (self.spatial_mode in ("contrast", "relu_contrast"))
+
+                if self.current_state == "OPEN":
+                    sim_closed = self._spatial_sim(emg_buffer, self.spatial_ref_closed)
+                    if need_both:
+                        sim_open = self._spatial_sim(emg_buffer, self.spatial_ref_open)
+                    k = self.spatial_sharpness
+                    if self.spatial_mode == "gate":
+                        if triggered_state == "CLOSED" and sim_closed < self.spatial_threshold:
+                            spatial_blocked = True
+                            triggered_state = "OPEN"
+                    elif self.spatial_mode == "scaling":
+                        sim_clamped = max(sim_closed, 0.1)
+                        D_corrected = D_closed / (sim_clamped ** k)
+                        if D_corrected >= self.THRESHOLD_CLOSED:
+                            triggered_state = "OPEN"
+                        elif D_corrected < self.THRESHOLD_CLOSED:
+                            triggered_state = "CLOSED"
+                    elif self.spatial_mode == "contrast":
+                        sim_target = max(sim_closed, 0.1)
+                        sim_current = max(sim_open, 0.1)
+                        D_corrected = D_closed * ((sim_current / sim_target) ** k)
+                        if D_corrected >= self.THRESHOLD_CLOSED:
+                            triggered_state = "OPEN"
+                        elif D_corrected < self.THRESHOLD_CLOSED:
+                            triggered_state = "CLOSED"
+                    elif self.spatial_mode == "relu_scaling":
+                        b = self.spatial_relu_baseline
+                        t = max(self.spatial_threshold, 1e-6)
+                        k = max(self.spatial_sharpness, 0.1)
+                        f_sim = 1.0 if sim_closed >= t else b ** ((1.0 - sim_closed / t) ** (1.0 / k))
+                        D_corrected = D_closed / max(f_sim, 0.01)
+                        if D_corrected >= self.THRESHOLD_CLOSED:
+                            triggered_state = "OPEN"
+                        elif D_corrected < self.THRESHOLD_CLOSED:
+                            triggered_state = "CLOSED"
+                    elif self.spatial_mode == "relu_contrast":
+                        # D * f(sim_current) / f(sim_target)
+                        # f saturates at 1 above threshold → no penalty/reward for high sims
+                        b = self.spatial_relu_baseline
+                        t = max(self.spatial_threshold, 1e-6)
+                        k = max(self.spatial_sharpness, 0.1)
+                        def _f(s): return 1.0 if s >= t else b ** ((1.0 - s / t) ** (1.0 / k))
+                        D_corrected = D_closed * _f(sim_open) / max(_f(sim_closed), 0.01)
+                        if D_corrected >= self.THRESHOLD_CLOSED:
+                            triggered_state = "OPEN"
+                        elif D_corrected < self.THRESHOLD_CLOSED:
+                            triggered_state = "CLOSED"
+                elif self.current_state == "CLOSED":
+                    sim_open = self._spatial_sim(emg_buffer, self.spatial_ref_open)
+                    if need_both:
+                        sim_closed = self._spatial_sim(emg_buffer, self.spatial_ref_closed)
+                    k = self.spatial_sharpness
+                    if self.spatial_mode == "gate":
+                        if triggered_state == "OPEN" and sim_open < self.spatial_threshold:
+                            spatial_blocked = True
+                            triggered_state = "CLOSED"
+                    elif self.spatial_mode == "scaling":
+                        sim_clamped = max(sim_open, 0.1)
+                        D_corrected = D_open / (sim_clamped ** k)
+                        if D_corrected >= self.THRESHOLD_OPEN:
+                            triggered_state = "CLOSED"
+                        elif D_corrected < self.THRESHOLD_OPEN:
+                            triggered_state = "OPEN"
+                    elif self.spatial_mode == "contrast":
+                        sim_target = max(sim_open, 0.1)
+                        sim_current = max(sim_closed, 0.1)
+                        D_corrected = D_open * ((sim_current / sim_target) ** k)
+                        if D_corrected >= self.THRESHOLD_OPEN:
+                            triggered_state = "CLOSED"
+                        elif D_corrected < self.THRESHOLD_OPEN:
+                            triggered_state = "OPEN"
+                    elif self.spatial_mode == "relu_scaling":
+                        b = self.spatial_relu_baseline
+                        t = max(self.spatial_threshold, 1e-6)
+                        k = max(self.spatial_sharpness, 0.1)
+                        f_sim = 1.0 if sim_open >= t else b ** ((1.0 - sim_open / t) ** (1.0 / k))
+                        D_corrected = D_open / max(f_sim, 0.01)
+                        if D_corrected >= self.THRESHOLD_OPEN:
+                            triggered_state = "CLOSED"
+                        elif D_corrected < self.THRESHOLD_OPEN:
+                            triggered_state = "OPEN"
+                    elif self.spatial_mode == "relu_contrast":
+                        b = self.spatial_relu_baseline
+                        t = max(self.spatial_threshold, 1e-6)
+                        k = max(self.spatial_sharpness, 0.1)
+                        def _f(s): return 1.0 if s >= t else b ** ((1.0 - s / t) ** (1.0 / k))
+                        D_corrected = D_open * _f(sim_closed) / max(_f(sim_open), 0.01)
+                        if D_corrected >= self.THRESHOLD_OPEN:
+                            triggered_state = "CLOSED"
+                        elif D_corrected < self.THRESHOLD_OPEN:
+                            triggered_state = "OPEN"
+
+                self.spatial_similarity_history.append((timestamp, sim_open, sim_closed))
             # Keep bounded
             if len(self.spatial_similarity_history) > 10000:
                 self.spatial_similarity_history = self.spatial_similarity_history[-5000:]
@@ -782,15 +984,15 @@ class Model:
                 print(f"\n{'='*50}")
                 print(f"  >>> HAND OPENED <<<  [{time_str}]")
                 print(f"  Distance: {self._last_distance:.4f} < Threshold: {self._last_threshold:.4f}")
-                if self.use_spatial_correction and sim_open is not None:
-                    print(f"  Spatial sim (OPEN): {sim_open:.4f} >= {self.spatial_threshold:.4f}")
+                if self.spatial_mode != "off" and sim_open is not None:
+                    print(f"  Spatial sim (OPEN): {sim_open:.4f} [{self.spatial_mode}]")
                 print(f"  Refractory: {self.refractory_period_s:.1f}s")
             else:
                 print(f"\n{'='*50}")
                 print(f"  >>> HAND CLOSED <<<  [{time_str}]")
                 print(f"  Distance: {self._last_distance:.4f} < Threshold: {self._last_threshold:.4f}")
-                if self.use_spatial_correction and sim_closed is not None:
-                    print(f"  Spatial sim (CLOSED): {sim_closed:.4f} >= {self.spatial_threshold:.4f}")
+                if self.spatial_mode != "off" and sim_closed is not None:
+                    print(f"  Spatial sim (CLOSED): {sim_closed:.4f} [{self.spatial_mode}]")
                 print(f"  Refractory: {self.refractory_period_s:.1f}s")
 
             # Print top 10 closest templates
@@ -842,7 +1044,7 @@ class Model:
         if self.dtw_count % 40 == 0:
             elapsed_s = self.dtw_count * 0.05
             spatial_str = ""
-            if self.use_spatial_correction:
+            if self.spatial_mode != "off":
                 sim_val = sim_closed if sim_closed is not None else sim_open
                 if sim_val is not None:
                     spatial_str = f" | S={sim_val:.4f}"
