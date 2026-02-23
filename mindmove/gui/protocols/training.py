@@ -1252,17 +1252,13 @@ class GuidedRecordingReviewDialog(QDialog):
             emg = cycle["emg"]
             n_samples = emg.shape[1]
 
-            cue_closed = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
-            cue_open = cycle.get("open_cue_idx") or cycle.get("open_start_idx", 0)
-            hold_closed = cycle.get("hold_closed_samples", 0)
-            hold_open = cycle.get("hold_open_samples", 0)
-            closed_search_start = max(0, cue_closed - hold_open // 2)
-            closed_search_end = cue_open - template_samples
-            open_search_start = max(0, cue_open - hold_closed // 2)
-            open_search_end = n_samples - template_samples
+            closed_search_start = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
+            closed_search_end   = (cycle.get("open_cue_idx") or cycle.get("open_start_idx", n_samples)) - template_samples
+            open_search_start   = cycle.get("open_cue_idx")  or cycle.get("open_start_idx", 0)
+            open_search_end     = n_samples - template_samples
 
             closed_baseline_start = max(0, closed_search_start - baseline_samples)
-            open_baseline_start = max(0, open_search_start - baseline_samples)
+            open_baseline_start   = max(0, open_search_start   - baseline_samples)
 
             cycle_info = {
                 "closed_channels_fired": [],
@@ -3569,13 +3565,13 @@ class TrainingProtocol(QObject):
 
                 cue_closed = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
                 cue_open = cycle.get("open_cue_idx") or cycle.get("open_start_idx", 0)
-                hold_closed = cycle.get("hold_closed_samples", 0)
                 hold_open = cycle.get("hold_open_samples", 0)
-                # Extend search window back by half the preceding hold to capture
-                # anticipatory movements (subject moves before the cue after practice)
+                # Extend CLOSED search back by half the preceding open hold to capture
+                # anticipatory movements (quiet rest before close cue → valid baseline)
                 closed_search_start = max(0, cue_closed - hold_open // 2)
                 closed_search_end = cue_open - template_samples
-                open_search_start = max(0, cue_open - hold_closed // 2)
+                # OPEN search starts at cue — extending into CLOSED hold fails amplitude detection
+                open_search_start = cue_open
                 open_search_end = n_samples - template_samples
 
                 closed_baseline_start = max(0, closed_search_start - baseline_samples)

@@ -71,15 +71,16 @@ class RealtimePlaybackWorker(QObject):
 
 class SimulationWorker(QObject):
     """Worker class for running offline simulation in a separate thread."""
-    finished = Signal(dict)
+    finished = Signal(dict, object)  # results dict + calibration_thresholds (dict or None)
     progress = Signal(str)
     error = Signal(str)
 
-    def __init__(self, emg_data, model, initial_state="CLOSED"):
+    def __init__(self, emg_data, model, initial_state="CLOSED", gt_data=None):
         super().__init__()
         self.emg_data = emg_data
         self.model = model
         self.initial_state = initial_state
+        self.gt_data = gt_data  # Optional real GT (at FSAMP rate) for plateau calibration
 
     def run(self):
         """Run offline simulation using the loaded model's parameters."""
@@ -165,7 +166,29 @@ class SimulationWorker(QObject):
                 spatial_n_best=spatial_n_best,
             )
 
-            self.finished.emit(results)
+            # --- Optional calibration: find plateau thresholds from GT ---
+            calibration_thresholds = None
+            if self.gt_data is not None and len(results.get('D_open', [])) > 0:
+                try:
+                    from mindmove.model.core.algorithm import find_plateau_thresholds
+                    timestamps = results['timestamps']
+                    gt_arr = np.array(self.gt_data, dtype=float).flatten()
+                    gt_time = np.arange(len(gt_arr)) / config.FSAMP
+                    gt_at_dtw = np.interp(timestamps, gt_time, gt_arr)
+                    gt_at_dtw = np.clip(np.round(gt_at_dtw), 0, 1)
+                    calibration_thresholds = find_plateau_thresholds(
+                        D_open=np.array(results['D_open']),
+                        D_closed=np.array(results['D_closed']),
+                        gt=gt_at_dtw,
+                    )
+                    print(f"[CALIBRATION] OPEN plateau={calibration_thresholds['open_plateau']:.4f}, "
+                          f"thr={calibration_thresholds['threshold_open']:.4f}")
+                    print(f"[CALIBRATION] CLOSED plateau={calibration_thresholds['closed_plateau']:.4f}, "
+                          f"thr={calibration_thresholds['threshold_closed']:.4f}")
+                except Exception as cal_err:
+                    print(f"[CALIBRATION] Error computing calibration thresholds: {cal_err}")
+
+            self.finished.emit(results, calibration_thresholds)
 
         except Exception as e:
             import traceback
@@ -185,7 +208,8 @@ class OfflineTestReviewDialog(QDialog):
     """
 
     def __init__(self, emg_data, results, gt_data=None, ref_predictions=None,
-                 recording_type="unknown", time_offset=0.0, parent=None):
+                 recording_type="unknown", time_offset=0.0, calibration_thresholds=None,
+                 parent=None):
         super().__init__(parent)
         self.emg_data = emg_data
         self.results = results
@@ -193,6 +217,7 @@ class OfflineTestReviewDialog(QDialog):
         self.ref_predictions = ref_predictions  # Previous online predictions (numeric array at DTW rate)
         self.recording_type = recording_type
         self.time_offset = time_offset  # Seconds to add to all timestamps (for sliced recordings)
+        self.calibration_thresholds = calibration_thresholds  # From find_plateau_thresholds (or None)
 
         self.setWindowTitle("Offline Test Review")
         self.setMinimumSize(1200, 800)
@@ -223,6 +248,11 @@ class OfflineTestReviewDialog(QDialog):
             f"Avg DTW: {avg_time:.2f}ms",
             f"Thr OPEN: {results['threshold_open']:.4f}  CLOSED: {results['threshold_closed']:.4f}",
         ]
+        if self.calibration_thresholds is not None:
+            cal = self.calibration_thresholds
+            stats_parts.append(
+                f"Cal OPEN: {cal['threshold_open']:.4f}  CLOSED: {cal['threshold_closed']:.4f}"
+            )
 
         stats = QLabel("  |  ".join(stats_parts))
         stats.setStyleSheet("font-family: monospace; font-size: 10px; color: #555;")
@@ -308,6 +338,12 @@ class OfflineTestReviewDialog(QDialog):
                     linestyle='--', label='D_open (corrected)')
         ax.axhline(threshold_open, color='r', linestyle='--', linewidth=2,
                    label=f'Thr: {threshold_open:.4f}')
+        if self.calibration_thresholds is not None:
+            cal = self.calibration_thresholds
+            ax.axhline(cal['open_plateau'], color='blue', linestyle=':', linewidth=1.5, alpha=0.8,
+                       label=f"Cal plateau: {cal['open_plateau']:.4f}")
+            ax.axhline(cal['threshold_open'], color='blue', linestyle='--', linewidth=1.5, alpha=0.8,
+                       label=f"Cal thr: {cal['threshold_open']:.4f}")
         ax.set_ylabel("DTW Distance")
         ax.set_title("Distance to OPEN templates")
         ax.legend(loc='upper right', fontsize=7)
@@ -324,6 +360,12 @@ class OfflineTestReviewDialog(QDialog):
                     linestyle='--', label='D_closed (corrected)')
         ax.axhline(threshold_closed, color='r', linestyle='--', linewidth=2,
                    label=f'Thr: {threshold_closed:.4f}')
+        if self.calibration_thresholds is not None:
+            cal = self.calibration_thresholds
+            ax.axhline(cal['closed_plateau'], color='blue', linestyle=':', linewidth=1.5, alpha=0.8,
+                       label=f"Cal plateau: {cal['closed_plateau']:.4f}")
+            ax.axhline(cal['threshold_closed'], color='blue', linestyle='--', linewidth=1.5, alpha=0.8,
+                       label=f"Cal thr: {cal['threshold_closed']:.4f}")
         ax.set_ylabel("DTW Distance")
         ax.set_title("Distance to CLOSED templates")
         ax.legend(loc='upper right', fontsize=7)
@@ -761,6 +803,7 @@ class OnlineProtocol(QObject):
         self.offline_test_gt = None  # Real GT from guided recording
         self.offline_test_ref_predictions = None  # Previous online predictions (numeric)
         self.offline_test_recording_type = None  # "guided", "prediction", "emg_only"
+        self._offline_test_calibration_thresholds = None  # From last GT-based run
         self._offline_test_dialogs: list = []  # Keep references so windows stay open
         self._playback_thread = None
         self._playback_worker = None
@@ -1365,6 +1408,20 @@ class OnlineProtocol(QObject):
         decision_layout.addStretch()
         layout.addLayout(decision_layout)
 
+        # Calibration results (only shown when GT is available and test completed)
+        self.calibration_results_label = QLabel("")
+        self.calibration_results_label.setStyleSheet(
+            "color: #2a7; font-family: monospace; font-size: 10px; padding: 2px;"
+        )
+        self.calibration_results_label.setWordWrap(True)
+        self.calibration_results_label.setVisible(False)
+        layout.addWidget(self.calibration_results_label)
+
+        self.apply_calibration_button = QPushButton("Apply Calibration Thresholds to Sliders")
+        self.apply_calibration_button.setVisible(False)
+        self.apply_calibration_button.clicked.connect(self._apply_calibration_thresholds)
+        layout.addWidget(self.apply_calibration_button)
+
         self.offline_test_group_box.setLayout(layout)
 
         # Add to the online commands group box layout
@@ -1541,18 +1598,18 @@ class OnlineProtocol(QObject):
 
         self._offline_test_thread = QThread()
         self._offline_test_worker = SimulationWorker(
-            emg_slice, model, initial_state=initial_state,
+            emg_slice, model, initial_state=initial_state, gt_data=gt_slice,
         )
         self._offline_test_worker.moveToThread(self._offline_test_thread)
         self._offline_test_thread.started.connect(self._offline_test_worker.run)
         self._offline_test_worker.finished.connect(self._on_offline_test_finished)
         self._offline_test_worker.error.connect(self._on_offline_test_error)
-        self._offline_test_worker.finished.connect(self._offline_test_thread.quit)
+        self._offline_test_worker.finished.connect(lambda r, c: self._offline_test_thread.quit())
         self._offline_test_worker.error.connect(self._offline_test_thread.quit)
         self._offline_test_thread.finished.connect(self._offline_test_thread.deleteLater)
         self._offline_test_thread.start()
 
-    def _on_offline_test_finished(self, results: dict) -> None:
+    def _on_offline_test_finished(self, results: dict, calibration_thresholds) -> None:
         """Handle offline test completion."""
         self.run_offline_test_button.setEnabled(True)
         self.run_offline_test_button.setText("Run Offline Test")
@@ -1566,6 +1623,23 @@ class OnlineProtocol(QObject):
         print(f"\n[OFFLINE TEST] Complete: {n_dtw} DTW steps, avg {avg_time:.2f}ms")
         print(f"  Predictions: {n_closed} CLOSED, {n_open} OPEN")
 
+        # Store and display calibration thresholds if GT was available
+        self._offline_test_calibration_thresholds = calibration_thresholds
+        if calibration_thresholds is not None:
+            open_p = calibration_thresholds['open_plateau']
+            open_t = calibration_thresholds['threshold_open']
+            closed_p = calibration_thresholds['closed_plateau']
+            closed_t = calibration_thresholds['threshold_closed']
+            self.calibration_results_label.setText(
+                f"OPEN plateau: {open_p:.4f}  →  threshold: {open_t:.4f}\n"
+                f"CLOSED plateau: {closed_p:.4f}  →  threshold: {closed_t:.4f}"
+            )
+            self.calibration_results_label.setVisible(True)
+            self.apply_calibration_button.setVisible(True)
+        else:
+            self.calibration_results_label.setVisible(False)
+            self.apply_calibration_button.setVisible(False)
+
         # Show review dialog (standalone — keep all open simultaneously)
         emg_for_dialog = getattr(self, '_offline_test_emg_slice', self.offline_test_emg)
         gt_for_dialog = getattr(self, '_offline_test_gt_slice', self.offline_test_gt)
@@ -1578,6 +1652,7 @@ class OnlineProtocol(QObject):
             ref_predictions=ref_for_dialog,
             recording_type=self.offline_test_recording_type or "unknown",
             time_offset=getattr(self, '_offline_test_start_s', 0.0),
+            calibration_thresholds=calibration_thresholds,
             parent=None,  # No parent → truly standalone window
         )
         # Remove any dialogs that have been closed to free memory
@@ -1593,6 +1668,18 @@ class OnlineProtocol(QObject):
         QMessageBox.critical(self.main_window, "Offline Test Error",
                              f"Offline test failed:\n{error_msg}", QMessageBox.Ok)
         print(f"[OFFLINE TEST ERROR] {error_msg}")
+
+    def _apply_calibration_thresholds(self) -> None:
+        """Apply calibration thresholds (from GT plateau analysis) to the threshold sliders."""
+        cal = self._offline_test_calibration_thresholds
+        if cal is None:
+            return
+        threshold_open = cal['threshold_open']
+        threshold_closed = cal['threshold_closed']
+        self.model_interface.set_threshold_open_direct(threshold_open)
+        self.model_interface.set_threshold_closed_direct(threshold_closed)
+        self._update_threshold_display()
+        print(f"[CALIBRATION] Applied: OPEN={threshold_open:.4f}, CLOSED={threshold_closed:.4f}")
 
     # ------------------------------------------------------------------
     # Real-time playback
