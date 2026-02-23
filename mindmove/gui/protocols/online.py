@@ -1607,6 +1607,9 @@ class OnlineProtocol(QObject):
                                 "Please load a model first.", QMessageBox.Ok)
             return
 
+        # Stop any existing playback before starting a new one
+        self._stop_realtime_playback()
+
         # Slice by time range (same logic as _run_offline_test)
         start_s = self.offline_test_start_spinbox.value()
         end_s   = self.offline_test_end_spinbox.value()
@@ -1647,6 +1650,21 @@ class OnlineProtocol(QObject):
         self._playback_thread.finished.connect(self._playback_thread.deleteLater)
         self._playback_thread.start()
 
+    def _disconnect_playback_signals(self) -> None:
+        """Disconnect all playback worker signals to prevent stale updates."""
+        if self._playback_worker is None:
+            return
+        for sig, slot in [
+            (self._playback_worker.chunk_ready, self._on_playback_chunk),
+            (self._playback_worker.progress,    self._on_playback_progress),
+            (self._playback_worker.finished,    self._on_playback_finished),
+            (self._playback_worker.error,       self._on_playback_error),
+        ]:
+            try:
+                sig.disconnect(slot)
+            except RuntimeError:
+                pass  # Already disconnected
+
     def _on_playback_chunk(self, emg_chunk: np.ndarray) -> None:
         """Called in the main thread for each streamed EMG chunk."""
         # Update the VisPy real-time plot (same scaling as live mode)
@@ -1658,22 +1676,25 @@ class OnlineProtocol(QObject):
         except Exception:
             pass  # Plot update is best-effort; don't crash playback
 
-        # Run model prediction
-        self.model_interface.predict(emg_chunk)
-        result = self.model_interface.get_last_result()
-
-        if result:
-            state = result['state']
-            joint_value = int(state)
-            unity_data = [joint_value] * 10
-            self.main_window.virtual_hand_interface.output_message_signal.emit(
-                str(unity_data).encode("utf-8")
-            )
+        # Run model prediction (wrapped so exceptions don't leak into Qt event loop)
+        try:
+            self.model_interface.predict(emg_chunk)
+            result = self.model_interface.get_last_result()
+            if result:
+                state = result['state']
+                joint_value = int(state)
+                unity_data = [joint_value] * 10
+                self.main_window.virtual_hand_interface.output_message_signal.emit(
+                    str(unity_data).encode("utf-8")
+                )
+        except Exception as e:
+            print(f"[PLAYBACK] Prediction error: {e}")
 
     def _on_playback_progress(self, t: float) -> None:
         self._playback_time_label.setText(f"▶ {t:.1f}s")
 
     def _on_playback_finished(self) -> None:
+        self._disconnect_playback_signals()
         self.play_realtime_button.setEnabled(True)
         self.stop_playback_button.setEnabled(False)
         self.run_offline_test_button.setEnabled(True)
@@ -1681,6 +1702,7 @@ class OnlineProtocol(QObject):
         print("[PLAYBACK] Finished")
 
     def _on_playback_error(self, error_msg: str) -> None:
+        self._disconnect_playback_signals()
         self.play_realtime_button.setEnabled(True)
         self.stop_playback_button.setEnabled(False)
         self.run_offline_test_button.setEnabled(True)
@@ -1690,11 +1712,19 @@ class OnlineProtocol(QObject):
         print(f"[PLAYBACK ERROR] {error_msg}")
 
     def _stop_realtime_playback(self) -> None:
+        # Disconnect signals first so no more chunks reach _on_playback_chunk
+        # even if the worker thread is mid-sleep and hasn't noticed _stop yet
+        self._disconnect_playback_signals()
         if self._playback_worker is not None:
             self._playback_worker.stop()
+        if self._playback_thread is not None and self._playback_thread.isRunning():
+            self._playback_thread.quit()
+            self._playback_thread.wait(2000)  # Max 2s for thread to exit cleanly
+        self._playback_worker = None
+        self._playback_thread = None
         self.stop_playback_button.setEnabled(False)
         self._playback_time_label.setText("■ Stopped")
-        print("[PLAYBACK] Stopped by user")
+        print("[PLAYBACK] Stopped")
 
     def _on_decision_model_changed(self, index: int) -> None:
         """Handle decision model combo change."""

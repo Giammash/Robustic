@@ -1635,11 +1635,35 @@ class TemplateStudyDialog(QDialog):
 
         layout.addLayout(param_layout)
 
-        # ── Results section ──
-        self.figure = Figure(figsize=(8, 6), dpi=100)
-        self.canvas = FigureCanvas(self.figure)
-        self.canvas.setMinimumHeight(400)
-        layout.addWidget(self.canvas)
+        # ── Results section: tab widget with DTW and Spatial pages ──
+        from PySide6.QtWidgets import QTabWidget
+        self.results_tabs = QTabWidget()
+
+        # Tab 1: DTW Analysis
+        tab1_widget = QWidget()
+        tab1_layout = QVBoxLayout(tab1_widget)
+        tab1_layout.setContentsMargins(0, 0, 0, 0)
+        self.figure_dtw = Figure(figsize=(8, 6), dpi=100)
+        self.canvas_dtw = FigureCanvas(self.figure_dtw)
+        self.canvas_dtw.setMinimumHeight(400)
+        tab1_layout.addWidget(self.canvas_dtw)
+        self.results_tabs.addTab(tab1_widget, "DTW Analysis")
+
+        # Tab 2: Spatial Analysis
+        tab2_widget = QWidget()
+        tab2_layout = QVBoxLayout(tab2_widget)
+        tab2_layout.setContentsMargins(0, 0, 0, 0)
+        self.figure_spatial = Figure(figsize=(8, 6), dpi=100)
+        self.canvas_spatial = FigureCanvas(self.figure_spatial)
+        self.canvas_spatial.setMinimumHeight(400)
+        tab2_layout.addWidget(self.canvas_spatial)
+        self.spatial_stats_label = QLabel("Run 'Compute' to see spatial analysis.")
+        self.spatial_stats_label.setStyleSheet("font-family: monospace; font-size: 11px;")
+        self.spatial_stats_label.setWordWrap(True)
+        tab2_layout.addWidget(self.spatial_stats_label)
+        self.results_tabs.addTab(tab2_widget, "Spatial Analysis")
+
+        layout.addWidget(self.results_tabs)
 
         n_c = len(self.templates_closed)
         n_o = len(self.templates_open)
@@ -1872,16 +1896,16 @@ class TemplateStudyDialog(QDialog):
             spatial_closed = compute_spatial_profiles(self.templates_closed) if self.templates_closed else None
             spatial_open = compute_spatial_profiles(self.templates_open) if self.templates_open else None
 
-            # Plot: DTW distance matrix (left) + spatial profiles (right)
-            self.figure.clear()
+            # Plot: DTW distance matrix (left) + spatial profiles (right) — Tab 1
+            self.figure_dtw.clear()
 
             if spatial_closed is not None or spatial_open is not None:
                 # Layout: DTW matrix (left) | two spatial subplots stacked (right)
                 import matplotlib.gridspec as gridspec
-                gs = gridspec.GridSpec(2, 2, figure=self.figure, width_ratios=[1.2, 1])
-                ax_dtw = self.figure.add_subplot(gs[:, 0])
-                ax_profile = self.figure.add_subplot(gs[0, 1])
-                ax_weights = self.figure.add_subplot(gs[1, 1])
+                gs = gridspec.GridSpec(2, 2, figure=self.figure_dtw, width_ratios=[1.2, 1])
+                ax_dtw = self.figure_dtw.add_subplot(gs[:, 0])
+                ax_profile = self.figure_dtw.add_subplot(gs[0, 1])
+                ax_weights = self.figure_dtw.add_subplot(gs[1, 1])
 
                 n_ch = 0
                 if spatial_closed is not None:
@@ -1940,11 +1964,14 @@ class TemplateStudyDialog(QDialog):
                 ax_weights.legend(fontsize=8)
                 ax_weights.grid(axis='y', alpha=0.3)
             else:
-                ax_dtw = self.figure.add_subplot(111)
+                ax_dtw = self.figure_dtw.add_subplot(111)
 
             plot_distance_matrix(metrics, ax=ax_dtw)
-            self.figure.tight_layout()
-            self.canvas.draw()
+            self.figure_dtw.tight_layout()
+            self.canvas_dtw.draw()
+
+            # ── Tab 2: Spatial Analysis ──
+            self._compute_spatial_tab(metrics, spatial_closed, spatial_open)
 
             # Build stats text
             ic = metrics["intra_closed"]
@@ -1992,6 +2019,131 @@ class TemplateStudyDialog(QDialog):
         finally:
             self.compute_btn.setEnabled(True)
             self.compute_btn.setText("Compute")
+
+    def _compute_spatial_tab(self, metrics, spatial_closed, spatial_open):
+        """Compute and render Tab 2: Spatial Analysis (similarity matrix + scatter plot)."""
+        import matplotlib.gridspec as gridspec
+
+        self.figure_spatial.clear()
+
+        n_closed = len(self.templates_closed)
+        n_open = len(self.templates_open)
+        n_total = n_closed + n_open
+
+        # Need at least 2 templates and spatial profiles to be meaningful
+        if n_total < 2 or (spatial_closed is None and spatial_open is None):
+            ax = self.figure_spatial.add_subplot(111)
+            ax.text(0.5, 0.5, "Spatial analysis requires templates with spatial profiles.",
+                    ha="center", va="center", transform=ax.transAxes, fontsize=11)
+            ax.axis("off")
+            self.canvas_spatial.draw()
+            self.spatial_stats_label.setText("Spatial analysis not available.")
+            return
+
+        # Stack per_template_rms: CLOSED first, then OPEN (L2-normalized unit vectors)
+        rms_parts = []
+        if spatial_closed is not None:
+            rms_parts.append(spatial_closed["per_template_rms"])   # (n_closed, n_ch)
+        if spatial_open is not None:
+            rms_parts.append(spatial_open["per_template_rms"])     # (n_open, n_ch)
+        rms_all = np.vstack(rms_parts)                             # (n_total, n_ch)
+
+        # Pairwise cosine similarity matrix (unit vectors → dot product = cos sim)
+        sim_matrix = np.clip(rms_all @ rms_all.T, 0.0, 1.0)       # (n_total, n_total)
+
+        # Per-template labels (CLOSED first, then OPEN to match DTW matrix order)
+        labels_sim = (
+            [f"C{i+1}" for i in range(n_closed)] +
+            [f"O{i+1}" for i in range(n_open)]
+        )
+
+        gs2 = gridspec.GridSpec(1, 2, figure=self.figure_spatial, width_ratios=[1, 1.1])
+        ax_sim = self.figure_spatial.add_subplot(gs2[0])
+        ax_scatter = self.figure_spatial.add_subplot(gs2[1])
+
+        # ── Similarity heatmap (mirrors DTW matrix layout) ──
+        im = ax_sim.imshow(sim_matrix, cmap="viridis", aspect="auto", vmin=0, vmax=1)
+        self.figure_spatial.colorbar(im, ax=ax_sim, label="Cosine Similarity", fraction=0.046)
+
+        # Class boundary line between CLOSED and OPEN blocks
+        if n_closed > 0 and n_open > 0:
+            b = n_closed - 0.5
+            ax_sim.axhline(b, color="white", linewidth=1.5, linestyle="--", alpha=0.8)
+            ax_sim.axvline(b, color="white", linewidth=1.5, linestyle="--", alpha=0.8)
+
+        # Tick labels — show all if few templates, else subsample
+        step = max(1, n_total // 20)
+        tick_positions = list(range(0, n_total, step))
+        ax_sim.set_xticks(tick_positions)
+        ax_sim.set_xticklabels([labels_sim[i] for i in tick_positions], fontsize=7, rotation=45)
+        ax_sim.set_yticks(tick_positions)
+        ax_sim.set_yticklabels([labels_sim[i] for i in tick_positions], fontsize=7)
+        ax_sim.set_title("Spatial Similarity Matrix")
+        ax_sim.set_xlabel("Template")
+        ax_sim.set_ylabel("Template")
+
+        # ── Scatter plot: DTW distance vs spatial similarity ──
+        dist_matrix = metrics["distance_matrix"]   # (n_total, n_total), CLOSED first
+
+        rows, cols = np.triu_indices(n_total, k=1)
+        d_intra_c, s_intra_c = [], []
+        d_intra_o, s_intra_o = [], []
+        d_cross,   s_cross   = [], []
+
+        for r, c in zip(rows, cols):
+            d = dist_matrix[r, c]
+            s = sim_matrix[r, c]
+            r_closed = r < n_closed
+            c_closed = c < n_closed
+            if r_closed and c_closed:
+                d_intra_c.append(d); s_intra_c.append(s)
+            elif not r_closed and not c_closed:
+                d_intra_o.append(d); s_intra_o.append(s)
+            else:
+                d_cross.append(d); s_cross.append(s)
+
+        handles = []
+        if d_intra_c:
+            sc = ax_scatter.scatter(d_intra_c, s_intra_c, c="#d44", alpha=0.65, s=18, label="Intra-CLOSED")
+            handles.append(sc)
+        if d_intra_o:
+            so = ax_scatter.scatter(d_intra_o, s_intra_o, c="#48b", alpha=0.65, s=18, label="Intra-OPEN")
+            handles.append(so)
+        if d_cross:
+            sx = ax_scatter.scatter(d_cross, s_cross, c="#4a4", alpha=0.5, s=14, label="Cross-class", marker="^")
+            handles.append(sx)
+
+        ax_scatter.set_xlabel("DTW Distance")
+        ax_scatter.set_ylabel("Cosine Similarity")
+        ax_scatter.set_title("DTW Distance vs Spatial Similarity")
+        if handles:
+            ax_scatter.legend(fontsize=8, handles=handles)
+        ax_scatter.grid(alpha=0.3)
+
+        self.figure_spatial.tight_layout()
+        self.canvas_spatial.draw()
+
+        # Stats text
+        all_intra_sim = s_intra_c + s_intra_o
+        mean_intra_sim = np.mean(all_intra_sim) if all_intra_sim else float("nan")
+        mean_cross_sim = np.mean(s_cross) if s_cross else float("nan")
+        sim_gap = mean_cross_sim - mean_intra_sim if all_intra_sim and s_cross else float("nan")
+
+        lines = ["Spatial Similarity (cosine, L2-normalized RMS vectors)"]
+        if d_intra_c:
+            lines.append(f"  Intra-CLOSED:  n={len(d_intra_c):3d}  "
+                         f"mean_sim={np.mean(s_intra_c):.4f}  mean_dtw={np.mean(d_intra_c):.4f}")
+        if d_intra_o:
+            lines.append(f"  Intra-OPEN:    n={len(d_intra_o):3d}  "
+                         f"mean_sim={np.mean(s_intra_o):.4f}  mean_dtw={np.mean(d_intra_o):.4f}")
+        if d_cross:
+            lines.append(f"  Cross-class:   n={len(d_cross):3d}  "
+                         f"mean_sim={np.mean(s_cross):.4f}  mean_dtw={np.mean(d_cross):.4f}")
+        if not np.isnan(sim_gap):
+            direction = ">" if sim_gap > 0 else "<"
+            lines.append(f"\n  Cross-class sim is {direction} intra sim by {abs(sim_gap):.4f}  "
+                         f"({'good: classes are spatially distinct' if sim_gap < 0 else 'warning: classes overlap spatially'})")
+        self.spatial_stats_label.setText("\n".join(lines))
 
     def _populate_flagged_templates(self, quality):
         """Build the flagged-templates section with Remove buttons."""
