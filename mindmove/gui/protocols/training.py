@@ -1238,10 +1238,12 @@ class GuidedRecordingReviewDialog(QDialog):
             detect_transition_onset,
             place_template_at_onset,
             ONSET_ANTICIPATORY_S,
+            ONSET_MAX_POST_CUE_S,
         )
 
         template_samples = int(self.template_manager.template_duration_s * config.FSAMP)
         anticipatory_samples = int(ONSET_ANTICIPATORY_S * config.FSAMP)
+        post_cue_samples = int(ONSET_MAX_POST_CUE_S * config.FSAMP)
 
         n_closed_detected = 0
         n_open_detected = 0
@@ -1255,14 +1257,17 @@ class GuidedRecordingReviewDialog(QDialog):
             cue_closed = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
             cue_open   = cycle.get("open_cue_idx")  or cycle.get("open_start_idx", 0)
 
-            # Extend search backward by ONSET_ANTICIPATORY_S — TKEO derivative is
-            # direction-agnostic so extending into preceding active state is safe
+            # Search window: [cue - anticipatory, cue + post_cue], capped to avoid
+            # reaching the opposite transition (argmax would find the stronger one)
             closed_search_start = max(0, cue_closed - anticipatory_samples)
-            closed_search_end   = max(closed_search_start + 1,
+            closed_search_end   = min(cue_closed + post_cue_samples,
                                       (cycle.get("open_cue_idx") or cycle.get("open_start_idx", n_samples))
                                       - template_samples)
+            closed_search_end   = max(closed_search_start + 1, closed_search_end)
             open_search_start   = max(0, cue_open - anticipatory_samples)
-            open_search_end     = n_samples - template_samples
+            open_search_end     = min(cue_open + post_cue_samples,
+                                      n_samples - template_samples)
+            open_search_end     = max(open_search_start + 1, open_search_end)
 
             cycle_info = {
                 "closed_channels_fired": [],
@@ -3529,6 +3534,7 @@ class TrainingProtocol(QObject):
             detect_dead_channels,
             detect_artifact_channels,
             ONSET_ANTICIPATORY_S,
+            ONSET_MAX_POST_CUE_S,
             ONSET_BASELINE_DURATION_S,
         )
 
@@ -3538,6 +3544,7 @@ class TrainingProtocol(QObject):
         template_duration_s = self.template_manager.template_duration_s
         template_samples = int(template_duration_s * config.FSAMP)
         anticipatory_samples = int(ONSET_ANTICIPATORY_S * config.FSAMP)
+        post_cue_samples = int(ONSET_MAX_POST_CUE_S * config.FSAMP)
         # baseline_samples is kept for artifact detection only (not for onset)
         baseline_samples = int(ONSET_BASELINE_DURATION_S * config.FSAMP)
 
@@ -3566,13 +3573,16 @@ class TrainingProtocol(QObject):
                 cue_closed = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
                 cue_open = cycle.get("open_cue_idx") or cycle.get("open_start_idx", 0)
 
-                # TKEO derivative is direction-agnostic: extending into the preceding
-                # active state is safe — the peak of |d(TKEO)/dt| at the transition
-                # dominates over any slow offset of the opposite muscle group
+                # Search window: [cue - anticipatory, cue + post_cue], capped to avoid
+                # reaching the opposite transition (argmax would find the stronger one)
                 closed_search_start = max(0, cue_closed - anticipatory_samples)
-                closed_search_end = max(closed_search_start + 1, cue_open - template_samples)
+                closed_search_end = min(cue_closed + post_cue_samples,
+                                        cue_open - template_samples)
+                closed_search_end = max(closed_search_start + 1, closed_search_end)
                 open_search_start = max(0, cue_open - anticipatory_samples)
-                open_search_end = n_samples - template_samples
+                open_search_end = min(cue_open + post_cue_samples,
+                                      n_samples - template_samples)
+                open_search_end = max(open_search_start + 1, open_search_end)
 
                 # Baselines below are used only for artifact detection, not for onset
                 closed_baseline_start = max(0, closed_search_start - baseline_samples)

@@ -58,6 +58,7 @@ CUSUM_DRIFT = 0.5                # Allowable drift before accumulating
 CUSUM_H = 5.0                    # Decision threshold for cumulative sum
 # TKEO transition detector parameters
 ONSET_ANTICIPATORY_S = 0.5      # Search extends this far before the audio cue
+ONSET_MAX_POST_CUE_S = 1.5      # Search ends at most this far after the audio cue
 TKEO_MIN_PEAK_RATIO = 3.0       # Peak/median noise ratio required for a valid detection
 TKEO_CONTRIBUTION_FRACTION = 0.3  # Channels above this fraction of max contribution → 'channels_fired'
 
