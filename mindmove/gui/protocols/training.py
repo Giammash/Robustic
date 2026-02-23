@@ -1233,15 +1233,15 @@ class GuidedRecordingReviewDialog(QDialog):
         self.cycle_viewer._update_display()
 
     def _run_onset_detection(self, cycles: list):
-        """Run per-channel onset detection and pre-set window positions."""
+        """Run TKEO-based transition onset detection and pre-set window positions."""
         from mindmove.model.template_study import (
-            detect_onset_per_channel,
+            detect_transition_onset,
             place_template_at_onset,
-            ONSET_BASELINE_DURATION_S,
+            ONSET_ANTICIPATORY_S,
         )
 
         template_samples = int(self.template_manager.template_duration_s * config.FSAMP)
-        baseline_samples = int(ONSET_BASELINE_DURATION_S * config.FSAMP)
+        anticipatory_samples = int(ONSET_ANTICIPATORY_S * config.FSAMP)
 
         n_closed_detected = 0
         n_open_detected = 0
@@ -1252,13 +1252,17 @@ class GuidedRecordingReviewDialog(QDialog):
             emg = cycle["emg"]
             n_samples = emg.shape[1]
 
-            closed_search_start = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
-            closed_search_end   = (cycle.get("open_cue_idx") or cycle.get("open_start_idx", n_samples)) - template_samples
-            open_search_start   = cycle.get("open_cue_idx")  or cycle.get("open_start_idx", 0)
-            open_search_end     = n_samples - template_samples
+            cue_closed = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
+            cue_open   = cycle.get("open_cue_idx")  or cycle.get("open_start_idx", 0)
 
-            closed_baseline_start = max(0, closed_search_start - baseline_samples)
-            open_baseline_start   = max(0, open_search_start   - baseline_samples)
+            # Extend search backward by ONSET_ANTICIPATORY_S — TKEO derivative is
+            # direction-agnostic so extending into preceding active state is safe
+            closed_search_start = max(0, cue_closed - anticipatory_samples)
+            closed_search_end   = max(closed_search_start + 1,
+                                      (cycle.get("open_cue_idx") or cycle.get("open_start_idx", n_samples))
+                                      - template_samples)
+            open_search_start   = max(0, cue_open - anticipatory_samples)
+            open_search_end     = n_samples - template_samples
 
             cycle_info = {
                 "closed_channels_fired": [],
@@ -1268,10 +1272,7 @@ class GuidedRecordingReviewDialog(QDialog):
             }
 
             # CLOSED onset
-            result = detect_onset_per_channel(
-                emg, closed_search_start, closed_search_end,
-                baseline_start=closed_baseline_start,
-            )
+            result = detect_transition_onset(emg, closed_search_start, closed_search_end)
             if result["earliest_onset"] is not None:
                 pos = place_template_at_onset(result["earliest_onset"], n_samples)
                 pos = max(pos, closed_search_start)
@@ -1284,13 +1285,10 @@ class GuidedRecordingReviewDialog(QDialog):
                 print(f"  Cycle {idx+1} CLOSED: onset={result['earliest_onset']/config.FSAMP:.2f}s, "
                       f"channels=[{fired}]")
             else:
-                print(f"  Cycle {idx+1} CLOSED: no onset detected (manual placement needed)")
+                print(f"  Cycle {idx+1} CLOSED: no transition detected (manual placement needed)")
 
             # OPEN onset
-            result = detect_onset_per_channel(
-                emg, open_search_start, open_search_end,
-                baseline_start=open_baseline_start,
-            )
+            result = detect_transition_onset(emg, open_search_start, open_search_end)
             if result["earliest_onset"] is not None:
                 pos = place_template_at_onset(result["earliest_onset"], n_samples)
                 pos = max(pos, open_search_start)
@@ -1303,7 +1301,7 @@ class GuidedRecordingReviewDialog(QDialog):
                 print(f"  Cycle {idx+1} OPEN:   onset={result['earliest_onset']/config.FSAMP:.2f}s, "
                       f"channels=[{fired}]")
             else:
-                print(f"  Cycle {idx+1} OPEN:   no onset detected (manual placement needed)")
+                print(f"  Cycle {idx+1} OPEN:   no transition detected (manual placement needed)")
 
             onset_info.append(cycle_info)
 
@@ -3526,11 +3524,11 @@ class TrainingProtocol(QObject):
         Stores onset info (channels fired) for use in review dialog.
         """
         from mindmove.model.template_study import (
-            detect_onset_per_channel,
+            detect_transition_onset,
             place_template_at_onset,
             detect_dead_channels,
             detect_artifact_channels,
-            ONSET_THRESHOLD_K,
+            ONSET_ANTICIPATORY_S,
             ONSET_BASELINE_DURATION_S,
         )
 
@@ -3539,6 +3537,8 @@ class TrainingProtocol(QObject):
 
         template_duration_s = self.template_manager.template_duration_s
         template_samples = int(template_duration_s * config.FSAMP)
+        anticipatory_samples = int(ONSET_ANTICIPATORY_S * config.FSAMP)
+        # baseline_samples is kept for artifact detection only (not for onset)
         baseline_samples = int(ONSET_BASELINE_DURATION_S * config.FSAMP)
 
         closed_templates = []
@@ -3565,15 +3565,16 @@ class TrainingProtocol(QObject):
 
                 cue_closed = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
                 cue_open = cycle.get("open_cue_idx") or cycle.get("open_start_idx", 0)
-                hold_open = cycle.get("hold_open_samples", 0)
-                # Extend CLOSED search back by half the preceding open hold to capture
-                # anticipatory movements (quiet rest before close cue → valid baseline)
-                closed_search_start = max(0, cue_closed - hold_open // 2)
-                closed_search_end = cue_open - template_samples
-                # OPEN search starts at cue — extending into CLOSED hold fails amplitude detection
-                open_search_start = cue_open
+
+                # TKEO derivative is direction-agnostic: extending into the preceding
+                # active state is safe — the peak of |d(TKEO)/dt| at the transition
+                # dominates over any slow offset of the opposite muscle group
+                closed_search_start = max(0, cue_closed - anticipatory_samples)
+                closed_search_end = max(closed_search_start + 1, cue_open - template_samples)
+                open_search_start = max(0, cue_open - anticipatory_samples)
                 open_search_end = n_samples - template_samples
 
+                # Baselines below are used only for artifact detection, not for onset
                 closed_baseline_start = max(0, closed_search_start - baseline_samples)
                 open_baseline_start = max(0, open_search_start - baseline_samples)
 
@@ -3593,13 +3594,9 @@ class TrainingProtocol(QObject):
                     print(f"  Cycle {cn} DEAD channels: {[ch+1 for ch in cycle_info['dead_channels']]}")
 
                 # CLOSED onset
-                result = detect_onset_per_channel(
-                    emg, closed_search_start, closed_search_end,
-                    baseline_start=closed_baseline_start,
-                )
+                result = detect_transition_onset(emg, closed_search_start, closed_search_end)
                 if result["earliest_onset"] is not None:
                     pos = place_template_at_onset(result["earliest_onset"], n_samples)
-                    # Clamp: don't start before the cue
                     pos = max(pos, closed_search_start)
                     pos = min(pos, n_samples - template_samples)
                     end_idx = pos + template_samples
@@ -3620,17 +3617,12 @@ class TrainingProtocol(QObject):
                         art_str = ",".join(str(ch+1) for ch in art["artifact_channels"])
                         print(f"           CLOSED artifacts: CH[{art_str}]")
                 else:
-                    print(f"  Cycle {cn} CLOSED: no onset detected — skipped")
-                    self._print_onset_diagnostics(result, "CLOSED", cn)
+                    print(f"  Cycle {cn} CLOSED: no transition detected — skipped")
 
                 # OPEN onset
-                result = detect_onset_per_channel(
-                    emg, open_search_start, open_search_end,
-                    baseline_start=open_baseline_start,
-                )
+                result = detect_transition_onset(emg, open_search_start, open_search_end)
                 if result["earliest_onset"] is not None:
                     pos = place_template_at_onset(result["earliest_onset"], n_samples)
-                    # Clamp: don't start before the cue
                     pos = max(pos, open_search_start)
                     pos = min(pos, n_samples - template_samples)
                     end_idx = pos + template_samples
@@ -3651,8 +3643,7 @@ class TrainingProtocol(QObject):
                         art_str = ",".join(str(ch+1) for ch in art["artifact_channels"])
                         print(f"           OPEN artifacts: CH[{art_str}]")
                 else:
-                    print(f"  Cycle {cn} OPEN:   no onset detected — skipped")
-                    self._print_onset_diagnostics(result, "OPEN", cn)
+                    print(f"  Cycle {cn} OPEN:   no transition detected — skipped")
 
                 self._onset_info.append(cycle_info)
                 total_cycles += 1

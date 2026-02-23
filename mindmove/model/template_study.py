@@ -56,6 +56,10 @@ ONSET_METHOD = "threshold"       # "threshold" or "cusum"
 # CUSUM parameters (in units of baseline std)
 CUSUM_DRIFT = 0.5                # Allowable drift before accumulating
 CUSUM_H = 5.0                    # Decision threshold for cumulative sum
+# TKEO transition detector parameters
+ONSET_ANTICIPATORY_S = 0.5      # Search extends this far before the audio cue
+TKEO_MIN_PEAK_RATIO = 3.0       # Peak/median noise ratio required for a valid detection
+TKEO_CONTRIBUTION_FRACTION = 0.3  # Channels above this fraction of max contribution → 'channels_fired'
 
 # Signal quality parameters
 DEAD_CHANNEL_EPSILON = 1e-6       # Std threshold for dead channel
@@ -441,6 +445,132 @@ def detect_onset_per_channel_cusum(
         "per_channel_onset": per_channel_onset,
         "channels_fired": channels_fired,
         "earliest_onset": mean_onset,
+        "envelope_data": envelope_data,
+    }
+
+
+def detect_transition_onset(
+    emg: np.ndarray,
+    search_start: int,
+    search_end: int,
+    min_peak_ratio: float = TKEO_MIN_PEAK_RATIO,
+    contribution_fraction: float = TKEO_CONTRIBUTION_FRACTION,
+) -> dict:
+    """
+    Detect the onset of a state transition using |d(TKEO_envelope)/dt| summed
+    across channels.
+
+    Direction-agnostic: channels activating (rising TKEO) and channels
+    deactivating (falling TKEO) both produce a large absolute derivative at the
+    same moment and therefore both contribute to the detection. This handles:
+
+    - CLOSED onset from an open posture: extensors deactivate + flexors activate
+    - OPEN onset from a closed posture:  flexors deactivate + extensors activate
+    - Any mix of simultaneously-changing channels
+
+    Silent channels throughout the cycle contribute near-zero derivative and
+    self-exclude without any explicit dead-channel logic.
+
+    Args:
+        emg: (n_channels, n_samples) full cycle EMG (already filtered)
+        search_start: first sample index of the search window
+        search_end: last sample index of the search window
+        min_peak_ratio: peak / median(combined) must exceed this ratio.
+            Prevents detecting noise as a transition when no clear event exists.
+        contribution_fraction: channels whose |d(TKEO_env)| at the peak exceeds
+            this fraction of the maximum are labelled 'channels_fired'.
+
+    Returns:
+        dict with keys:
+            earliest_onset: sample index of the detected transition (None if not found)
+            channels_fired: list of channel indices most active at the transition
+            channel_contributions: (n_ch,) array of each channel's contribution at peak
+            envelope_data: dict with 'combined', 'env_time', 'search_start_s', 'search_end_s'
+    """
+    n_ch, n_samples = emg.shape
+    _empty = {
+        "earliest_onset": None,
+        "channels_fired": [],
+        "channel_contributions": np.zeros(n_ch),
+        "envelope_data": {
+            "combined": np.array([]),
+            "env_time": np.array([]),
+            "search_start_s": search_start / config.FSAMP,
+            "search_end_s": search_end / config.FSAMP,
+        },
+    }
+
+    if search_end <= search_start or n_samples < 3:
+        return _empty
+
+    # --- Step 1: TKEO per channel ---
+    # psi[n] = x[n]^2 - x[n-1]*x[n+1]  (instantaneous energy, ~5ms effective window)
+    psi = emg[:, 1:-1] ** 2 - emg[:, :-2] * emg[:, 2:]  # (n_ch, n_samples-2)
+    psi = np.abs(psi)  # TKEO is theoretically non-negative; abs guards against noise
+
+    # --- Step 2: RMS envelope of TKEO per channel (same grid as amplitude detector) ---
+    psi_env, _, env_time = compute_rms_envelope(psi)  # (n_ch, n_env)
+
+    if psi_env.shape[1] < 2:
+        return _empty
+
+    # --- Step 3: |d(TKEO_envelope)/dt| per channel ---
+    d_psi = np.abs(np.diff(psi_env, axis=1))  # (n_ch, n_env-1)
+
+    # --- Step 4: Sum across channels ---
+    # Both rising and falling channels contribute positively to the same peak
+    combined = np.sum(d_psi, axis=0)  # (n_env-1,)
+
+    # --- Step 5: Map search window to envelope indices ---
+    env_step = int(ONSET_ENVELOPE_WINDOW_S * config.FSAMP) // 2
+    search_start_env = max(0, search_start // env_step)
+    search_end_env = min(combined.shape[0], search_end // env_step)
+
+    # Align env_time with d_psi (diff reduces length by 1; use midpoint convention)
+    d_env_time = env_time[:-1] + (env_time[1] - env_time[0]) / 2 if len(env_time) > 1 else env_time
+
+    envelope_data = {
+        "combined": combined,
+        "env_time": d_env_time,
+        "search_start_s": search_start / config.FSAMP,
+        "search_end_s": search_end / config.FSAMP,
+    }
+
+    if search_end_env <= search_start_env:
+        return {**_empty, "envelope_data": envelope_data}
+
+    # --- Step 6: Find peak within search window ---
+    window = combined[search_start_env:search_end_env]
+    peak_idx_local = int(np.argmax(window))
+    peak_val = float(window[peak_idx_local])
+
+    # --- Step 7: Quality gate — peak must stand out against noise floor ---
+    noise_floor = float(np.median(window))
+    if noise_floor <= 0 or peak_val < noise_floor * min_peak_ratio:
+        return {**_empty, "envelope_data": envelope_data}
+
+    peak_env_idx = search_start_env + peak_idx_local
+    onset_sample = int(d_env_time[min(peak_env_idx, len(d_env_time) - 1)] * config.FSAMP)
+
+    # --- Step 8: Per-channel contribution at the peak (±2 envelope bins) ---
+    hw = 2
+    peak_lo = max(0, peak_env_idx - hw)
+    peak_hi = min(d_psi.shape[1], peak_env_idx + hw + 1)
+    per_channel_contribution = np.mean(d_psi[:, peak_lo:peak_hi], axis=1)  # (n_ch,)
+
+    max_contrib = float(np.max(per_channel_contribution))
+    if max_contrib > 0:
+        channels_fired = [
+            ch for ch in range(n_ch)
+            if per_channel_contribution[ch] >= max_contrib * contribution_fraction
+        ]
+    else:
+        channels_fired = []
+
+    return {
+        "earliest_onset": onset_sample,
+        "channels_fired": channels_fired,
+        "channel_contributions": per_channel_contribution,
         "envelope_data": envelope_data,
     }
 
