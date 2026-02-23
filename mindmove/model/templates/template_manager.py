@@ -899,6 +899,12 @@ class TemplateManager:
                 open_start_relative = fall_idx - cycle_start   # Where GT goes 1→0 (first transition)
                 close_start_relative = rise_idx - cycle_start  # Where GT goes 0→1 (second transition)
 
+                # Hold durations for onset detection lookback
+                hold_open_samples = rise_idx - fall_idx  # GT=0 segment (open contraction)
+                # Hold closed = time since previous 0→1 edge (or 0 if first cycle)
+                prev_rises = rising_edges[rising_edges < fall_idx]
+                hold_closed_samples = int(fall_idx - prev_rises[-1]) if len(prev_rises) > 0 else 0
+
                 # Find audio cue indices by nearest-match (same logic as standard mode)
                 cue_tolerance = int(1.0 * config.FSAMP)
                 close_cue_idx = None
@@ -925,6 +931,8 @@ class TemplateManager:
                     'open_start_idx': open_start_relative,    # Where GT goes 1→0 (first in inverted)
                     'close_cue_idx': close_cue_idx,           # Audio cue time (if available)
                     'open_cue_idx': open_cue_idx,             # Audio cue time (if available)
+                    'hold_closed_samples': hold_closed_samples,  # Duration of preceding CLOSED hold
+                    'hold_open_samples': hold_open_samples,      # Duration of OPEN hold (GT=0)
                     'cycle_number': cycle_num,
                     'duration_s': cycle_emg.shape[1] / config.FSAMP,
                     'protocol_mode': protocol_mode,
@@ -963,6 +971,13 @@ class TemplateManager:
                 close_start_relative = rise_idx - cycle_start
                 open_start_relative = fall_idx - cycle_start
 
+                # Hold durations — used by onset detection to extend the search window
+                # back into the preceding hold (anticipatory movements)
+                hold_closed_samples = fall_idx - rise_idx  # GT=1 segment for this cycle
+                # Hold open = time since previous GT 1→0 edge (or 0 if first cycle)
+                prev_falls = falling_edges[falling_edges < rise_idx]
+                hold_open_samples = int(rise_idx - prev_falls[-1]) if len(prev_falls) > 0 else 0
+
                 # Find audio cue indices by matching to the nearest cue within ±1s
                 # of each GT transition. This works for any number of reps per cycle.
                 cue_tolerance = int(1.0 * config.FSAMP)
@@ -990,6 +1005,8 @@ class TemplateManager:
                     'open_start_idx': open_start_relative,    # Where GT goes 1→0
                     'close_cue_idx': close_cue_idx,           # Audio cue time (if available)
                     'open_cue_idx': open_cue_idx,             # Audio cue time (if available)
+                    'hold_closed_samples': hold_closed_samples,  # Duration of CLOSED hold (GT=1)
+                    'hold_open_samples': hold_open_samples,      # Duration of preceding OPEN hold
                     'cycle_number': cycle_num,
                     'duration_s': cycle_emg.shape[1] / config.FSAMP,
                     'protocol_mode': protocol_mode,

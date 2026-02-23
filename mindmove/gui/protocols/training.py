@@ -859,7 +859,11 @@ class CycleReviewWidget(QWidget):
         self.ax.set_xlabel('Time (s)')
         status = " [ACCEPTED]" if (has_closed and has_open) else (" [CLOSED]" if has_closed else (" [OPEN]" if has_open else ""))
         mode_indicator = " [INV]" if protocol_mode == "inverted" else ""
-        rec_name = f'{self.recording_name} - ' if hasattr(self, 'recording_name') and self.recording_name else ''
+        # Use per-cycle source recording name (set when multiple recordings loaded)
+        # Fall back to widget-level recording_name for single-recording use
+        cycle_rec = self.cycles[self.current_cycle_idx].get('source_recording') if self.cycles else None
+        _rec = cycle_rec or (self.recording_name if hasattr(self, 'recording_name') else None)
+        rec_name = f'{_rec} - ' if _rec else ''
 
         # Onset detection status indicator
         onset_status = ""
@@ -1195,12 +1199,13 @@ class GuidedRecordingReviewDialog(QDialog):
                 pre_close_s=1.0,  # 1 second before closing starts
                 post_open_s=2.5   # 2.5 seconds after opening to include HOLD_OPEN_END
             )
+            # Tag each cycle with its source recording name for display in the viewer
+            rec_label = recording.get('label', f'Recording {i+1}')
+            for c in cycles:
+                c['source_recording'] = rec_label
             all_cycles.extend(cycles)
 
-        # Get recording name from first recording
-        recording_name = self.recordings[0].get('label', 'Recording') if self.recordings else None
-
-        self.cycle_viewer.set_cycles(all_cycles, recording_name=recording_name)
+        self.cycle_viewer.set_cycles(all_cycles)
         print(f"[REVIEW] Total: {len(all_cycles)} complete cycles")
 
         # Pre-set window positions and channel info from onset detection
@@ -1247,9 +1252,13 @@ class GuidedRecordingReviewDialog(QDialog):
             emg = cycle["emg"]
             n_samples = emg.shape[1]
 
-            closed_search_start = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
-            closed_search_end = (cycle.get("open_cue_idx") or cycle.get("open_start_idx", n_samples)) - template_samples
-            open_search_start = cycle.get("open_cue_idx") or cycle.get("open_start_idx", 0)
+            cue_closed = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
+            cue_open = cycle.get("open_cue_idx") or cycle.get("open_start_idx", 0)
+            hold_closed = cycle.get("hold_closed_samples", 0)
+            hold_open = cycle.get("hold_open_samples", 0)
+            closed_search_start = max(0, cue_closed - hold_open // 2)
+            closed_search_end = cue_open - template_samples
+            open_search_start = max(0, cue_open - hold_closed // 2)
             open_search_end = n_samples - template_samples
 
             closed_baseline_start = max(0, closed_search_start - baseline_samples)
@@ -3543,20 +3552,30 @@ class TrainingProtocol(QObject):
         # Store onset info for review dialog
         self._onset_info = []  # list of dicts per cycle
 
-        for recording in recordings:
-            # Need enough post-open data for onset search + template (1s) + margin
+        for rec_idx, recording in enumerate(recordings):
+            # pre_close_s=3.0 gives up to 3s lookback before the cue, covering
+            # anticipatory movements where half of even a 6s hold is 3s
             cycles = self.template_manager.extract_complete_cycles(
-                recording, post_open_s=2.0
+                recording, pre_close_s=3.0, post_open_s=2.0
             )
+            rec_label = recording.get('label', f'Recording {rec_idx+1}')
+            for c in cycles:
+                c['source_recording'] = rec_label
 
             for cycle in cycles:
                 emg = cycle["emg"]
                 n_samples = emg.shape[1]
                 cn = cycle["cycle_number"]
 
-                closed_search_start = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
-                closed_search_end = (cycle.get("open_cue_idx") or cycle.get("open_start_idx", n_samples)) - template_samples
-                open_search_start = cycle.get("open_cue_idx") or cycle.get("open_start_idx", 0)
+                cue_closed = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
+                cue_open = cycle.get("open_cue_idx") or cycle.get("open_start_idx", 0)
+                hold_closed = cycle.get("hold_closed_samples", 0)
+                hold_open = cycle.get("hold_open_samples", 0)
+                # Extend search window back by half the preceding hold to capture
+                # anticipatory movements (subject moves before the cue after practice)
+                closed_search_start = max(0, cue_closed - hold_open // 2)
+                closed_search_end = cue_open - template_samples
+                open_search_start = max(0, cue_open - hold_closed // 2)
                 open_search_end = n_samples - template_samples
 
                 closed_baseline_start = max(0, closed_search_start - baseline_samples)
