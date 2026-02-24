@@ -1309,7 +1309,7 @@ def compute_spatial_profiles(
 
         # L2 normalization (unit vector)
         l2 = np.linalg.norm(rms)
-        per_template_rms[i] = rms / l2 if l2 > 1e-10 else rms
+        per_template_rms[i] = rms / l2 if l2 > 1e-10 else np.zeros(n_ch)
 
         # Max normalization (for plotting)
         mx = np.max(rms)
@@ -1487,3 +1487,121 @@ def compute_spatial_similarity(
     else:
         # Mean-profile mode (default)
         return _weighted_cosine(current_unit, ref_profile)
+
+
+def compute_live_rms(emg_buffer: np.ndarray) -> np.ndarray:
+    """L2-normalized RMS of second half of buffer.
+
+    Shared helper for both global and per-template coupled spatial paths.
+    Mirrors how per-template RMS vectors are computed in compute_spatial_profiles().
+
+    Args:
+        emg_buffer: Current EMG buffer, shape (n_channels, n_samples)
+
+    Returns:
+        L2-normalized RMS vector, shape (n_channels,). Zero vector if norm is tiny.
+    """
+    half = emg_buffer.shape[1] // 2
+    active = emg_buffer[:, half:]
+    rms = np.sqrt(np.mean(active ** 2, axis=1))
+    norm = np.linalg.norm(rms)
+    return rms / norm if norm > 1e-10 else np.zeros_like(rms)
+
+
+def aggregate_distances_with_per_template_spatial(
+    distances: np.ndarray,
+    live_rms: np.ndarray,
+    per_template_rms: np.ndarray,
+    aggregation: str = "avg_3_smallest",
+    spatial_mode: str = "scaling",
+    spatial_threshold: float = 0.5,
+    spatial_sharpness: float = 3.0,
+    spatial_relu_baseline: float = 0.3,
+) -> tuple:
+    """Per-template coupled spatial correction: correct each DTW distance by the
+    cosine similarity between the live signal and that specific template, then aggregate.
+
+    For each template i:
+        sim_i = dot(live_rms_L2, per_template_rms_i_L2)   (plain cosine, both unit vectors)
+        D_i_corr = correction(D_i, sim_i, spatial_mode, ...)
+
+    Then aggregate the corrected distances with the same logic as
+    compute_distance_from_training_set_online.
+
+    Contrast modes (contrast, relu_contrast, relu_ext_contrast) are not supported
+    per-template (they require two class similarities). This function silently treats
+    them as their scaling counterparts.
+
+    Args:
+        distances: Raw DTW distances, shape (n_templates,)
+        live_rms: L2-normalized live RMS vector, shape (n_channels,)
+        per_template_rms: L2-normalized per-template RMS, shape (n_templates, n_channels)
+        aggregation: Aggregation method — "average", "minimum", "avg_3_smallest"
+        spatial_mode: Correction mode — "gate", "scaling", "relu_scaling",
+                      "relu_ext_scaling", or contrast variants (treated as scaling)
+        spatial_threshold: Gate/ReLU saturation threshold
+        spatial_sharpness: Exponent k for power-law/ReLU modes
+        spatial_relu_baseline: Baseline b for ReLU modes (f(0) = b)
+
+    Returns:
+        (D_agg_corrected, per_template_sims)
+        D_agg_corrected: Aggregated corrected distance (scalar float)
+        per_template_sims: Cosine similarity to each template, shape (n_templates,)
+    """
+    n = len(distances)
+    if n == 0:
+        return np.inf, np.zeros(0)
+
+    # Step 1: per-template cosine similarities
+    raw_dots = per_template_rms @ live_rms
+    sims = np.where(np.isnan(raw_dots), 0.0, np.clip(raw_dots, 0.0, 1.0))  # NaN-safe
+
+    # Step 2: apply correction per template
+    k = max(spatial_sharpness, 0.1)
+    t = max(spatial_threshold, 1e-6)
+    b = spatial_relu_baseline
+    corrected = np.empty(n)
+
+    for i in range(n):
+        D_i = distances[i]
+        s = sims[i]
+
+        if spatial_mode == "gate":
+            # Replace blocked distances with inf; aggregation (min/avg) ignores inf
+            corrected[i] = np.inf if s < t else D_i
+        elif spatial_mode in ("scaling", "contrast", "relu_contrast", "relu_ext_contrast"):
+            # contrast modes treated as scaling (no second-class sim available per-template)
+            sim_clamped = max(s, 0.1)
+            corrected[i] = D_i / (sim_clamped ** k)
+        elif spatial_mode in ("relu_scaling",):
+            f_sim = 1.0 if s >= t else b ** ((1.0 - s / t) ** (1.0 / k))
+            corrected[i] = D_i / max(f_sim, 0.01)
+        elif spatial_mode in ("relu_ext_scaling",):
+            if s >= t:
+                rt = (s - t) / max(1.0 - t, 1e-6)
+                f_ext = (1.0 / b) ** (rt ** (1.0 / k))
+            else:
+                f_ext = b ** ((1.0 - s / t) ** (1.0 / k))
+            corrected[i] = D_i / max(f_ext, 0.01)
+        else:
+            # Unknown mode: pass through unchanged
+            corrected[i] = D_i
+
+    # Replace any NaN (e.g. from degenerate DTW distances) with inf so they are skipped
+    corrected[np.isnan(corrected)] = np.inf
+
+    # Step 3: aggregate over finite corrected distances.
+    # Gate and NaN→inf replacement mean we always work on finite values only.
+    finite = corrected[np.isfinite(corrected)]
+    if len(finite) == 0:
+        # All templates blocked or degenerate → large penalty
+        D_agg = float(np.nanmax(distances) * 2.0) if n > 0 else 1e9
+    elif aggregation == "minimum":
+        D_agg = float(np.min(finite))
+    elif aggregation == "avg_3_smallest":
+        n_s = min(3, len(finite))
+        D_agg = float(np.mean(np.sort(finite)[:n_s]))
+    else:
+        D_agg = float(np.mean(finite))
+
+    return D_agg, sims

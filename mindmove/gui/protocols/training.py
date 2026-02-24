@@ -1120,7 +1120,8 @@ class GuidedRecordingReviewDialog(QDialog):
     """
 
     def __init__(self, recordings: List[dict], template_manager: TemplateManager,
-                 parent=None, onset_detection: bool = False, onset_info: list = None):
+                 parent=None, onset_detection: bool = False, onset_info: list = None,
+                 onset_method: str = "amplitude"):
         super().__init__(parent)
         if isinstance(recordings, dict):
             self.recordings = [recordings]
@@ -1130,6 +1131,7 @@ class GuidedRecordingReviewDialog(QDialog):
         self.saved = False
         self._onset_detection = onset_detection
         self._onset_info = onset_info  # list of dicts with channels_fired and positions per cycle
+        self._onset_method = onset_method  # "amplitude" or "tkeo"
 
         n_recordings = len(self.recordings)
         title_suffix = " (Onset Detection)" if onset_detection else ""
@@ -1162,6 +1164,20 @@ class GuidedRecordingReviewDialog(QDialog):
         self.cycle_viewer = CycleReviewWidget()
         self.cycle_viewer.templates_accepted.connect(self._on_templates_accepted)
         layout.addWidget(self.cycle_viewer, stretch=1)
+
+        # Onset controls (only shown in onset detection mode)
+        if self._onset_detection:
+            onset_ctrl_layout = QHBoxLayout()
+            method_label_text = {
+                "amplitude": "Amplitude Threshold (mean + k·std)",
+                "tkeo": "TKEO (|d/dt| energy)",
+            }.get(self._onset_method, self._onset_method)
+            onset_ctrl_layout.addWidget(QLabel(f"Method: {method_label_text}"))
+            rerun_btn = QPushButton("Re-run Detection")
+            rerun_btn.clicked.connect(self._rerun_onset_detection)
+            onset_ctrl_layout.addWidget(rerun_btn)
+            onset_ctrl_layout.addStretch()
+            layout.addLayout(onset_ctrl_layout)
 
         # Status and buttons
         status_layout = QHBoxLayout()
@@ -1219,31 +1235,64 @@ class GuidedRecordingReviewDialog(QDialog):
 
         self._update_status()
 
+    def _rerun_onset_detection(self):
+        """Re-run onset detection with the current method (set by template type selection)."""
+        cycles = self.cycle_viewer.cycles
+        if cycles:
+            self._run_onset_detection(cycles)
+
     def _apply_onset_info(self, cycles: list):
-        """Apply pre-computed onset detection results to cycle viewer."""
+        """Apply pre-computed onset detection results to cycle viewer.
+
+        onset_info positions are stored as offsets from the GT transition index
+        (closed_pos = window_start - cue_closed, open_pos = window_start - cue_open).
+        Re-apply using the viewer cycle's own GT transition indices so the positions
+        are correct regardless of which pre_close_s was used during extraction.
+        """
+        template_samples = int(self.template_manager.template_duration_s * config.FSAMP)
+
         for idx in range(min(len(cycles), len(self._onset_info))):
             info = self._onset_info[idx]
+            cycle = cycles[idx]
+            n_samples = cycle["emg"].shape[1]
+
+            # Viewer cycle GT transition indices
+            viewer_cue_closed = (cycle.get("close_cue_idx") or
+                                 cycle.get("close_start_idx", 0))
+            viewer_cue_open   = (cycle.get("open_cue_idx") or
+                                 cycle.get("open_start_idx", 0))
+
             if info["closed_pos"] is not None:
-                self.cycle_viewer._saved_closed_positions[idx] = info["closed_pos"]
+                pos = viewer_cue_closed + info["closed_pos"]
+                pos = max(0, min(pos, n_samples - template_samples))
+                self.cycle_viewer._saved_closed_positions[idx] = pos
             if info["open_pos"] is not None:
-                self.cycle_viewer._saved_open_positions[idx] = info["open_pos"]
+                pos = viewer_cue_open + info["open_pos"]
+                pos = max(0, min(pos, n_samples - template_samples))
+                self.cycle_viewer._saved_open_positions[idx] = pos
 
         # Store channel info for highlighting
         self.cycle_viewer._onset_info = self._onset_info
         self.cycle_viewer._update_display()
 
     def _run_onset_detection(self, cycles: list):
-        """Run TKEO-based transition onset detection and pre-set window positions."""
+        """Run onset detection (amplitude threshold or TKEO) and pre-set window positions."""
         from mindmove.model.template_study import (
+            detect_onset_per_channel,
             detect_transition_onset,
             place_template_at_onset,
             ONSET_ANTICIPATORY_S,
             ONSET_MAX_POST_CUE_S,
+            ONSET_BASELINE_DURATION_S,
         )
+
+        method = getattr(self, "_onset_method", "amplitude")
+        print(f"\n[ONSET] Running detection method: {method}")
 
         template_samples = int(self.template_manager.template_duration_s * config.FSAMP)
         anticipatory_samples = int(ONSET_ANTICIPATORY_S * config.FSAMP)
         post_cue_samples = int(ONSET_MAX_POST_CUE_S * config.FSAMP)
+        baseline_samples = int(ONSET_BASELINE_DURATION_S * config.FSAMP)
 
         n_closed_detected = 0
         n_open_detected = 0
@@ -1257,17 +1306,29 @@ class GuidedRecordingReviewDialog(QDialog):
             cue_closed = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
             cue_open   = cycle.get("open_cue_idx")  or cycle.get("open_start_idx", 0)
 
-            # Search window: [cue - anticipatory, cue + post_cue], capped to avoid
-            # reaching the opposite transition (argmax would find the stronger one)
-            closed_search_start = max(0, cue_closed - anticipatory_samples)
-            closed_search_end   = min(cue_closed + post_cue_samples,
-                                      (cycle.get("open_cue_idx") or cycle.get("open_start_idx", n_samples))
-                                      - template_samples)
-            closed_search_end   = max(closed_search_start + 1, closed_search_end)
-            open_search_start   = max(0, cue_open - anticipatory_samples)
-            open_search_end     = min(cue_open + post_cue_samples,
-                                      n_samples - template_samples)
-            open_search_end     = max(open_search_start + 1, open_search_end)
+            if method == "tkeo":
+                # TKEO: narrow window around cue so argmax cannot reach opposite transition
+                closed_search_start = max(0, cue_closed - anticipatory_samples)
+                closed_search_end   = min(cue_closed + post_cue_samples,
+                                          (cycle.get("open_cue_idx") or
+                                           cycle.get("open_start_idx", n_samples))
+                                          - template_samples)
+                closed_search_end   = max(closed_search_start + 1, closed_search_end)
+                open_search_start   = max(0, cue_open - anticipatory_samples)
+                open_search_end     = min(cue_open + post_cue_samples,
+                                          n_samples - template_samples)
+                open_search_end     = max(open_search_start + 1, open_search_end)
+                closed_baseline_start = None  # not used by TKEO
+                open_baseline_start   = None
+            else:
+                # Amplitude threshold: extend search backward to catch anticipatory movements.
+                # Baseline is placed in the quiet rest BEFORE the search window.
+                closed_search_start = max(0, cue_closed - anticipatory_samples)
+                closed_search_end   = max(closed_search_start + 1, cue_open - template_samples)
+                open_search_start   = max(0, cue_open - anticipatory_samples)
+                open_search_end     = max(open_search_start + 1, n_samples - template_samples)
+                closed_baseline_start = max(0, closed_search_start - baseline_samples)
+                open_baseline_start   = max(0, open_search_start - baseline_samples)
 
             cycle_info = {
                 "closed_channels_fired": [],
@@ -1277,7 +1338,11 @@ class GuidedRecordingReviewDialog(QDialog):
             }
 
             # CLOSED onset
-            result = detect_transition_onset(emg, closed_search_start, closed_search_end)
+            if method == "tkeo":
+                result = detect_transition_onset(emg, closed_search_start, closed_search_end)
+            else:
+                result = detect_onset_per_channel(emg, closed_search_start, closed_search_end,
+                                                  baseline_start=closed_baseline_start)
             if result["earliest_onset"] is not None:
                 pos = place_template_at_onset(result["earliest_onset"], n_samples)
                 pos = max(pos, closed_search_start)
@@ -1290,10 +1355,14 @@ class GuidedRecordingReviewDialog(QDialog):
                 print(f"  Cycle {idx+1} CLOSED: onset={result['earliest_onset']/config.FSAMP:.2f}s, "
                       f"channels=[{fired}]")
             else:
-                print(f"  Cycle {idx+1} CLOSED: no transition detected (manual placement needed)")
+                print(f"  Cycle {idx+1} CLOSED: no onset detected (manual placement needed)")
 
             # OPEN onset
-            result = detect_transition_onset(emg, open_search_start, open_search_end)
+            if method == "tkeo":
+                result = detect_transition_onset(emg, open_search_start, open_search_end)
+            else:
+                result = detect_onset_per_channel(emg, open_search_start, open_search_end,
+                                                  baseline_start=open_baseline_start)
             if result["earliest_onset"] is not None:
                 pos = place_template_at_onset(result["earliest_onset"], n_samples)
                 pos = max(pos, open_search_start)
@@ -1306,7 +1375,7 @@ class GuidedRecordingReviewDialog(QDialog):
                 print(f"  Cycle {idx+1} OPEN:   onset={result['earliest_onset']/config.FSAMP:.2f}s, "
                       f"channels=[{fired}]")
             else:
-                print(f"  Cycle {idx+1} OPEN:   no transition detected (manual placement needed)")
+                print(f"  Cycle {idx+1} OPEN:   no onset detected (manual placement needed)")
 
             onset_info.append(cycle_info)
 
@@ -1363,6 +1432,8 @@ class GuidedRecordingReviewDialog(QDialog):
         combined_data = {
             "templates_open": open_templates,
             "templates_closed": closed_templates,
+            "metadata_open": self.template_manager.template_metadata.get("open", []),
+            "metadata_closed": self.template_manager.template_metadata.get("closed", []),
             "metadata": {
                 "n_open": len(open_templates),
                 "n_closed": len(closed_templates),
@@ -1579,14 +1650,43 @@ class TemplateStudyDialog(QDialog):
         default_overlap_samples: int = 64,
         default_aggregation_idx: int = 0,
         default_dead_channels_text: str = "",
+        metadata_closed: list = None,
+        metadata_open: list = None,
         parent=None,
     ):
         super().__init__(parent)
         self.templates_closed = list(templates_closed)  # work on a copy
         self.templates_open = list(templates_open)
+        self.metadata_closed = list(metadata_closed) if metadata_closed else []
+        self.metadata_open = list(metadata_open) if metadata_open else []
         self.templates_modified = False
+        # Cache for Tab 3 re-computation (populated after first _compute() call)
+        self._cached_metrics = None
+        self._cached_spatial_closed = None
+        self._cached_spatial_open = None
         self.setWindowTitle("Template Study")
-        self.resize(900, 700)
+        # Make the dialog a proper resizable window with maximize/minimize buttons
+        from PySide6.QtCore import Qt
+        self.setWindowFlags(
+            Qt.WindowType.Window |
+            Qt.WindowType.WindowTitleHint |
+            Qt.WindowType.WindowSystemMenuHint |
+            Qt.WindowType.WindowMinMaxButtonsHint |
+            Qt.WindowType.WindowCloseButtonHint
+        )
+        self.setSizeGripEnabled(True)
+        # Start with a reasonable size but allow free resizing
+        from PySide6.QtWidgets import QApplication
+        screen = QApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            w = min(1100, int(avail.width() * 0.85))
+            h = min(850, int(avail.height() * 0.85))
+            self.resize(w, h)
+            # Center on screen
+            self.move(avail.center().x() - w // 2, avail.center().y() - h // 2)
+        else:
+            self.resize(1000, 750)
 
         layout = QVBoxLayout(self)
 
@@ -1653,7 +1753,7 @@ class TemplateStudyDialog(QDialog):
         tab1_layout.setContentsMargins(0, 0, 0, 0)
         self.figure_dtw = Figure(figsize=(8, 6), dpi=100)
         self.canvas_dtw = FigureCanvas(self.figure_dtw)
-        self.canvas_dtw.setMinimumHeight(400)
+        self.canvas_dtw.setMinimumHeight(200)
         tab1_layout.addWidget(self.canvas_dtw)
         self.results_tabs.addTab(tab1_widget, "DTW Analysis")
 
@@ -1663,13 +1763,73 @@ class TemplateStudyDialog(QDialog):
         tab2_layout.setContentsMargins(0, 0, 0, 0)
         self.figure_spatial = Figure(figsize=(8, 6), dpi=100)
         self.canvas_spatial = FigureCanvas(self.figure_spatial)
-        self.canvas_spatial.setMinimumHeight(400)
+        self.canvas_spatial.setMinimumHeight(200)
         tab2_layout.addWidget(self.canvas_spatial)
         self.spatial_stats_label = QLabel("Run 'Compute' to see spatial analysis.")
         self.spatial_stats_label.setStyleSheet("font-family: monospace; font-size: 11px;")
         self.spatial_stats_label.setWordWrap(True)
         tab2_layout.addWidget(self.spatial_stats_label)
         self.results_tabs.addTab(tab2_widget, "Spatial Analysis")
+
+        # Tab 3: Coupled Correction
+        tab3_widget = QWidget()
+        tab3_layout = QVBoxLayout(tab3_widget)
+        tab3_layout.setContentsMargins(4, 4, 4, 4)
+
+        # Parameter controls row
+        tab3_param_row = QHBoxLayout()
+        tab3_param_row.addWidget(QLabel("Mode:"))
+        self.coupled_mode_combo = QComboBox()
+        self.coupled_mode_combo.addItem("Distance Scaling", "scaling")
+        self.coupled_mode_combo.addItem("Gate", "gate")
+        self.coupled_mode_combo.addItem("ReLU Scaling", "relu_scaling")
+        self.coupled_mode_combo.addItem("ReLU Scaling (ext)", "relu_ext_scaling")
+        tab3_param_row.addWidget(self.coupled_mode_combo)
+
+        tab3_param_row.addWidget(QLabel("k:"))
+        self.coupled_k_spinbox = QDoubleSpinBox()
+        self.coupled_k_spinbox.setRange(0.5, 10.0)
+        self.coupled_k_spinbox.setSingleStep(0.5)
+        self.coupled_k_spinbox.setValue(3.0)
+        self.coupled_k_spinbox.setDecimals(1)
+        self.coupled_k_spinbox.setFixedWidth(65)
+        tab3_param_row.addWidget(self.coupled_k_spinbox)
+
+        tab3_param_row.addWidget(QLabel("Threshold:"))
+        self.coupled_threshold_spinbox = QDoubleSpinBox()
+        self.coupled_threshold_spinbox.setRange(0.0, 1.0)
+        self.coupled_threshold_spinbox.setSingleStep(0.05)
+        self.coupled_threshold_spinbox.setValue(0.50)
+        self.coupled_threshold_spinbox.setDecimals(2)
+        self.coupled_threshold_spinbox.setFixedWidth(65)
+        tab3_param_row.addWidget(self.coupled_threshold_spinbox)
+
+        tab3_param_row.addWidget(QLabel("Baseline:"))
+        self.coupled_baseline_spinbox = QDoubleSpinBox()
+        self.coupled_baseline_spinbox.setRange(0.01, 0.99)
+        self.coupled_baseline_spinbox.setSingleStep(0.05)
+        self.coupled_baseline_spinbox.setValue(0.30)
+        self.coupled_baseline_spinbox.setDecimals(2)
+        self.coupled_baseline_spinbox.setFixedWidth(65)
+        tab3_param_row.addWidget(self.coupled_baseline_spinbox)
+
+        self.coupled_compute_btn = QPushButton("Compute Coupled")
+        self.coupled_compute_btn.clicked.connect(self._compute_coupled_tab_from_ui)
+        tab3_param_row.addWidget(self.coupled_compute_btn)
+        tab3_param_row.addStretch()
+        tab3_layout.addLayout(tab3_param_row)
+
+        self.figure_coupled = Figure(figsize=(8, 6), dpi=100)
+        self.canvas_coupled = FigureCanvas(self.figure_coupled)
+        self.canvas_coupled.setMinimumHeight(200)
+        tab3_layout.addWidget(self.canvas_coupled)
+
+        self.coupled_stats_label = QLabel("Run 'Compute' then switch to this tab, or click 'Compute Coupled'.")
+        self.coupled_stats_label.setStyleSheet("font-family: monospace; font-size: 11px;")
+        self.coupled_stats_label.setWordWrap(True)
+        tab3_layout.addWidget(self.coupled_stats_label)
+
+        self.results_tabs.addTab(tab3_widget, "Coupled Correction")
 
         layout.addWidget(self.results_tabs)
 
@@ -1692,7 +1852,8 @@ class TemplateStudyDialog(QDialog):
         flagged_scroll = QScrollArea()
         flagged_scroll.setWidget(self.flagged_container)
         flagged_scroll.setWidgetResizable(True)
-        flagged_scroll.setMaximumHeight(160)
+        flagged_scroll.setMinimumHeight(60)
+        flagged_scroll.setMaximumHeight(220)
         layout.addWidget(flagged_scroll)
 
         # ── Template count label ──
@@ -1818,6 +1979,20 @@ class TemplateStudyDialog(QDialog):
 
             self.templates_closed = list(templates_closed)
             self.templates_open = list(templates_open)
+            # Load provenance metadata if available in the file
+            if isinstance(data, dict):
+                if "templates_open" in data and "templates_closed" in data:
+                    self.metadata_closed = list(data.get("metadata_closed", []))
+                    self.metadata_open = list(data.get("metadata_open", []))
+                elif "templates" in data and "metadata" in data:
+                    class_label = data["metadata"].get("class_label", "").lower()
+                    tmpl_meta = list(data.get("template_metadata", []))
+                    if "open" in class_label:
+                        self.metadata_open = tmpl_meta
+                        self.metadata_closed = []
+                    else:
+                        self.metadata_closed = tmpl_meta
+                        self.metadata_open = []
             self.templates_modified = True  # loaded new set
             basename = os.path.basename(filename)
             self.setWindowTitle(f"Template Study — {basename}")
@@ -1900,9 +2075,13 @@ class TemplateStudyDialog(QDialog):
                 return
             metrics, quality, params = result
 
-            # Compute spatial profiles
+            # Compute spatial profiles (also stored for Tab 3 on-demand re-computation)
             spatial_closed = compute_spatial_profiles(self.templates_closed) if self.templates_closed else None
             spatial_open = compute_spatial_profiles(self.templates_open) if self.templates_open else None
+            # Cache for Tab 3
+            self._cached_metrics = metrics
+            self._cached_spatial_closed = spatial_closed
+            self._cached_spatial_open = spatial_open
 
             # Plot: DTW distance matrix (left) + spatial profiles (right) — Tab 1
             self.figure_dtw.clear()
@@ -1980,6 +2159,9 @@ class TemplateStudyDialog(QDialog):
 
             # ── Tab 2: Spatial Analysis ──
             self._compute_spatial_tab(metrics, spatial_closed, spatial_open)
+
+            # ── Tab 3: Coupled Correction (auto-compute with current params) ──
+            self._compute_coupled_tab(metrics, spatial_closed, spatial_open)
 
             # Build stats text
             ic = metrics["intra_closed"]
@@ -2059,10 +2241,30 @@ class TemplateStudyDialog(QDialog):
         # Pairwise cosine similarity matrix (unit vectors → dot product = cos sim)
         sim_matrix = np.clip(rms_all @ rms_all.T, 0.0, 1.0)       # (n_total, n_total)
 
-        # Per-template labels (CLOSED first, then OPEN to match DTW matrix order)
+        # Per-template labels with provenance (CLOSED first, then OPEN)
+        def _meta_label(prefix, i, meta_list):
+            # Use stored original id if available so labels are stable after removals
+            if i < len(meta_list):
+                m = meta_list[i]
+                orig_id = m.get("id", i + 1)
+                base = f"{prefix}{orig_id}"
+                rec = str(m.get("recording", ""))
+                cyc = m.get("cycle", "")
+                # Abbreviate long recording names (keep last 8 chars)
+                if len(rec) > 8:
+                    rec = rec[-8:]
+                if rec and cyc != "":
+                    return f"{base}\n{rec}#{cyc}"
+                elif rec:
+                    return f"{base}\n{rec}"
+                elif cyc != "":
+                    return f"{base}\n#{cyc}"
+                return base
+            return f"{prefix}{i+1}"
+
         labels_sim = (
-            [f"C{i+1}" for i in range(n_closed)] +
-            [f"O{i+1}" for i in range(n_open)]
+            [_meta_label("C", i, self.metadata_closed) for i in range(n_closed)] +
+            [_meta_label("O", i, self.metadata_open) for i in range(n_open)]
         )
 
         gs2 = gridspec.GridSpec(1, 2, figure=self.figure_spatial, width_ratios=[1, 1.1])
@@ -2153,6 +2355,239 @@ class TemplateStudyDialog(QDialog):
                          f"({'good: classes are spatially distinct' if sim_gap < 0 else 'warning: classes overlap spatially'})")
         self.spatial_stats_label.setText("\n".join(lines))
 
+    def _compute_coupled_tab_from_ui(self):
+        """Called by 'Compute Coupled' button — uses cached metrics/spatial data."""
+        metrics = getattr(self, '_cached_metrics', None)
+        spatial_closed = getattr(self, '_cached_spatial_closed', None)
+        spatial_open = getattr(self, '_cached_spatial_open', None)
+        if metrics is None:
+            self.coupled_stats_label.setText("Run 'Compute' first to compute DTW metrics.")
+            return
+        self._compute_coupled_tab(metrics, spatial_closed, spatial_open)
+
+    def _compute_coupled_tab(self, metrics, spatial_closed, spatial_open):
+        """Compute and render Tab 3: Coupled Correction analysis."""
+        from mindmove.model.core.algorithm import aggregate_distances_with_per_template_spatial
+        from mindmove.model.template_study import analyze_template_quality
+        import matplotlib.gridspec as gridspec
+
+        self.figure_coupled.clear()
+
+        n_closed = len(self.templates_closed)
+        n_open = len(self.templates_open)
+        n_total = n_closed + n_open
+
+        if n_total < 2 or (spatial_closed is None and spatial_open is None):
+            ax = self.figure_coupled.add_subplot(111)
+            ax.text(0.5, 0.5, "Coupled correction requires spatial profiles (per_template_rms).",
+                    ha="center", va="center", transform=ax.transAxes, fontsize=11)
+            ax.axis("off")
+            self.canvas_coupled.draw()
+            self.coupled_stats_label.setText("Spatial profiles not available.")
+            return
+
+        # Check per_template_rms availability
+        has_ptpl_c = spatial_closed is not None and spatial_closed.get("per_template_rms") is not None
+        has_ptpl_o = spatial_open is not None and spatial_open.get("per_template_rms") is not None
+        if not has_ptpl_c and not has_ptpl_o:
+            ax = self.figure_coupled.add_subplot(111)
+            ax.text(0.5, 0.5, "per_template_rms not available in spatial profiles.",
+                    ha="center", va="center", transform=ax.transAxes, fontsize=11)
+            ax.axis("off")
+            self.canvas_coupled.draw()
+            self.coupled_stats_label.setText("per_template_rms not available.")
+            return
+
+        spatial_mode = self.coupled_mode_combo.currentData()
+        k = self.coupled_k_spinbox.value()
+        threshold = self.coupled_threshold_spinbox.value()
+        baseline = self.coupled_baseline_spinbox.value()
+
+        # Stack per_template_rms: CLOSED first, then OPEN
+        rms_parts = []
+        if has_ptpl_c:
+            rms_parts.append(spatial_closed["per_template_rms"])
+        else:
+            # Fallback: zeros for closed templates if missing
+            if n_closed > 0 and has_ptpl_o:
+                n_ch = spatial_open["per_template_rms"].shape[1]
+                rms_parts.append(np.zeros((n_closed, n_ch)))
+        if has_ptpl_o:
+            rms_parts.append(spatial_open["per_template_rms"])
+        else:
+            if n_open > 0 and has_ptpl_c:
+                n_ch = spatial_closed["per_template_rms"].shape[1]
+                rms_parts.append(np.zeros((n_open, n_ch)))
+        rms_all = np.vstack(rms_parts)  # (n_total, n_ch)
+
+        # Pairwise cosine similarities (L2-unit vectors)
+        sim_matrix = np.clip(rms_all @ rms_all.T, 0.0, 1.0)  # (n_total, n_total)
+
+        # Apply per-template coupled correction to the raw distance matrix
+        dist_matrix_raw = metrics["distance_matrix"].copy()  # (n_total, n_total)
+        dist_matrix_corr = np.zeros_like(dist_matrix_raw)
+
+        for i in range(n_total):
+            # For each template i as the "live" signal, correct distances to all others
+            live_rms_i = rms_all[i]  # unit vector
+            raw_row = dist_matrix_raw[i].copy()
+            # Per-template similarities: sim_j = dot(live_rms_i, rms_j) = sim_matrix[i]
+            sims_row = sim_matrix[i]
+            corr_row = np.empty(n_total)
+            for j in range(n_total):
+                D_j = raw_row[j]
+                s_j = float(sims_row[j])
+                if i == j:
+                    corr_row[j] = 0.0
+                    continue
+                if spatial_mode == "gate":
+                    corr_row[j] = np.inf if s_j < threshold else D_j
+                elif spatial_mode in ("scaling",):
+                    corr_row[j] = D_j / max(s_j, 0.1) ** k
+                elif spatial_mode == "relu_scaling":
+                    t = max(threshold, 1e-6)
+                    k_ = max(k, 0.1)
+                    f = 1.0 if s_j >= t else baseline ** ((1.0 - s_j / t) ** (1.0 / k_))
+                    corr_row[j] = D_j / max(f, 0.01)
+                elif spatial_mode == "relu_ext_scaling":
+                    t = max(threshold, 1e-6)
+                    k_ = max(k, 0.1)
+                    if s_j >= t:
+                        rt = (s_j - t) / max(1.0 - t, 1e-6)
+                        f_ext = (1.0 / baseline) ** (rt ** (1.0 / k_))
+                    else:
+                        f_ext = baseline ** ((1.0 - s_j / t) ** (1.0 / k_))
+                    corr_row[j] = D_j / max(f_ext, 0.01)
+                else:
+                    corr_row[j] = D_j
+            dist_matrix_corr[i] = corr_row
+
+        # Replace inf with large finite value for display only
+        display_corr = np.where(np.isinf(dist_matrix_corr), np.nanmax(dist_matrix_raw) * 2, dist_matrix_corr)
+
+        # Re-symmetrize (average i→j and j→i)
+        display_corr = (display_corr + display_corr.T) / 2
+
+        # Compute corrected metrics from upper triangle (symmetrized)
+        rows_ut, cols_ut = np.triu_indices(n_total, k=1)
+        d_ic_raw, d_ic_corr = [], []
+        d_io_raw, d_io_corr = [], []
+        d_cross_raw, d_cross_corr = [], []
+        s_ic, s_io, s_cross = [], [], []
+
+        for r, c in zip(rows_ut, cols_ut):
+            d_raw = dist_matrix_raw[r, c]
+            d_corr_val = display_corr[r, c]
+            s = sim_matrix[r, c]
+            r_closed = r < n_closed
+            c_closed = c < n_closed
+            if r_closed and c_closed:
+                d_ic_raw.append(d_raw); d_ic_corr.append(d_corr_val); s_ic.append(s)
+            elif not r_closed and not c_closed:
+                d_io_raw.append(d_raw); d_io_corr.append(d_corr_val); s_io.append(s)
+            else:
+                d_cross_raw.append(d_raw); d_cross_corr.append(d_corr_val); s_cross.append(s)
+
+        # Grade computation (same metric as Tab 1: separation gap / intra std)
+        def _grade(d_intra_c, d_intra_o, d_cross_c, d_cross_o):
+            if not d_intra_c and not d_intra_o:
+                return 0.0
+            ic_m = np.mean(d_intra_c) if d_intra_c else 0.0
+            ic_s = np.std(d_intra_c) if d_intra_c else 0.0
+            io_m = np.mean(d_intra_o) if d_intra_o else 0.0
+            io_s = np.std(d_intra_o) if d_intra_o else 0.0
+            ec_m = np.mean(d_cross_c) if d_cross_c else float('inf')
+            eo_m = np.mean(d_cross_o) if d_cross_o else float('inf')
+            gap_c = ec_m - (ic_m + ic_s)
+            gap_o = eo_m - (io_m + io_s)
+            gap = (gap_c + gap_o) / 2
+            denom = (ic_s + io_s) / 2 + 1e-8
+            score = min(10.0, max(0.0, 5.0 + 5.0 * gap / denom))
+            return score
+
+        grade_raw = _grade(d_ic_raw, d_io_raw, d_cross_raw, d_cross_raw)
+        grade_corr = _grade(d_ic_corr, d_io_corr, d_cross_corr, d_cross_corr)
+
+        # ── Plots ──
+        gs3 = gridspec.GridSpec(1, 2, figure=self.figure_coupled, width_ratios=[1, 1.1])
+        ax_mat = self.figure_coupled.add_subplot(gs3[0])
+        ax_sc = self.figure_coupled.add_subplot(gs3[1])
+
+        # Left: corrected distance matrix heatmap
+        im = ax_mat.imshow(display_corr, cmap="viridis", aspect="auto")
+        self.figure_coupled.colorbar(im, ax=ax_mat, label="Corrected Distance", fraction=0.046)
+        if n_closed > 0 and n_open > 0:
+            b = n_closed - 0.5
+            ax_mat.axhline(b, color="white", linewidth=1.5, linestyle="--", alpha=0.8)
+            ax_mat.axvline(b, color="white", linewidth=1.5, linestyle="--", alpha=0.8)
+        step = max(1, n_total // 20)
+        ticks = list(range(0, n_total, step))
+        tick_labels = (
+            [f"C{i+1}" for i in range(n_closed)] +
+            [f"O{i+1}" for i in range(n_open)]
+        )
+        ax_mat.set_xticks(ticks)
+        ax_mat.set_xticklabels([tick_labels[i] for i in ticks], fontsize=7, rotation=45)
+        ax_mat.set_yticks(ticks)
+        ax_mat.set_yticklabels([tick_labels[i] for i in ticks], fontsize=7)
+        ax_mat.set_title(f"Corrected Distance Matrix\n({spatial_mode}, k={k:.1f}, t={threshold:.2f})")
+
+        # Right: DTW vs Spatial scatter (raw distances, color by class)
+        if d_ic_raw:
+            ax_sc.scatter(d_ic_raw, s_ic, c="#d44", alpha=0.65, s=18, label="Intra-CLOSED")
+        if d_io_raw:
+            ax_sc.scatter(d_io_raw, s_io, c="#48b", alpha=0.65, s=18, label="Intra-OPEN")
+        if d_cross_raw:
+            ax_sc.scatter(d_cross_raw, s_cross, c="#4a4", alpha=0.5, s=14, label="Cross-class", marker="^")
+        ax_sc.set_xlabel("DTW Distance (raw)")
+        ax_sc.set_ylabel("Cosine Similarity")
+        ax_sc.set_title("Raw DTW vs Per-Template Spatial Similarity")
+        ax_sc.legend(fontsize=8)
+        ax_sc.grid(alpha=0.3)
+
+        self.figure_coupled.tight_layout()
+        self.canvas_coupled.draw()
+
+        # ── Stats text ──
+        def _fmt(vals, label):
+            if not vals:
+                return f"  {label}: n=0  (no pairs)"
+            return (f"  {label}: n={len(vals):3d}  "
+                    f"mean={np.mean(vals):.4f}  std={np.std(vals):.4f}")
+
+        def _gap(intra_list, cross_list):
+            if not intra_list or not cross_list:
+                return float("nan")
+            return np.mean(cross_list) - (np.mean(intra_list) + np.std(intra_list))
+
+        gap_c_raw = _gap(d_ic_raw, d_cross_raw)
+        gap_o_raw = _gap(d_io_raw, d_cross_raw)
+        gap_c_corr = _gap(d_ic_corr, d_cross_corr)
+        gap_o_corr = _gap(d_io_corr, d_cross_corr)
+
+        lines_c = [
+            "Coupled Correction Analysis",
+            f"  Mode: {spatial_mode}  k={k:.1f}  threshold={threshold:.2f}  baseline={baseline:.2f}",
+            "",
+            "Raw distances:",
+            _fmt(d_ic_raw, "Intra-CLOSED"),
+            _fmt(d_io_raw, "Intra-OPEN  "),
+            _fmt(d_cross_raw, "Cross-class "),
+            "",
+            "Corrected distances:",
+            _fmt(d_ic_corr, "Intra-CLOSED"),
+            _fmt(d_io_corr, "Intra-OPEN  "),
+            _fmt(d_cross_corr, "Cross-class "),
+            "",
+            f"  Separation gap (raw):  CLOSED={gap_c_raw:+.4f}  OPEN={gap_o_raw:+.4f}",
+            f"  Separation gap (corr): CLOSED={gap_c_corr:+.4f}  OPEN={gap_o_corr:+.4f}",
+            f"  Gap improvement:       CLOSED Δ={gap_c_corr-gap_c_raw:+.4f}  OPEN Δ={gap_o_corr-gap_o_raw:+.4f}",
+            "",
+            f"  Grade (raw):  {grade_raw:.1f} / 10",
+            f"  Grade (corr): {grade_corr:.1f} / 10",
+        ]
+        self.coupled_stats_label.setText("\n".join(lines_c))
+
     def _populate_flagged_templates(self, quality):
         """Build the flagged-templates section with Remove buttons."""
         # Clear previous content
@@ -2183,8 +2618,27 @@ class TemplateStudyDialog(QDialog):
             row = QHBoxLayout()
             flag_str = ", ".join(t["flags"])
             consensus = " [OUTLIER]" if t["is_outlier"] else ""
+            idx = t["index"]
+            # Build stable label and provenance string from metadata
+            meta_list = self.metadata_closed if class_name == "closed" else self.metadata_open
+            prov = ""
+            stable_label = t["label"]  # fallback: C{idx+1} / O{idx+1} from template_study
+            if idx < len(meta_list):
+                m = meta_list[idx]
+                orig_id = m.get("id", idx + 1)
+                prefix = "C" if class_name == "closed" else "O"
+                stable_label = f"{prefix}{orig_id}"
+                rec = m.get("recording", "")
+                cyc = m.get("cycle", "")
+                parts = []
+                if rec:
+                    parts.append(rec)
+                if cyc != "":
+                    parts.append(f"#{cyc}")
+                if parts:
+                    prov = f"  ({', '.join(parts)})"
             info = QLabel(
-                f"{t['label']}  intra={t['intra']:.4f}  inter={t['inter']:.4f}  "
+                f"{stable_label}{prov}  intra={t['intra']:.4f}  inter={t['inter']:.4f}  "
                 f"margin={t['margin']:.4f}  sil={t['silhouette']:.3f}  "
                 f"[{flag_str}]{consensus}"
             )
@@ -2210,9 +2664,15 @@ class TemplateStudyDialog(QDialog):
     def _remove_template(self, class_name, index):
         """Remove a template by class and index, then re-compute."""
         target = self.templates_closed if class_name == "closed" else self.templates_open
+        meta_target = self.metadata_closed if class_name == "closed" else self.metadata_open
         if 0 <= index < len(target):
-            removed_label = f"{'C' if class_name == 'closed' else 'O'}{index + 1}"
+            # Build display label using stored original ID if available
+            m = meta_target[index] if index < len(meta_target) else {}
+            orig_id = m.get("id", index + 1)
+            removed_label = f"{'C' if class_name == 'closed' else 'O'}{orig_id}"
             del target[index]
+            if index < len(meta_target):
+                del meta_target[index]
             self.templates_modified = True
             n_c = len(self.templates_closed)
             n_o = len(self.templates_open)
@@ -2336,6 +2796,7 @@ class TrainingProtocol(QObject):
         self.legacy_emg_folder: Optional[str] = None
         self.legacy_gt_folder: Optional[str] = None
         self._guided_recordings_for_review: List[dict] = []  # Store recordings for template review
+        self._onset_method: str = "amplitude"  # "amplitude" or "tkeo"
 
         # File management:
         self.recordings_dir_path: str = "data/recordings/"
@@ -2913,10 +3374,11 @@ class TrainingProtocol(QObject):
             "Manual Selection",           # index 3
         ]
         self._guided_template_types = [
-            "Manual Selection",     # index 0 - opens review dialog with two windows
-            "After Audio Cue",      # index 1 - template starts at audio cue
-            "After Reaction Time",  # index 2 - template starts after reaction time
-            "Onset Detection",      # index 3 - auto-detect onset, then review
+            "Manual Selection",          # index 0 - opens review dialog with two windows
+            "After Audio Cue",           # index 1 - template starts at audio cue
+            "After Reaction Time",       # index 2 - template starts after reaction time
+            "Onset (Amplitude)",         # index 3 - auto-detect via mean+k·std, then review
+            "Onset (TKEO)",              # index 4 - auto-detect via |d(TKEO)/dt|, then review
         ]
 
         # Add extra options for auto-detect mode (UI file has only 2)
@@ -3183,11 +3645,13 @@ class TrainingProtocol(QObject):
         """Handle template type combo box change."""
         if self._is_guided_mode:
             # Guided Recording mode options:
-            # Index 0: "Manual Selection" - opens review dialog
-            # Index 1: "After Audio Cue" - template starts at audio cue
-            # Index 2: "After Reaction Time" - template starts after reaction time
+            # Index 0: "Manual Selection"
+            # Index 1: "After Audio Cue"
+            # Index 2: "After Reaction Time"
+            # Index 3: "Onset (Amplitude)" - mean + k·std threshold
+            # Index 4: "Onset (TKEO)"      - |d(TKEO)/dt| peak
 
-            self._manual_selection_mode = (index == 0 or index == 3)
+            self._manual_selection_mode = (index in (0, 3, 4))
 
             if index == 0:
                 self.template_manager.template_type = "manual"
@@ -3197,6 +3661,10 @@ class TrainingProtocol(QObject):
                 self.template_manager.template_type = "after_reaction_time"
             elif index == 3:
                 self.template_manager.template_type = "onset_detection"
+                self._onset_method = "amplitude"
+            elif index == 4:
+                self.template_manager.template_type = "onset_detection"
+                self._onset_method = "tkeo"
         else:
             # Auto-detect / Legacy mode options:
             # Index 0: "Hold Only (skip 0.5s)" - hold_only mode
@@ -3529,6 +3997,7 @@ class TrainingProtocol(QObject):
         Stores onset info (channels fired) for use in review dialog.
         """
         from mindmove.model.template_study import (
+            detect_onset_per_channel,
             detect_transition_onset,
             place_template_at_onset,
             detect_dead_channels,
@@ -3538,6 +4007,9 @@ class TrainingProtocol(QObject):
             ONSET_BASELINE_DURATION_S,
         )
 
+        method = getattr(self, "_onset_method", "amplitude")
+        print(f"\n[TRAINING] Onset detection method: {method}")
+
         self.template_manager.templates["closed"] = []
         self.template_manager.templates["open"] = []
 
@@ -3545,11 +4017,12 @@ class TrainingProtocol(QObject):
         template_samples = int(template_duration_s * config.FSAMP)
         anticipatory_samples = int(ONSET_ANTICIPATORY_S * config.FSAMP)
         post_cue_samples = int(ONSET_MAX_POST_CUE_S * config.FSAMP)
-        # baseline_samples is kept for artifact detection only (not for onset)
         baseline_samples = int(ONSET_BASELINE_DURATION_S * config.FSAMP)
 
         closed_templates = []
         open_templates = []
+        closed_meta = []
+        open_meta = []
         total_cycles = 0
 
         # Store onset info for review dialog
@@ -3573,20 +4046,28 @@ class TrainingProtocol(QObject):
                 cue_closed = cycle.get("close_cue_idx") or cycle.get("close_start_idx", 0)
                 cue_open = cycle.get("open_cue_idx") or cycle.get("open_start_idx", 0)
 
-                # Search window: [cue - anticipatory, cue + post_cue], capped to avoid
-                # reaching the opposite transition (argmax would find the stronger one)
-                closed_search_start = max(0, cue_closed - anticipatory_samples)
-                closed_search_end = min(cue_closed + post_cue_samples,
-                                        cue_open - template_samples)
-                closed_search_end = max(closed_search_start + 1, closed_search_end)
-                open_search_start = max(0, cue_open - anticipatory_samples)
-                open_search_end = min(cue_open + post_cue_samples,
-                                      n_samples - template_samples)
-                open_search_end = max(open_search_start + 1, open_search_end)
-
-                # Baselines below are used only for artifact detection, not for onset
-                closed_baseline_start = max(0, closed_search_start - baseline_samples)
-                open_baseline_start = max(0, open_search_start - baseline_samples)
+                if method == "tkeo":
+                    # TKEO: narrow window around cue so argmax cannot reach opposite transition
+                    closed_search_start = max(0, cue_closed - anticipatory_samples)
+                    closed_search_end = min(cue_closed + post_cue_samples,
+                                            cue_open - template_samples)
+                    closed_search_end = max(closed_search_start + 1, closed_search_end)
+                    open_search_start = max(0, cue_open - anticipatory_samples)
+                    open_search_end = min(cue_open + post_cue_samples,
+                                          n_samples - template_samples)
+                    open_search_end = max(open_search_start + 1, open_search_end)
+                    # Baselines used only for artifact detection
+                    closed_baseline_start = max(0, closed_search_start - baseline_samples)
+                    open_baseline_start = max(0, open_search_start - baseline_samples)
+                else:
+                    # Amplitude threshold: extend search backward to catch anticipatory movements.
+                    # Baseline is placed in the quiet rest BEFORE the search window.
+                    closed_search_start = max(0, cue_closed - anticipatory_samples)
+                    closed_search_end = max(closed_search_start + 1, cue_open - template_samples)
+                    open_search_start = max(0, cue_open - anticipatory_samples)
+                    open_search_end = max(open_search_start + 1, n_samples - template_samples)
+                    closed_baseline_start = max(0, closed_search_start - baseline_samples)
+                    open_baseline_start = max(0, open_search_start - baseline_samples)
 
                 cycle_info = {
                     "closed_channels_fired": [],
@@ -3604,15 +4085,26 @@ class TrainingProtocol(QObject):
                     print(f"  Cycle {cn} DEAD channels: {[ch+1 for ch in cycle_info['dead_channels']]}")
 
                 # CLOSED onset
-                result = detect_transition_onset(emg, closed_search_start, closed_search_end)
+                if method == "tkeo":
+                    result = detect_transition_onset(emg, closed_search_start, closed_search_end)
+                else:
+                    result = detect_onset_per_channel(emg, closed_search_start, closed_search_end,
+                                                      baseline_start=closed_baseline_start)
                 if result["earliest_onset"] is not None:
                     pos = place_template_at_onset(result["earliest_onset"], n_samples)
                     pos = max(pos, closed_search_start)
                     pos = min(pos, n_samples - template_samples)
                     end_idx = pos + template_samples
                     closed_templates.append(emg[:, pos:end_idx])
+                    closed_meta.append({
+                        "id": len(closed_templates),  # stable 1-based ID assigned at extraction
+                        "recording": cycle.get("source_recording", f"Rec{rec_idx+1}"),
+                        "cycle": cn,
+                    })
                     cycle_info["closed_channels_fired"] = result["channels_fired"]
-                    cycle_info["closed_pos"] = pos
+                    # Store as offset from GT close transition so it can be
+                    # re-applied to the viewer cycle (different pre_close_s)
+                    cycle_info["closed_pos"] = pos - cue_closed
                     fired = ",".join(str(ch+1) for ch in result["channels_fired"])
                     print(f"  Cycle {cn} CLOSED: onset={result['earliest_onset']/config.FSAMP:.2f}s, "
                           f"window={pos/config.FSAMP:.2f}s-{end_idx/config.FSAMP:.2f}s, ch=[{fired}]")
@@ -3627,18 +4119,28 @@ class TrainingProtocol(QObject):
                         art_str = ",".join(str(ch+1) for ch in art["artifact_channels"])
                         print(f"           CLOSED artifacts: CH[{art_str}]")
                 else:
-                    print(f"  Cycle {cn} CLOSED: no transition detected — skipped")
+                    print(f"  Cycle {cn} CLOSED: no onset detected — skipped")
 
                 # OPEN onset
-                result = detect_transition_onset(emg, open_search_start, open_search_end)
+                if method == "tkeo":
+                    result = detect_transition_onset(emg, open_search_start, open_search_end)
+                else:
+                    result = detect_onset_per_channel(emg, open_search_start, open_search_end,
+                                                      baseline_start=open_baseline_start)
                 if result["earliest_onset"] is not None:
                     pos = place_template_at_onset(result["earliest_onset"], n_samples)
                     pos = max(pos, open_search_start)
                     pos = min(pos, n_samples - template_samples)
                     end_idx = pos + template_samples
                     open_templates.append(emg[:, pos:end_idx])
+                    open_meta.append({
+                        "id": len(open_templates),  # stable 1-based ID assigned at extraction
+                        "recording": cycle.get("source_recording", f"Rec{rec_idx+1}"),
+                        "cycle": cn,
+                    })
                     cycle_info["open_channels_fired"] = result["channels_fired"]
-                    cycle_info["open_pos"] = pos
+                    # Store as offset from GT open transition (same convention as closed_pos)
+                    cycle_info["open_pos"] = pos - cue_open
                     fired = ",".join(str(ch+1) for ch in result["channels_fired"])
                     print(f"  Cycle {cn} OPEN:   onset={result['earliest_onset']/config.FSAMP:.2f}s, "
                           f"window={pos/config.FSAMP:.2f}s-{end_idx/config.FSAMP:.2f}s, ch=[{fired}]")
@@ -3653,13 +4155,15 @@ class TrainingProtocol(QObject):
                         art_str = ",".join(str(ch+1) for ch in art["artifact_channels"])
                         print(f"           OPEN artifacts: CH[{art_str}]")
                 else:
-                    print(f"  Cycle {cn} OPEN:   no transition detected — skipped")
+                    print(f"  Cycle {cn} OPEN:   no onset detected — skipped")
 
                 self._onset_info.append(cycle_info)
                 total_cycles += 1
 
         self.template_manager.templates["closed"] = closed_templates
         self.template_manager.templates["open"] = open_templates
+        self.template_manager.template_metadata["closed"] = closed_meta
+        self.template_manager.template_metadata["open"] = open_meta
 
         n_closed = len(closed_templates)
         n_open = len(open_templates)
@@ -4442,6 +4946,8 @@ class TrainingProtocol(QObject):
         save_dict = {
             "templates_open": templates_open,
             "templates_closed": templates_closed,
+            "metadata_open": self.template_manager.template_metadata.get("open", []),
+            "metadata_closed": self.template_manager.template_metadata.get("closed", []),
             "metadata": {
                 "template_duration_s": duration,
                 "n_open": n_open,
@@ -4582,6 +5088,17 @@ class TrainingProtocol(QObject):
             self.template_manager.clear_all()
             self.template_manager.templates["closed"] = templates_closed
             self.template_manager.templates["open"] = templates_open
+            # Load provenance metadata if available
+            if "templates_open" in data and "templates_closed" in data:
+                self.template_manager.template_metadata["closed"] = list(data.get("metadata_closed", []))
+                self.template_manager.template_metadata["open"] = list(data.get("metadata_open", []))
+            elif "templates" in data and "metadata" in data:
+                class_label_key = data["metadata"].get("class_label", "").lower()
+                tmpl_meta = list(data.get("template_metadata", []))
+                if "open" in class_label_key:
+                    self.template_manager.template_metadata["open"] = tmpl_meta
+                else:
+                    self.template_manager.template_metadata["closed"] = tmpl_meta
 
             # Infer template duration from data
             if sample.shape[1] > 0:
@@ -4653,6 +5170,7 @@ class TrainingProtocol(QObject):
             self._guided_recordings_for_review, self.template_manager, self.main_window,
             onset_detection=has_onset,
             onset_info=self._onset_info if has_onset else None,
+            onset_method=getattr(self, "_onset_method", "amplitude"),
         )
         result = review_dialog.exec()
 
@@ -4681,6 +5199,8 @@ class TrainingProtocol(QObject):
             default_overlap_samples=overlap_samples,
             default_aggregation_idx=agg_idx,
             default_dead_channels_text=dead_text,
+            metadata_closed=self.template_manager.template_metadata.get("closed", []),
+            metadata_open=self.template_manager.template_metadata.get("open", []),
             parent=self.main_window,
         )
         dialog.finished.connect(lambda: self._on_template_study_closed(dialog))
@@ -4692,6 +5212,8 @@ class TrainingProtocol(QObject):
             return
         self.template_manager.templates["closed"] = dialog.templates_closed
         self.template_manager.templates["open"] = dialog.templates_open
+        self.template_manager.template_metadata["closed"] = dialog.metadata_closed
+        self.template_manager.template_metadata["open"] = dialog.metadata_open
         n_c = len(dialog.templates_closed)
         n_o = len(dialog.templates_open)
         self.template_count_label.setText(f"Updated: {n_c} closed, {n_o} open")

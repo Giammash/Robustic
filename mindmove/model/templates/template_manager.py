@@ -40,6 +40,9 @@ class TemplateManager:
         self.templates: Dict[str, List[np.ndarray]] = {"open": [], "closed": []}
         self.all_activations: Dict[str, List[np.ndarray]] = {"open": [], "closed": []}
         self.activation_metadata: Dict[str, List[dict]] = {"open": [], "closed": []}
+        # Per-template provenance: parallel list to self.templates[class]
+        # Each entry: {"recording": str, "cycle": int}
+        self.template_metadata: Dict[str, List[dict]] = {"open": [], "closed": []}
         self.template_type: Literal["hold_only", "onset_hold", "onset", "manual"] = "hold_only"
         self.selection_mode: Literal["manual", "auto", "first_n"] = "manual"
 
@@ -587,6 +590,7 @@ class TemplateManager:
         # Include metadata for reproducibility
         save_data = {
             "templates": self.templates[class_label],
+            "template_metadata": self.template_metadata.get(class_label, []),
             "metadata": {
                 "class_label": class_label,
                 "template_set_name": template_set_name,
@@ -639,8 +643,10 @@ class TemplateManager:
         """Clear selected templates."""
         if class_label:
             self.templates[class_label] = []
+            self.template_metadata[class_label] = []
         else:
             self.templates = {"open": [], "closed": []}
+            self.template_metadata = {"open": [], "closed": []}
 
     def clear_all(self, class_label: Optional[str] = None) -> None:
         """Clear both activations and templates."""

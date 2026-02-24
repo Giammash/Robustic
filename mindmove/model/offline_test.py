@@ -12,7 +12,10 @@ from pathlib import Path
 from scipy.io import loadmat
 
 from mindmove.config import config
-from mindmove.model.core.algorithm import compute_dtw, compute_distance_from_training_set_online, compute_spatial_similarity, GPUDTW_AVAILABLE
+from mindmove.model.core.algorithm import (
+    compute_dtw, compute_distance_from_training_set_online, compute_spatial_similarity,
+    compute_live_rms, aggregate_distances_with_per_template_spatial, GPUDTW_AVAILABLE,
+)
 from mindmove.model.core.windowing import sliding_window
 from mindmove.model.core.filtering import apply_rtfiltering
 from mindmove.model.core.features.features_registry import FEATURES
@@ -324,6 +327,7 @@ def simulate_realtime_dtw(
     decision_catboost_model: dict = None,
     spatial_similarity_mode: str = "mean",
     spatial_n_best: int = 3,
+    spatial_coupled: bool = False,
 ) -> dict:
     """
     Simulate real-time DTW processing using the same buffer logic as the online model.
@@ -446,8 +450,12 @@ def simulate_realtime_dtw(
             # Compute DTW distances
             dtw_start = time.perf_counter()
 
-            D_open = compute_distance_from_training_set_online(features, templates_open, distance_aggregation=distance_aggregation)
-            D_closed = compute_distance_from_training_set_online(features, templates_closed, distance_aggregation=distance_aggregation)
+            # Always fetch per-template distances when coupled correction might need them
+            _need_all = spatial_coupled and spatial_mode not in ("off", "contrast", "relu_contrast", "relu_ext_contrast")
+            D_open, _all_dist_open = compute_distance_from_training_set_online(
+                features, templates_open, distance_aggregation=distance_aggregation, return_all_distances=True)
+            D_closed, _all_dist_closed = compute_distance_from_training_set_online(
+                features, templates_closed, distance_aggregation=distance_aggregation, return_all_distances=True)
 
             dtw_end = time.perf_counter()
             dtw_time_ms = (dtw_end - dtw_start) * 1000
@@ -524,8 +532,39 @@ def simulate_realtime_dtw(
                 else:
                     triggered_state = "OPEN" if D_open < threshold_open else "CLOSED"
 
-                # Spatial correction (threshold mode only)
-                if spatial_mode != "off" and has_spatial_refs:
+                # Per-template coupled spatial correction (overrides global path when active)
+                _coupled_active = (
+                    spatial_coupled
+                    and spatial_mode not in ("off", "contrast", "relu_contrast", "relu_ext_contrast")
+                    and has_spatial_refs
+                )
+                if _coupled_active:
+                    buf = emg_filtered if config.ENABLE_FILTERING else emg_buffer
+                    live_rms_vec = compute_live_rms(buf)
+                    if current_state == "OPEN":
+                        _ref = spatial_ref_closed
+                        _all_d = _all_dist_closed
+                    else:
+                        _ref = spatial_ref_open
+                        _all_d = _all_dist_open
+                    if _ref is not None and _ref.get("per_template_rms") is not None:
+                        D_corr_val, _per_sims = aggregate_distances_with_per_template_spatial(
+                            _all_d, live_rms_vec, _ref["per_template_rms"],
+                            aggregation=distance_aggregation,
+                            spatial_mode=spatial_mode,
+                            spatial_threshold=spatial_threshold,
+                            spatial_sharpness=spatial_sharpness,
+                            spatial_relu_baseline=spatial_relu_baseline,
+                        )
+                        if current_state == "OPEN":
+                            D_closed_corr = D_corr_val
+                            triggered_state = "CLOSED" if D_closed_corr < threshold_closed else "OPEN"
+                        else:
+                            D_open_corr = D_corr_val
+                            triggered_state = "OPEN" if D_open_corr < threshold_open else "CLOSED"
+
+                # Spatial correction (threshold mode only, global path)
+                elif spatial_mode != "off" and has_spatial_refs:
                     k = spatial_sharpness
                     if spatial_mode == "gate":
                         if current_state == "OPEN":
@@ -702,6 +741,8 @@ def simulate_realtime_dtw(
         # Spatially-corrected distances (scaling/contrast modes only, else None per tick)
         'D_open_corrected': D_open_corrected_list,
         'D_closed_corrected': D_closed_corrected_list,
+        # Whether per-template coupled correction was active
+        'spatial_coupled': spatial_coupled,
     }
 
 

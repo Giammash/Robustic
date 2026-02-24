@@ -13,7 +13,12 @@ from mindmove.model.core.features.features_registry import FEATURES
 from mindmove.model.core.features import *
 from mindmove.model.core.windowing import sliding_window
 from mindmove.model.core.filtering import apply_rtfiltering
-from mindmove.model.core.algorithm import compute_distance_from_training_set_online, compute_spatial_similarity
+from mindmove.model.core.algorithm import (
+    compute_distance_from_training_set_online,
+    compute_spatial_similarity,
+    compute_live_rms,
+    aggregate_distances_with_per_template_spatial,
+)
 from mindmove.model.core.decision_network import DecisionNetworkInference, CatBoostDecisionInference
 
 if TYPE_CHECKING:
@@ -139,6 +144,9 @@ class Model:
         # Per-template spatial similarity mode
         self.spatial_similarity_mode = "mean"   # "mean" or "per_template"
         self.spatial_n_best = 3                 # top-k for per_template mode
+        # Per-template coupled correction: correct each DTW distance by its own spatial sim
+        # before aggregation. Disabled by default (global path).
+        self.spatial_coupled = False
 
         # Decision mode: "threshold" (manual), "nn" (neural network), or "catboost" (gradient boosting)
         self.decision_mode = "threshold"
@@ -796,8 +804,48 @@ class Model:
                 self._last_all_distances = all_distances_open
                 self._last_template_class = "OPEN"
 
-            # --- Spatial correction (threshold mode only) ---
-            if self.spatial_mode != "off" and self.spatial_ref_open is not None and self.spatial_ref_closed is not None:
+            # --- Per-template coupled spatial correction ---
+            # Overrides global correction if enabled and conditions are met.
+            _coupled_active = (
+                self.spatial_coupled
+                and self.use_spatial_correction
+                and self.spatial_mode not in ("off", "contrast", "relu_contrast", "relu_ext_contrast")
+            )
+            if _coupled_active:
+                # Determine the target class reference and raw per-template distances.
+                # At this point: state==OPEN → all_distances_closed defined; state==CLOSED → all_distances_open defined.
+                if self.current_state == "OPEN":
+                    _ref = self.spatial_ref_closed
+                    _all_dist = all_distances_closed
+                else:
+                    _ref = self.spatial_ref_open
+                    _all_dist = all_distances_open
+
+                if _ref is not None and _ref.get("per_template_rms") is not None and _all_dist is not None:
+                    live_rms = compute_live_rms(emg_buffer)
+                    D_final, per_sims = aggregate_distances_with_per_template_spatial(
+                        _all_dist, live_rms, _ref["per_template_rms"],
+                        aggregation=self.distance_aggregation,
+                        spatial_mode=self.spatial_mode,
+                        spatial_threshold=self.spatial_threshold,
+                        spatial_sharpness=self.spatial_sharpness,
+                        spatial_relu_baseline=self.spatial_relu_baseline,
+                    )
+                    sim_display = float(np.mean(per_sims))
+                    if self.current_state == "OPEN":
+                        sim_closed = sim_display
+                        triggered_state = "CLOSED" if D_final < self.THRESHOLD_CLOSED else "OPEN"
+                        self._last_distance = D_final
+                        self.distance_history[-1] = (timestamp, None, D_final, self.current_state, self.THRESHOLD_OPEN, self.THRESHOLD_CLOSED)
+                    else:
+                        sim_open = sim_display
+                        triggered_state = "OPEN" if D_final < self.THRESHOLD_OPEN else "CLOSED"
+                        self._last_distance = D_final
+                        self.distance_history[-1] = (timestamp, D_final, None, self.current_state, self.THRESHOLD_OPEN, self.THRESHOLD_CLOSED)
+                    self.spatial_similarity_history.append((timestamp, sim_open, sim_closed))
+
+            # --- Spatial correction (threshold mode only, global path) ---
+            if not _coupled_active and self.spatial_mode != "off" and self.spatial_ref_open is not None and self.spatial_ref_closed is not None:
                 need_both = (self.spatial_mode in ("contrast", "relu_contrast", "relu_ext_contrast"))
 
                 if self.current_state == "OPEN":

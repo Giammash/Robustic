@@ -110,6 +110,7 @@ class SimulationWorker(QObject):
             spatial_relu_baseline = getattr(self.model, 'spatial_relu_baseline', 0.2)
             spatial_similarity_mode = getattr(self.model, 'spatial_similarity_mode', 'mean')
             spatial_n_best = getattr(self.model, 'spatial_n_best', 3)
+            spatial_coupled = getattr(self.model, 'spatial_coupled', False)
 
             # Sync config with model parameters so simulate_realtime_dtw uses correct values
             config.window_length = self.model.window_length
@@ -164,6 +165,7 @@ class SimulationWorker(QObject):
                 decision_catboost_model=decision_catboost_model,
                 spatial_similarity_mode=spatial_similarity_mode,
                 spatial_n_best=spatial_n_best,
+                spatial_coupled=spatial_coupled,
             )
 
             # --- Optional calibration: find plateau thresholds from GT ---
@@ -1108,6 +1110,25 @@ class OnlineProtocol(QObject):
         self.spatial_threshold_row.setVisible(False)
         self.spatial_sharpness_row.setVisible(False)
         self.spatial_relu_baseline_row.setVisible(False)
+        self.spatial_coupling_row.setVisible(False)
+        self.spatial_coupling_combo.blockSignals(True)
+        self.spatial_coupling_combo.setCurrentIndex(0)  # reset to Global profile
+        self.spatial_coupling_combo.blockSignals(False)
+        # Disable coupled option if per_template_rms not available in this model
+        has_per_tpl = False
+        if model is not None:
+            ref_o = getattr(model, 'spatial_ref_open', None)
+            ref_c = getattr(model, 'spatial_ref_closed', None)
+            has_per_tpl = (ref_o is not None and ref_o.get("per_template_rms") is not None
+                           and ref_c is not None and ref_c.get("per_template_rms") is not None)
+        from PySide6.QtGui import QStandardItemModel as _QStdModel
+        _std = self.spatial_coupling_combo.model()
+        if isinstance(_std, _QStdModel):
+            _coupled_item = _std.item(1)
+            if _coupled_item is not None:
+                _coupled_item.setEnabled(has_per_tpl)
+                if not has_per_tpl:
+                    _coupled_item.setToolTip("Requires a model built with spatial profiles (per_template_rms).")
 
         self.spatial_mode_combo.setEnabled(has_spatial)
         if has_spatial:
@@ -2111,6 +2132,31 @@ class OnlineProtocol(QObject):
         self.spatial_profile_row.setLayout(row4)
         layout.addWidget(self.spatial_profile_row)
 
+        # Coupling row: Global profile vs Per-template coupled
+        self.spatial_coupling_row = QWidget()
+        row_coupling = QHBoxLayout()
+        row_coupling.setContentsMargins(0, 0, 0, 0)
+        row_coupling.addWidget(QLabel("Coupling:"))
+        self.spatial_coupling_combo = QComboBox()
+        self.spatial_coupling_combo.addItem("Global profile", "global")
+        self.spatial_coupling_combo.addItem("Per-template coupled", "coupled")
+        self.spatial_coupling_combo.setToolTip(
+            "Global profile: spatial similarity vs the class mean profile (or top-k mean).\n"
+            "Per-template coupled: each DTW distance is corrected by its own template's\n"
+            "spatial similarity before aggregation. Contrast modes not supported."
+        )
+        self.spatial_coupling_combo.currentIndexChanged.connect(self._on_spatial_coupling_changed)
+        row_coupling.addWidget(self.spatial_coupling_combo)
+
+        self.spatial_coupling_note = QLabel("(Contrast modes fall back to Scaling)")
+        self.spatial_coupling_note.setStyleSheet("color: #999; font-style: italic; font-size: 10px;")
+        self.spatial_coupling_note.setVisible(False)
+        row_coupling.addWidget(self.spatial_coupling_note)
+        row_coupling.addStretch()
+        self.spatial_coupling_row.setLayout(row_coupling)
+        self.spatial_coupling_row.setVisible(False)  # Hidden when spatial mode is "off"
+        layout.addWidget(self.spatial_coupling_row)
+
         self.spatial_group_box.setLayout(layout)
 
         # Add to the online commands group box layout
@@ -2127,6 +2173,12 @@ class OnlineProtocol(QObject):
         self.spatial_sharpness_row.setVisible(mode in ("scaling", "contrast", "relu_scaling", "relu_contrast", "relu_ext_scaling", "relu_ext_contrast"))
         # Show/hide baseline spinbox (relu modes only)
         self.spatial_relu_baseline_row.setVisible(mode in ("relu_scaling", "relu_contrast", "relu_ext_scaling", "relu_ext_contrast"))
+        # Show coupling row only when spatial is active
+        self.spatial_coupling_row.setVisible(mode != "off")
+        # Update contrast-mode note visibility
+        is_coupled = self.spatial_coupling_combo.currentData() == "coupled"
+        is_contrast = mode in ("contrast", "relu_contrast", "relu_ext_contrast")
+        self.spatial_coupling_note.setVisible(is_coupled and is_contrast)
 
         if self.model_interface.model is not None:
             model = self.model_interface.model
@@ -2181,6 +2233,38 @@ class OnlineProtocol(QObject):
         if self.model_interface.model is not None:
             self.model_interface.model.spatial_n_best = value
             print(f"[SPATIAL] Per-template k: {value}")
+
+    def _on_spatial_coupling_changed(self, index: int) -> None:
+        """Switch between global profile and per-template coupled correction."""
+        coupling = self.spatial_coupling_combo.currentData()
+        is_coupled = coupling == "coupled"
+        mode = self.spatial_mode_combo.currentData()
+        is_contrast = mode in ("contrast", "relu_contrast", "relu_ext_contrast")
+        self.spatial_coupling_note.setVisible(is_coupled and is_contrast)
+
+        if self.model_interface.model is not None:
+            model = self.model_interface.model
+            if is_coupled:
+                # Validate that per_template_rms is available
+                ref_open = getattr(model, 'spatial_ref_open', None)
+                ref_closed = getattr(model, 'spatial_ref_closed', None)
+                has_per_tpl = (
+                    ref_open is not None and ref_open.get("per_template_rms") is not None and
+                    ref_closed is not None and ref_closed.get("per_template_rms") is not None
+                )
+                if not has_per_tpl:
+                    self.spatial_coupling_combo.blockSignals(True)
+                    self.spatial_coupling_combo.setCurrentIndex(0)  # revert to Global
+                    self.spatial_coupling_combo.blockSignals(False)
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.information(
+                        self.main_window, "Not Available",
+                        "Per-template coupling requires a model built with spatial profiles.\n"
+                        "The current model does not have per-template RMS data."
+                    )
+                    return
+            model.spatial_coupled = is_coupled
+            print(f"[SPATIAL] Coupling: {'per-template coupled' if is_coupled else 'global profile'}")
 
     def _setup_plot_options(self) -> None:
         """Setup plot options UI."""
