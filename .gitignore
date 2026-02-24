@@ -62,7 +62,7 @@ bin/
 # Claude / temp
 .claude/
 tmpclaude-*/
-CLAUDE.md
+
 
 # Misc
 nul
