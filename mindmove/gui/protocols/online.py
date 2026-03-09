@@ -871,19 +871,18 @@ class OnlineProtocol(QObject):
         result = self.model_interface.get_last_result()
 
         if result:
-            # Convert binary state to 10-joint format for Unity VHI
-            # OPEN (state=0.0): all fingers extended [0,0,0,0,0,0,0,0,0,0]
-            # CLOSED (state=1.0): all fingers closed [1,1,1,1,1,1,1,1,1,1]
+            # Convert binary state to 18-value format for Unity VHI:
+            # [predicted_hand(9)] + [control_hand(9 zeros)]
             state = result['state']  # 0.0 or 1.0
             joint_value = int(state)  # 0 or 1
-            unity_data = [joint_value] * 10  # All 10 joints same value
+            unity_data = [joint_value] * 9 + [0] * 9
 
             self.main_window.virtual_hand_interface.output_message_signal.emit(
                 str(unity_data).encode("utf-8")
             )
         else:
             # Fallback: send all zeros (OPEN state)
-            unity_data = [0] * 10
+            unity_data = [0] * 18
             result = {'state': 0.0, 'distance': 0.0, 'threshold': 0.0, 'state_name': 'OPEN'}
             self.main_window.virtual_hand_interface.output_message_signal.emit(
                 str(unity_data).encode("utf-8")
@@ -1791,7 +1790,7 @@ class OnlineProtocol(QObject):
             if result:
                 state = result['state']
                 joint_value = int(state)
-                unity_data = [joint_value] * 10
+                unity_data = [joint_value] * 9 + [0] * 9
                 self.main_window.virtual_hand_interface.output_message_signal.emit(
                     str(unity_data).encode("utf-8")
                 )

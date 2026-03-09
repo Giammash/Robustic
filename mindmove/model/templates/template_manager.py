@@ -131,7 +131,7 @@ class TemplateManager:
             }
 
         elif fmt == TemplateManager.FORMAT_VHI:
-            # Convert VHI format
+            # Convert VHI (MyoGestic) format
             # biosignal shape: (n_channels, samples_per_frame, n_frames)
             biosignal = recording["biosignal"]
 
@@ -140,13 +140,35 @@ class TemplateManager:
             emg = np.concatenate(biosignal.T, axis=0).T
             emg = emg[:config.num_channels, :]
 
+            # Upsample GT from ~32 Hz to EMG sample rate
+            gt_low = recording.get("ground_truth", np.array([]))
+            gt_times = recording.get("ground_truth_timings", np.array([]))
+            emg_timings = recording.get("biosignal_timings", np.array([]))
+            n_total = emg.shape[1]
+
+            if len(gt_low) > 1 and len(gt_times) > 1 and len(emg_timings) > 1:
+                emg_sample_times = np.linspace(
+                    emg_timings[0], emg_timings[-1], n_total
+                )
+                gt = np.interp(emg_sample_times, gt_times, gt_low).astype(np.float64)
+            elif len(gt_low) > 0 and len(gt_low) < n_total:
+                from scipy.ndimage import zoom
+                gt = zoom(gt_low.astype(np.float64), n_total / len(gt_low), order=1)
+                gt = gt[:n_total]
+            else:
+                gt = gt_low
+
+            # Reshape GT to (1, n_samples) to match kinematics expected shape
+            kinematics = gt.reshape(1, -1) if gt.ndim == 1 else gt
+
             return {
                 "emg": emg,
-                "kinematics": recording["ground_truth"],
-                "timings_emg": recording.get("biosignal_timings"),
-                "timings_kinematics": recording.get("ground_truth_timings"),
+                "kinematics": kinematics,
+                "timings_emg": emg_timings,
+                "timings_kinematics": gt_times,
                 "label": recording.get("recording_label", "default"),
                 "task": recording.get("task", "unknown"),
+                "gt_mode": recording.get("gt_mode", "guided_animation"),
             }
 
         else:

@@ -1384,12 +1384,16 @@ class GuidedRecordProtocol(QObject):
         self.time_remaining_label.setText(f"Time remaining: {time_remaining:.1f}s")
 
     def _send_joints_to_vhi(self, joints: List[float]):
-        """Send joint positions to Virtual Hand Interface."""
+        """Send joint positions to Virtual Hand Interface.
+
+        Sends 18 values: [predicted_hand(9 zeros)] + [control_hand(9 joints)]
+        so VHI displays both hands (control hand animates, predicted hand idle).
+        """
         if self.main_window.virtual_hand_interface.is_streaming:
-            # Convert to int for cleaner transmission (0 or 1 for hold states)
-            joint_values = [round(j, 2) for j in joints]
+            control_joints = [round(j, 2) for j in joints[:9]]
+            full_array = [0.0] * 9 + control_joints
             self.main_window.virtual_hand_interface.output_message_signal.emit(
-                str(joint_values).encode("utf-8")
+                str(full_array).encode("utf-8")
             )
 
     def _on_emg_data(self, data: np.ndarray):

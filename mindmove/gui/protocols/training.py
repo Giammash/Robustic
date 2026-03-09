@@ -54,6 +54,66 @@ def _detect_mode_from_data(data: dict) -> bool | None:
     return None
 
 
+def _convert_myogestic_recording(recording: dict) -> dict:
+    """Convert a MyoGestic recording to MindMove guided recording format.
+
+    MyoGestic Transitions recordings have:
+      - biosignal: (n_ch, samples_per_frame, n_frames)
+      - ground_truth: 1D at ~32 Hz (ramp 0-1)
+      - biosignal_timings / ground_truth_timings: wall-clock timestamps
+      - gt_mode: "guided_animation"
+      - cycles, animation_config, cycles_completed
+
+    MindMove guided recordings expect:
+      - emg: (n_ch, n_samples)
+      - gt: 1D at EMG rate (ramp 0-1)
+      - timings_emg: per-frame timestamps
+      - gt_mode: "guided_animation"
+      - cycles, animation_config, cycles_completed
+
+    Returns a new dict in MindMove format, leaving the original unchanged.
+    """
+    biosignal = recording["biosignal"]
+    emg = np.concatenate(biosignal.T, axis=0).T  # (n_ch, total_samples)
+
+    gt_low = recording.get("ground_truth", np.array([]))
+    gt_times = recording.get("ground_truth_timings", np.array([]))
+    emg_timings = recording.get("biosignal_timings", np.array([]))
+
+    n_total = emg.shape[1]
+
+    # Upsample GT from ~32 Hz to EMG sample rate using timestamp interpolation
+    if len(gt_low) > 1 and len(gt_times) > 1 and len(emg_timings) > 1:
+        emg_sample_times = np.linspace(
+            emg_timings[0], emg_timings[-1], n_total
+        )
+        gt = np.interp(emg_sample_times, gt_times, gt_low).astype(np.float64)
+    elif len(gt_low) > 0:
+        # Fallback: simple linear resampling
+        from scipy.ndimage import zoom
+        gt = zoom(gt_low.astype(np.float64), n_total / len(gt_low), order=1)
+        gt = gt[:n_total]
+    else:
+        gt = np.zeros(n_total)
+
+    out = {
+        "emg": emg,
+        "gt": gt,
+        "timings_emg": emg_timings,
+        "label": recording.get("recording_label", recording.get("label", "default")),
+        "task": recording.get("task", "Transitions"),
+        "gt_mode": recording.get("gt_mode", "guided_animation"),
+        # Preserve guided recording metadata
+        "cycles": recording.get("cycles", []),
+        "cycles_completed": recording.get("cycles_completed", 0),
+        "animation_config": recording.get("animation_config", {}),
+        "differential_mode": recording.get("differential_mode", False),
+        "_source_format": "myogestic",
+    }
+
+    return out
+
+
 def _infer_mode_from_templates(templates: list) -> bool:
     """
     Infer differential mode from template arrays.
@@ -2867,6 +2927,11 @@ class TrainingProtocol(QObject):
                 if type(recording) is not dict:
                     continue
 
+                # Convert MyoGestic recordings to MindMove format
+                if "biosignal" in recording and "ground_truth" in recording:
+                    print(f"  Converting MyoGestic recording: {os.path.basename(file)}")
+                    recording = _convert_myogestic_recording(recording)
+
                 keys = recording.keys()
 
                 # Check for MindMove virtual hand format
@@ -3781,6 +3846,11 @@ class TrainingProtocol(QObject):
             for filename in filenames:
                 with open(filename, "rb") as f:
                     recording = pickle.load(f)
+
+                # Convert MyoGestic recordings to MindMove format
+                if "biosignal" in recording and "ground_truth" in recording:
+                    print(f"\n[TRAINING] Converting MyoGestic recording: {os.path.basename(filename)}")
+                    recording = _convert_myogestic_recording(recording)
 
                 # Check if it's a guided recording or has GT data
                 gt_mode = recording.get("gt_mode", "")
